@@ -69,7 +69,7 @@ All six k6 executors: `constant-vus`, `constant-arrival-rate`, `ramping-vus`, `r
 
 ### Pre-built Binaries
 
-Download the latest release for your platform from the [Releases page](https://github.com/rohitsi/k6-rs/releases/latest):
+Download the latest release for your platform from the [Releases page](https://github.com/huskercane/k6-rs/releases/latest):
 
 | Platform | Asset |
 |----------|-------|
@@ -82,7 +82,7 @@ Download the latest release for your platform from the [Releases page](https://g
 ```bash
 # Example: Linux x86_64, replace VERSION with the tag (e.g. v0.1.0)
 VERSION=v0.1.0
-curl -LO "https://github.com/rohitsi/k6-rs/releases/download/${VERSION}/k6-rs-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+curl -LO "https://github.com/huskercane/k6-rs/releases/download/${VERSION}/k6-rs-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf "k6-rs-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 sudo mv k6-rs /usr/local/bin/
 ```

@@ -1,0 +1,17 @@
+[package]
+name = "k6-rs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "k6-rs"
+path = "src/main.rs"
+
+[dependencies]
+k6-core = { workspace = true }
+k6-js = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }

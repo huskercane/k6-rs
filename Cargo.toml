@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/k6-core", "crates/k6-js", "crates/k6-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+k6-core = { path = "crates/k6-core" }
+k6-js = { path = "crates/k6-js" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-queue = "0.3"
+rquickjs = { version = "0.11", features = ["classes", "properties", "parallel"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+hdrhistogram = "7"
+base64 = "0.22"
+md-5 = "0.10"
+md4 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+ripemd = "0.1"
+digest = "0.10"
+rand = "0.9"
+scraper = "0.22"
+ipnet = "2"
+url = "2"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+tonic = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+snap = "1"
+duckdb = "1"
+csv = "1"
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+pbkdf2 = "0.12"

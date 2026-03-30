@@ -34,18 +34,151 @@ enum Commands {
         /// Path to the test script
         script: String,
 
-        /// Number of virtual users (overrides script options)
+        /// Path to a JSON config file (same format as script options)
         #[arg(long)]
+        config: Option<String>,
+
+        // --- Execution ---
+        /// Number of virtual users (overrides script options)
+        #[arg(long, short = 'u')]
         vus: Option<u32>,
 
         /// Test duration (e.g., "30s", "5m") (overrides script options)
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         duration: Option<String>,
 
+        /// Script total iteration limit (among all VUs), creates shared-iterations scenario
+        #[arg(long, short = 'i')]
+        iterations: Option<u32>,
+
+        /// Add a ramping stage as duration:target (e.g., "1m:10"), repeatable
+        #[arg(long = "stage", short = 's')]
+        stages: Vec<String>,
+
+        // --- Output ---
         /// Output plugin(s): json=file.json, csv=file.csv, influxdb=url, prometheus=url, duckdb=file.duckdb
         #[arg(long = "out", short = 'o')]
         outputs: Vec<String>,
+
+        /// InfluxDB URL for metrics output (shorthand for --out influxdb=url)
+        #[arg(long)]
+        influxdb: Option<String>,
+
+        // --- HTTP & networking ---
+        /// Skip verification of TLS certificates
+        #[arg(long)]
+        insecure_skip_tls_verify: bool,
+
+        /// Disable keep-alive connections
+        #[arg(long)]
+        no_connection_reuse: bool,
+
+        /// Don't reuse connections between iterations
+        #[arg(long)]
+        no_vu_connection_reuse: bool,
+
+        /// Follow at most n redirects
+        #[arg(long)]
+        max_redirects: Option<u32>,
+
+        /// User agent for HTTP requests
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        /// Log all HTTP requests and responses ("" or "full")
+        #[arg(long)]
+        http_debug: Option<String>,
+
+        /// Limit requests per second (0 = unlimited)
+        #[arg(long)]
+        rps: Option<u32>,
+
+        /// Throw warnings (like failed HTTP requests) as errors
+        #[arg(long, short = 'w')]
+        throw: bool,
+
+        /// Read but don't process or save HTTP response bodies
+        #[arg(long)]
+        discard_response_bodies: bool,
+
+        /// Blacklist IP ranges (CIDR), repeatable
+        #[arg(long = "blacklist-ip")]
+        blacklist_ips: Vec<String>,
+
+        /// Block hostnames (supports * wildcards), repeatable
+        #[arg(long)]
+        block_hostnames: Vec<String>,
+
+        /// Client IP ranges for outgoing requests (comma-separated)
+        #[arg(long)]
+        local_ips: Option<String>,
+
+        /// DNS config as key=value pairs (e.g., "ttl=5m,select=random,policy=preferIPv4")
+        #[arg(long)]
+        dns: Option<String>,
+
+        // --- Lifecycle & runtime ---
+        /// Don't run setup()
+        #[arg(long)]
+        no_setup: bool,
+
+        /// Don't run teardown()
+        #[arg(long)]
+        no_teardown: bool,
+
+        /// Don't evaluate thresholds
+        #[arg(long)]
+        no_thresholds: bool,
+
+        /// Don't show the summary at the end of the test
+        #[arg(long)]
+        no_summary: bool,
+
+        /// Export end-of-test summary as JSON to file
+        #[arg(long)]
+        summary_export: Option<String>,
+
+        /// Redirect console output to file path
+        #[arg(long)]
+        console_output: Option<String>,
+
+        /// Add/override environment variable as VAR=value, repeatable
+        #[arg(long = "env", short = 'e')]
+        envs: Vec<String>,
+
+        /// Add a tag applied to all samples as name=value, repeatable
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
+}
+
+/// Parsed CLI overrides that map to TestConfig fields.
+struct CliOverrides {
+    vus: Option<u32>,
+    duration: Option<String>,
+    iterations: Option<u32>,
+    stages: Vec<String>,
+    insecure_skip_tls_verify: bool,
+    no_connection_reuse: bool,
+    no_vu_connection_reuse: bool,
+    max_redirects: Option<u32>,
+    user_agent: Option<String>,
+    http_debug: Option<String>,
+    rps: Option<u32>,
+    throw: bool,
+    discard_response_bodies: bool,
+    blacklist_ips: Vec<String>,
+    block_hostnames: Vec<String>,
+    local_ips: Option<String>,
+    dns: Option<String>,
+    no_setup: bool,
+    no_teardown: bool,
+    no_thresholds: bool,
+    no_summary: bool,
+    summary_export: Option<String>,
+    console_output: Option<String>,
+    envs: Vec<String>,
+    tags: Vec<String>,
 }
 
 #[tokio::main]
@@ -55,17 +188,75 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run {
             script,
+            config,
             vus,
             duration,
-            outputs,
-        } => run_test(&script, vus, duration, &outputs).await,
+            iterations,
+            stages,
+            mut outputs,
+            influxdb,
+            insecure_skip_tls_verify,
+            no_connection_reuse,
+            no_vu_connection_reuse,
+            max_redirects,
+            user_agent,
+            http_debug,
+            rps,
+            throw,
+            discard_response_bodies,
+            blacklist_ips,
+            block_hostnames,
+            local_ips,
+            dns,
+            no_setup,
+            no_teardown,
+            no_thresholds,
+            no_summary,
+            summary_export,
+            console_output,
+            envs,
+            tags,
+        } => {
+            // --influxdb=URL is shorthand for --out influxdb=URL
+            if let Some(url) = influxdb {
+                outputs.push(format!("influxdb={url}"));
+            }
+            let overrides = CliOverrides {
+                vus,
+                duration,
+                iterations,
+                stages,
+                insecure_skip_tls_verify,
+                no_connection_reuse,
+                no_vu_connection_reuse,
+                max_redirects,
+                user_agent,
+                http_debug,
+                rps,
+                throw,
+                discard_response_bodies,
+                blacklist_ips,
+                block_hostnames,
+                local_ips,
+                dns,
+                no_setup,
+                no_teardown,
+                no_thresholds,
+                no_summary,
+                summary_export,
+                console_output,
+                envs,
+                tags,
+            };
+            run_test(&script, config.as_deref(), overrides, &outputs).await
+        }
     }
 }
 
 async fn run_test(
     script_path: &str,
-    vus_override: Option<u32>,
-    duration_override: Option<String>,
+    config_path: Option<&str>,
+    cli: CliOverrides,
     output_specs: &[String],
 ) -> Result<()> {
     // Read and prepare the script, resolving local imports relative to script directory
@@ -77,19 +268,153 @@ async fn run_test(
     let script = vu::prepare_script_with_dir(&raw_script, script_dir.as_deref());
 
     // Extract options from the script by evaluating it in a temporary context
-    let options = extract_options(&script)?;
+    let script_options = extract_options(&script)?;
 
-    // Parse config, apply CLI overrides
+    // Merge config file options (lowest priority) with script options (higher priority)
+    let options = if let Some(path) = config_path {
+        let config_json = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config file {path}"))?;
+        let config_value: serde_json::Value =
+            serde_json::from_str(&config_json).with_context(|| format!("parsing config file {path}"))?;
+        merge_json(config_value, script_options)
+    } else {
+        script_options
+    };
+
+    // Parse config, apply CLI overrides (CLI has highest priority)
     let mut test_config = config::parse_options(&options)?;
-    if let Some(v) = vus_override {
+
+    // Execution overrides
+    if let Some(v) = cli.vus {
         test_config.vus = v;
     }
-    if let Some(d) = duration_override {
-        test_config.duration = config::parse_duration(&d)?;
+    if let Some(d) = &cli.duration {
+        test_config.duration = config::parse_duration(d)?;
     }
 
-    // Rebuild default scenario if overrides were applied and only default exists
-    if test_config.scenarios.len() == 1 && test_config.scenarios.contains_key("default") {
+    // HTTP & networking overrides
+    if cli.insecure_skip_tls_verify {
+        test_config.insecure_skip_tls_verify = true;
+    }
+    if cli.no_connection_reuse {
+        test_config.no_connection_reuse = true;
+    }
+    if cli.no_vu_connection_reuse {
+        test_config.no_vu_connection_reuse = true;
+    }
+    if let Some(v) = cli.max_redirects {
+        test_config.max_redirects = Some(v);
+    }
+    if let Some(ref v) = cli.user_agent {
+        test_config.user_agent = Some(v.clone());
+    }
+    if let Some(ref v) = cli.http_debug {
+        test_config.http_debug = Some(v.clone());
+    }
+    if let Some(v) = cli.rps {
+        test_config.rps = v;
+    }
+    if cli.throw {
+        test_config.throw = true;
+    }
+    if cli.discard_response_bodies {
+        test_config.discard_response_bodies = true;
+    }
+    if !cli.blacklist_ips.is_empty() {
+        test_config.blacklist_ips = cli.blacklist_ips.clone();
+    }
+    if !cli.block_hostnames.is_empty() {
+        test_config.block_hostnames = cli.block_hostnames.clone();
+    }
+    if let Some(ref v) = cli.local_ips {
+        test_config.local_ips = v.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(ref v) = cli.dns {
+        test_config.dns = Some(parse_dns_flag(v)?);
+    }
+    if let Some(ref v) = cli.console_output {
+        test_config.console_output = Some(v.clone());
+    }
+
+    // Parse --env flags into key-value pairs for VUs
+    let env_vars: Vec<(String, String)> = cli
+        .envs
+        .iter()
+        .map(|s| {
+            let (k, v) = s
+                .split_once('=')
+                .with_context(|| format!("invalid --env format '{s}', expected VAR=value"))?;
+            anyhow::ensure!(!k.is_empty(), "empty variable name in --env '{s}'");
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Parse --tag flags into run-level tags
+    let run_tags: std::collections::HashMap<String, String> = cli
+        .tags
+        .iter()
+        .map(|s| {
+            let (k, v) = s
+                .split_once('=')
+                .with_context(|| format!("invalid --tag format '{s}', expected name=value"))?;
+            anyhow::ensure!(!k.is_empty(), "empty tag name in --tag '{s}'");
+            anyhow::ensure!(!v.is_empty(), "empty tag value in --tag '{s}'");
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>>>()?;
+
+    // Handle --iterations: create shared-iterations default scenario
+    if let Some(iters) = cli.iterations {
+        test_config.scenarios.clear();
+        test_config.scenarios.insert(
+            "default".to_string(),
+            k6_core::config::ScenarioConfig {
+                executor: ExecutorType::SharedIterations {
+                    vus: test_config.vus,
+                    iterations: iters,
+                    max_duration: test_config.duration,
+                },
+                exec: None,
+                start_time: std::time::Duration::ZERO,
+                graceful_stop: std::time::Duration::from_secs(30),
+                env: std::collections::HashMap::new(),
+                tags: std::collections::HashMap::new(),
+            },
+        );
+    // Handle --stage: create ramping-vus default scenario
+    } else if !cli.stages.is_empty() {
+        let stages = cli
+            .stages
+            .iter()
+            .map(|s| {
+                let (dur_str, target_str) = s
+                    .split_once(':')
+                    .with_context(|| format!("invalid --stage format '{s}', expected duration:target"))?;
+                let duration = config::parse_duration(dur_str)?;
+                let target: u32 = target_str
+                    .parse()
+                    .with_context(|| format!("invalid target VU count in --stage '{s}'"))?;
+                Ok(config::Stage { duration, target })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        test_config.scenarios.clear();
+        test_config.scenarios.insert(
+            "default".to_string(),
+            k6_core::config::ScenarioConfig {
+                executor: ExecutorType::RampingVus {
+                    start_vus: test_config.vus,
+                    stages,
+                    graceful_ramp_down: std::time::Duration::from_secs(30),
+                },
+                exec: None,
+                start_time: std::time::Duration::ZERO,
+                graceful_stop: std::time::Duration::from_secs(30),
+                env: std::collections::HashMap::new(),
+                tags: std::collections::HashMap::new(),
+            },
+        );
+    // Rebuild default constant-vus scenario if vus/duration overrides were applied
+    } else if test_config.scenarios.len() == 1 && test_config.scenarios.contains_key("default") {
         test_config.scenarios.insert(
             "default".to_string(),
             k6_core::config::ScenarioConfig {
@@ -104,6 +429,15 @@ async fn run_test(
                 tags: std::collections::HashMap::new(),
             },
         );
+    }
+
+    // Apply --tag run-level tags to all scenarios
+    if !run_tags.is_empty() {
+        for scenario in test_config.scenarios.values_mut() {
+            for (k, v) in &run_tags {
+                scenario.tags.insert(k.clone(), v.clone());
+            }
+        }
     }
 
     // Run static analysis
@@ -169,13 +503,15 @@ async fn run_test(
 
     let test_start = std::time::Instant::now();
 
-    // Run setup() if the script defines it
-    let setup_data = {
+    // Run setup() if the script defines it (unless --no-setup)
+    let setup_data = if cli.no_setup {
+        None
+    } else {
         let bp = Backpressure::new(1);
         let mut setup_vu = QuickJsVu::new_full_with_console(
             0,
             &script,
-            &[],
+            &env_vars,
             handle.clone(),
             Arc::clone(&client),
             bp,
@@ -200,7 +536,7 @@ async fn run_test(
                     let mut vu = QuickJsVu::new_full_with_console(
                         i,
                         &script,
-                        &[],
+                        &env_vars,
                         handle.clone(),
                         Arc::clone(&client),
                         bp.clone(),
@@ -341,13 +677,13 @@ async fn run_test(
         }
     }
 
-    // Run teardown() if the script defines it
-    {
+    // Run teardown() if the script defines it (unless --no-teardown)
+    if !cli.no_teardown {
         let bp = Backpressure::new(1);
         let mut teardown_vu = QuickJsVu::new_full_with_console(
             0,
             &script,
-            &[],
+            &env_vars,
             handle.clone(),
             Arc::clone(&client),
             bp,
@@ -369,8 +705,8 @@ async fn run_test(
     let total_duration = test_start.elapsed();
     let snapshot = metrics.registry.snapshot(total_duration.as_secs_f64());
 
-    // Evaluate thresholds
-    let threshold_results = if !test_config.thresholds.is_empty() {
+    // Evaluate thresholds (unless --no-thresholds)
+    let threshold_results = if !cli.no_thresholds && !test_config.thresholds.is_empty() {
         Some(k6_core::thresholds::evaluate(
             &test_config.thresholds,
             &snapshot,
@@ -379,57 +715,69 @@ async fn run_test(
         None
     };
 
-    // Try handleSummary() if defined, else use default summary
-    let mut used_handle_summary = false;
-    {
-        let bp = Backpressure::new(1);
-        let mut summary_vu = QuickJsVu::new_full_with_console(
-            0,
-            &script,
-            &[],
-            handle.clone(),
-            Arc::clone(&client),
-            bp,
-            Some(metrics.clone()),
-            script_dir.clone(),
-            console_output.clone(),
-        )?;
+    // Export summary as JSON if --summary-export is set
+    if let Some(ref path) = cli.summary_export {
+        let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration);
+        let json = serde_json::to_string_pretty(&summary_data)?;
+        std::fs::write(path, &json)
+            .with_context(|| format!("writing summary export to {path}"))?;
+        eprintln!("  summary exported to {path}");
+    }
 
-        if summary_vu.has_handle_summary() {
-            let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration);
-            let data_json = serde_json::to_string(&summary_data)?;
-            match summary_vu.run_handle_summary(&data_json) {
-                Ok(outputs) => {
-                    used_handle_summary = true;
-                    for (dest, content) in outputs {
-                        match dest.as_str() {
-                            "stdout" => print!("{content}"),
-                            "stderr" => eprint!("{content}"),
-                            path => {
-                                if let Err(e) = std::fs::write(path, &content) {
-                                    eprintln!("  warning: failed to write {path}: {e}");
+    // Show summary (unless --no-summary)
+    if !cli.no_summary {
+        // Try handleSummary() if defined, else use default summary
+        let mut used_handle_summary = false;
+        {
+            let bp = Backpressure::new(1);
+            let mut summary_vu = QuickJsVu::new_full_with_console(
+                0,
+                &script,
+                &env_vars,
+                handle.clone(),
+                Arc::clone(&client),
+                bp,
+                Some(metrics.clone()),
+                script_dir.clone(),
+                console_output.clone(),
+            )?;
+
+            if summary_vu.has_handle_summary() {
+                let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration);
+                let data_json = serde_json::to_string(&summary_data)?;
+                match summary_vu.run_handle_summary(&data_json) {
+                    Ok(outputs) => {
+                        used_handle_summary = true;
+                        for (dest, content) in outputs {
+                            match dest.as_str() {
+                                "stdout" => print!("{content}"),
+                                "stderr" => eprint!("{content}"),
+                                path => {
+                                    if let Err(e) = std::fs::write(path, &content) {
+                                        eprintln!("  warning: failed to write {path}: {e}");
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("  warning: handleSummary() failed: {e}");
+                    Err(e) => {
+                        eprintln!("  warning: handleSummary() failed: {e}");
+                    }
                 }
             }
         }
-    }
 
-    if !used_handle_summary {
-        eprintln!();
-        eprint!(
-            "{}",
-            k6_core::summary::format_summary(
-                &snapshot,
-                total_duration,
-                threshold_results.as_ref()
-            )
-        );
+        if !used_handle_summary {
+            eprintln!();
+            eprint!(
+                "{}",
+                k6_core::summary::format_summary(
+                    &snapshot,
+                    total_duration,
+                    threshold_results.as_ref()
+                )
+            );
+        }
     }
 
     // Stop output plugins
@@ -449,6 +797,47 @@ async fn run_test(
     }
 
     Ok(())
+}
+
+/// Parse --dns flag format: "ttl=5m,select=random,policy=preferIPv4"
+fn parse_dns_flag(s: &str) -> Result<config::DnsConfig> {
+    let mut dns = config::DnsConfig {
+        ttl: None,
+        select: None,
+        policy: None,
+    };
+    for part in s.split(',') {
+        let part = part.trim();
+        if let Some((key, val)) = part.split_once('=') {
+            match key.trim() {
+                "ttl" => dns.ttl = Some(val.trim().to_string()),
+                "select" => dns.select = Some(val.trim().to_string()),
+                "policy" => dns.policy = Some(val.trim().to_string()),
+                other => anyhow::bail!("unknown DNS option: {other}"),
+            }
+        }
+    }
+    Ok(dns)
+}
+
+/// Deep-merge two JSON values. `overlay` values take priority over `base`.
+/// For objects, keys from both are merged recursively. For all other types,
+/// `overlay` replaces `base` entirely.
+fn merge_json(base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+    match (base, overlay) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                let merged = if let Some(base_val) = base_map.remove(&key) {
+                    merge_json(base_val, overlay_val)
+                } else {
+                    overlay_val
+                };
+                base_map.insert(key, merged);
+            }
+            serde_json::Value::Object(base_map)
+        }
+        (_, overlay) => overlay,
+    }
 }
 
 fn extract_options(script: &str) -> Result<serde_json::Value> {

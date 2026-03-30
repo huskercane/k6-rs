@@ -240,6 +240,80 @@ WARNING: Potential memory leak detected at line 4:
   Fix: Move inside default function, or use a bounded LRU cache.
 ```
 
+## CLI Reference
+
+k6-rs aims to be a drop-in replacement for `k6 run`. All supported flags use the same names and short aliases as k6.
+
+```bash
+k6-rs run [OPTIONS] <SCRIPT>
+```
+
+### Execution
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--vus` | `-u` | Number of virtual users |
+| `--duration` | `-d` | Test duration (e.g., "30s", "5m") |
+| `--iterations` | `-i` | Total iteration limit (shared-iterations) |
+| `--stage` | `-s` | Ramping stage as `duration:target` (repeatable) |
+| `--config` | | JSON config file (same format as script options) |
+
+### Output
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--out` | `-o` | Output plugin (repeatable): `json=`, `csv=`, `influxdb=`, `prometheus=`, `duckdb=` |
+| `--influxdb` | | Shorthand for `--out influxdb=URL` |
+| `--summary-export` | | Export end-of-test summary as JSON |
+
+### HTTP & Networking
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--insecure-skip-tls-verify` | | Skip TLS certificate verification |
+| `--no-connection-reuse` | | Disable keep-alive connections |
+| `--no-vu-connection-reuse` | | Don't reuse connections between iterations |
+| `--max-redirects` | | Follow at most N redirects |
+| `--user-agent` | | User agent string |
+| `--http-debug` | | Log HTTP requests/responses ("" or "full") |
+| `--rps` | | Global rate limit (requests/sec, 0=unlimited) |
+| `--throw` | `-w` | Treat HTTP errors as exceptions |
+| `--discard-response-bodies` | | Don't save HTTP response bodies |
+| `--blacklist-ip` | | Block IP ranges, CIDR (repeatable) |
+| `--block-hostnames` | | Block hostnames, wildcards (repeatable) |
+| `--local-ips` | | Source IP pool (comma-separated) |
+| `--dns` | | DNS config: `ttl=5m,select=random,policy=preferIPv4` |
+
+### Lifecycle & Runtime
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--no-setup` | | Skip `setup()` |
+| `--no-teardown` | | Skip `teardown()` |
+| `--no-thresholds` | | Skip threshold evaluation |
+| `--no-summary` | | Skip end-of-test summary |
+| `--console-output` | | Redirect console to file |
+| `--env` | `-e` | Set env variable as `VAR=value` (repeatable) |
+| `--tag` | | Add tag to all samples as `name=value` (repeatable) |
+
+### Not Yet Supported
+
+These k6 flags are not implemented. If you need any of these, open an issue.
+
+| Flag | Reason |
+|------|--------|
+| `--paused` / `-p` | Requires API server pause/resume |
+| `--linger` / `-l` | Requires API server keep-alive |
+| `--system-tags` | System tag filtering not implemented |
+| `--summary-trend-stats` | Custom trend stat selection not implemented |
+| `--summary-time-unit` | Custom time unit display not implemented |
+| `--execution-segment` | Distributed execution not supported |
+| `--execution-segment-sequence` | Distributed execution not supported |
+| `--compatibility-mode` | Not applicable (QuickJS, not goja) |
+| `--type` / `-t` | Archive format not supported |
+| `--include-system-env-vars` | All system env vars are available by default |
+| `--batch` | `http.batch()` concurrency limit not enforced |
+| `--batch-per-host` | Per-host batch limit not enforced |
+| `--min-iteration-duration` | Minimum iteration pacing not implemented |
+| `--traces-output` | OpenTelemetry tracing not supported |
+| `--no-usage-report` | No telemetry to disable |
+
 ## Architecture
 
 ```

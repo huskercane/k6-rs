@@ -33,7 +33,7 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +65,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/k6-rs.exe" -DestinationPath "k6-rs-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: k6-rs-${{ matrix.target }}
           path: k6-rs-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -75,10 +75,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true

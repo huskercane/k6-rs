@@ -1,11 +1,39 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rquickjs::{Ctx, Function};
+use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
-use k6_core::traits::{HttpClient, HttpMethod, HttpRequest};
+use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, ResponseBody, Timings};
+
+/// HTTP response data that converts directly into a native JS object via `IntoJs`,
+/// bypassing JSON serialization/parsing on the hot path.
+struct JsHttpResponse {
+    status: u16,
+    body: String,
+    headers: Vec<(String, String)>,
+    timings: Timings,
+    url: String,
+    error: String,
+    error_code: u32,
+}
+
+impl<'js> IntoJs<'js> for JsHttpResponse {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+
+        obj.set("status", self.status)?;
+        obj.set("body", self.body)?;
+        obj.set("headers", build_headers_obj(ctx, &self.headers)?)?;
+        obj.set("url", self.url)?;
+        obj.set("timings", build_timings_obj(ctx, &self.timings)?)?;
+        obj.set("error", self.error)?;
+        obj.set("error_code", self.error_code)?;
+
+        Ok(obj.into_value())
+    }
+}
 
 /// Classify an error into a k6-compatible error code.
 ///
@@ -79,7 +107,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
             "__http_request",
             Function::new(
                 ctx.clone(),
-                move |method: String, url: String, body: rquickjs::Value, headers_json: String, timeout_ms: f64| -> String {
+                move |method: String, url: String, body: rquickjs::Value<'_>, headers_json: String, timeout_ms: f64| -> rquickjs::Result<JsHttpResponse> {
                     let headers: Vec<(String, String)> = serde_json::from_str(&headers_json)
                         .unwrap_or_default();
                     let timeout = if timeout_ms > 0.0 {
@@ -124,85 +152,50 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
 
                     match result {
                         Ok(resp) => {
-                            // Record metrics
                             if let Some(ref m) = metrics {
                                 let failed = resp.status >= 400;
                                 m.record_http_request(&resp.timings, failed);
                                 m.record_data_sent(send_bytes);
                                 let recv_bytes = match &resp.body {
-                                    k6_core::traits::ResponseBody::Buffered(b) => b.len() as u64,
-                                    k6_core::traits::ResponseBody::Discarded => 0,
+                                    ResponseBody::Buffered(b) => b.len() as u64,
+                                    ResponseBody::Discarded => 0,
                                 };
                                 m.record_data_received(recv_bytes);
                             }
 
                             let body_str = match &resp.body {
-                                k6_core::traits::ResponseBody::Buffered(b) => {
+                                ResponseBody::Buffered(b) => {
                                     String::from_utf8_lossy(b).to_string()
                                 }
-                                k6_core::traits::ResponseBody::Discarded => String::new(),
+                                ResponseBody::Discarded => String::new(),
                             };
 
-                            // Build headers object, handling duplicate keys (e.g., set-cookie)
-                            let mut headers_map = serde_json::Map::new();
-                            for (k, v) in &resp.headers {
-                                let key = k.to_lowercase();
-                                if let Some(existing) = headers_map.get_mut(&key) {
-                                    // Convert to array if not already
-                                    match existing {
-                                        serde_json::Value::Array(arr) => {
-                                            arr.push(serde_json::Value::String(v.clone()));
-                                        }
-                                        _ => {
-                                            let prev = existing.clone();
-                                            *existing = serde_json::json!([prev, v]);
-                                        }
-                                    }
-                                } else {
-                                    headers_map.insert(key, serde_json::Value::String(v.clone()));
-                                }
-                            }
-                            let headers_obj: serde_json::Value = headers_map.into();
-
-                            serde_json::json!({
-                                "status": resp.status,
-                                "body": body_str,
-                                "headers": headers_obj,
-                                "url": resp.url,
-                                "timings": {
-                                    "blocked": resp.timings.blocked,
-                                    "connecting": resp.timings.connecting,
-                                    "tls_handshaking": resp.timings.tls_handshaking,
-                                    "sending": resp.timings.sending,
-                                    "waiting": resp.timings.waiting,
-                                    "receiving": resp.timings.receiving,
-                                    "duration": resp.timings.duration,
-                                },
-                                "error": "",
-                                "error_code": 0,
+                            Ok(JsHttpResponse {
+                                status: resp.status,
+                                body: body_str,
+                                headers: resp.headers,
+                                timings: resp.timings,
+                                url: resp.url,
+                                error: String::new(),
+                                error_code: 0,
                             })
-                            .to_string()
                         }
                         Err(e) => {
-                            // Record failed request metrics
                             if let Some(ref m) = metrics {
-                                let timings = k6_core::traits::Timings::default();
+                                let timings = Timings::default();
                                 m.record_http_request(&timings, true);
                             }
 
                             let error_code = classify_error(&e);
-                            let error_msg = e.to_string();
-
-                            serde_json::json!({
-                                "status": 0,
-                                "body": "",
-                                "headers": {},
-                                "url": "",
-                                "timings": { "duration": 0.0 },
-                                "error": error_msg,
-                                "error_code": error_code,
+                            Ok(JsHttpResponse {
+                                status: 0,
+                                body: String::new(),
+                                headers: Vec::new(),
+                                timings: Timings::default(),
+                                url: String::new(),
+                                error: e.to_string(),
+                                error_code,
                             })
-                            .to_string()
                         }
                     }
                 },
@@ -211,7 +204,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
     }
 
     // JS wrapper with cookie jar and response helpers
-    ctx.eval::<(), _>(r#"
+    ctx.eval::<(), _>(r##"
         // Per-VU cookie jar
         const __cookieJar = {
             _cookies: {}, // domain -> { name: { value, path, domain, expires, ... } }
@@ -307,8 +300,8 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                 const headers = JSON.stringify(Object.entries(allHeaders));
                 const bodyArg = (typeof body === 'object' && body !== null) ? JSON.stringify(body) : (body || null);
                 const timeoutMs = (params && params.timeout) ? Number(params.timeout) : 0;
-                const responseJson = __http_request(method, url, bodyArg, headers, timeoutMs);
-                return __wrap_response(JSON.parse(responseJson));
+                const responseObj = __http_request(method, url, bodyArg, headers, timeoutMs);
+                return __wrap_response(responseObj);
             },
             get: function(url, params) {
                 return __http.request('GET', url, null, params);
@@ -385,9 +378,48 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
             },
         };
         globalThis.http = __http;
-    "#)?;
+    "##)?;
 
     Ok(())
+}
+
+/// Build a native JS object for response headers, coalescing duplicates into arrays.
+fn build_headers_obj<'js>(
+    ctx: &Ctx<'js>,
+    headers: &[(String, String)],
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+
+    for (k, v) in headers {
+        let key = k.to_lowercase();
+        let existing: Value<'js> = obj.get(&*key)?;
+        if existing.is_undefined() {
+            obj.set(&*key, v.as_str())?;
+        } else if existing.is_array() {
+            let arr: rquickjs::Array<'js> = existing.into_array().unwrap();
+            arr.set(arr.len(), v.as_str())?;
+        } else {
+            let arr = rquickjs::Array::new(ctx.clone())?;
+            arr.set(0, existing)?;
+            arr.set(1, v.as_str())?;
+            obj.set(&*key, arr)?;
+        }
+    }
+
+    Ok(obj)
+}
+
+/// Build a native JS object for HTTP timings.
+fn build_timings_obj<'js>(ctx: &Ctx<'js>, timings: &Timings) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("blocked", timings.blocked)?;
+    obj.set("connecting", timings.connecting)?;
+    obj.set("tls_handshaking", timings.tls_handshaking)?;
+    obj.set("sending", timings.sending)?;
+    obj.set("waiting", timings.waiting)?;
+    obj.set("receiving", timings.receiving)?;
+    obj.set("duration", timings.duration)?;
+    Ok(obj)
 }
 
 #[cfg(test)]

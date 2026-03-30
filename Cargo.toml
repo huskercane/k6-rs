@@ -43,6 +43,7 @@ http-body-util = "0.1"
 snap = "1"
 duckdb = "1"
 csv = "1"
+dotenvy = "0.15"
 aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }

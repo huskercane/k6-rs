@@ -336,16 +336,14 @@ impl HttpClient for ReqwestHttpClient {
     }
 }
 
-async fn drain_response_body(response: reqwest::Response) -> Result<()> {
-    let mut response = response;
+async fn drain_response_body(mut response: reqwest::Response) -> Result<()> {
     while let Some(chunk) = response.chunk().await? {
         let _ = chunk;
     }
     Ok(())
 }
 
-async fn buffer_response_body(response: reqwest::Response, max_response_body_size: usize) -> Result<Vec<u8>> {
-    let mut response = response;
+async fn buffer_response_body(mut response: reqwest::Response, max_response_body_size: usize) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(max_response_body_size.min(16 * 1024));
 
     while let Some(chunk) = response.chunk().await? {

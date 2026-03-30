@@ -36,8 +36,7 @@
                 params = params || {};
                 var requestJson = JSON.stringify(request || {});
                 var metadataJson = JSON.stringify(params.metadata || {});
-                var resultJson = __grpc_invoke(this._connId, String(method), requestJson, metadataJson);
-                return JSON.parse(resultJson);
+                return __grpc_invoke(this._connId, String(method), requestJson, metadataJson);
             };
 
             this.close = function() {

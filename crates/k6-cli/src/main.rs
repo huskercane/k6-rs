@@ -1,4 +1,5 @@
 mod analysis;
+mod env;
 
 use std::sync::Arc;
 
@@ -284,18 +285,11 @@ async fn run_test(
     // Parse config, apply CLI overrides (CLI has highest priority)
     let mut test_config = config::parse_options(&options)?;
 
-    // Parse --env flags into key-value pairs for VUs
-    let env_vars: Vec<(String, String)> = cli
-        .envs
-        .iter()
-        .map(|s| {
-            let (k, v) = s
-                .split_once('=')
-                .with_context(|| format!("invalid --env format '{s}', expected VAR=value"))?;
-            anyhow::ensure!(!k.is_empty(), "empty variable name in --env '{s}'");
-            Ok((k.to_string(), v.to_string()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Resolve env vars: .env file (low priority) merged with --env flags (high priority)
+    let dotenv_dir = std::path::Path::new(script_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let env_vars = env::resolve_env_vars(&cli.envs, dotenv_dir, &mut std::io::stderr())?;
 
     // Parse --tag flags into run-level tags
     let run_tags: std::collections::HashMap<String, String> = cli

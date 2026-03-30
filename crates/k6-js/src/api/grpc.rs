@@ -3,9 +3,72 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use rquickjs::Function;
+use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::metrics::BuiltinMetrics;
+
+/// gRPC response data that converts directly into a native JS object via `IntoJs`.
+struct JsGrpcResponse {
+    status: i32,
+    message: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+impl<'js> IntoJs<'js> for JsGrpcResponse {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("status", self.status)?;
+
+        match self.message {
+            Some(msg) => obj.set("message", serde_json_to_js(ctx, &msg)?)?,
+            None => obj.set("message", Value::new_null(ctx.clone()))?,
+        }
+
+        if let Some(err) = self.error {
+            obj.set("error", err)?;
+        }
+
+        let empty = Object::new(ctx.clone())?;
+        let empty2 = Object::new(ctx.clone())?;
+        obj.set("headers", empty)?;
+        obj.set("trailers", empty2)?;
+
+        Ok(obj.into_value())
+    }
+}
+
+/// Convert a serde_json::Value into a native rquickjs Value without JSON string round-trip.
+fn serde_json_to_js<'js>(ctx: &Ctx<'js>, val: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
+    match val {
+        serde_json::Value::Null => Ok(Value::new_null(ctx.clone())),
+        serde_json::Value::Bool(b) => Ok(Value::new_bool(ctx.clone(), *b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::new_int(ctx.clone(), i as i32))
+            } else {
+                Ok(Value::new_float(ctx.clone(), n.as_f64().unwrap_or(0.0)))
+            }
+        }
+        serde_json::Value::String(s) => {
+            let js_str = rquickjs::String::from_str(ctx.clone(), s)?;
+            Ok(js_str.into_value())
+        }
+        serde_json::Value::Array(arr) => {
+            let js_arr = rquickjs::Array::new(ctx.clone())?;
+            for (i, item) in arr.iter().enumerate() {
+                js_arr.set(i, serde_json_to_js(ctx, item)?)?;
+            }
+            Ok(js_arr.into_value())
+        }
+        serde_json::Value::Object(map) => {
+            let js_obj = Object::new(ctx.clone())?;
+            for (k, v) in map {
+                js_obj.set(&**k, serde_json_to_js(ctx, v)?)?;
+            }
+            Ok(js_obj.into_value())
+        }
+    }
+}
 
 /// Register the gRPC module matching k6/net/grpc API.
 ///
@@ -53,7 +116,7 @@ pub fn register(
         )?;
     }
 
-    // __grpc_invoke(conn_id, method, request_json, metadata_json) → response JSON
+    // __grpc_invoke(conn_id, method, request_json, metadata_json) → native JS object
     {
         let h = handle.clone();
         let m = metrics.clone();
@@ -66,7 +129,7 @@ pub fn register(
                       method: String,
                       request_json: String,
                       metadata_json: String|
-                      -> rquickjs::Result<String> {
+                      -> rquickjs::Result<JsGrpcResponse> {
                     let conns = Arc::clone(&conns);
                     let m = m.clone();
 
@@ -76,7 +139,7 @@ pub fn register(
                     });
 
                     match result {
-                        Ok(json) => Ok(json),
+                        Ok(resp) => Ok(resp),
                         Err(e) => Err(rquickjs::Error::new_from_js_message(
                             "string",
                             "string",
@@ -178,7 +241,7 @@ async fn grpc_invoke_impl(
     metadata_json: &str,
     connections: Arc<Mutex<HashMap<String, GrpcConnection>>>,
     metrics: Option<&BuiltinMetrics>,
-) -> Result<String> {
+) -> Result<JsGrpcResponse> {
     use tonic::codec::ProstCodec;
 
     let (channel, default_metadata) = {
@@ -254,30 +317,21 @@ async fn grpc_invoke_impl(
 
     match response {
         Ok(resp) => {
-            let status_code = 0; // OK
             let body = resp.into_inner();
             let body_json = prost_value_to_json(&body);
 
-            Ok(serde_json::json!({
-                "status": status_code,
-                "message": body_json,
-                "headers": {},
-                "trailers": {},
+            Ok(JsGrpcResponse {
+                status: 0,
+                message: Some(body_json),
+                error: None,
             })
-            .to_string())
         }
         Err(status) => {
-            let code = status.code() as i32;
-            let message = status.message().to_string();
-
-            Ok(serde_json::json!({
-                "status": code,
-                "message": null,
-                "error": message,
-                "headers": {},
-                "trailers": {},
+            Ok(JsGrpcResponse {
+                status: status.code() as i32,
+                message: None,
+                error: Some(status.message().to_string()),
             })
-            .to_string())
         }
     }
 }

@@ -292,6 +292,72 @@ k6-rs run [OPTIONS] <SCRIPT>
 | `--env` | `-e` | Set env variable as `VAR=value` (repeatable) |
 | `--tag` | | Add tag to all samples as `name=value` (repeatable) |
 
+### Environment Variables and `.env` File
+
+**This is a k6-rs extension not available in k6.**
+
+k6-rs automatically loads environment variables from a `.env` file in the script's directory. Variables set via `--env` / `-e` flags take priority over `.env` values.
+
+```bash
+# These are equivalent:
+k6-rs run script.js -e HOST=localhost -e PORT=8080
+
+# Or use a .env file in the same directory as script.js:
+# .env
+HOST=localhost
+PORT=8080
+```
+
+When a `.env` file is found, k6-rs prints what it loaded:
+```
+  reading 2 environment variable(s) from .env file
+```
+
+#### Secret Provider Integration (`cmd:` prefix)
+
+Values starting with `cmd:` are executed as shell commands, letting you pull secrets from any provider without storing them in plaintext. The command's stdout (trimmed) becomes the value.
+
+```env
+# .env — no secrets in this file
+DB_HOST=localhost
+DB_PASS="cmd:security find-generic-password -s myapp -a dbuser -w"
+API_KEY="cmd:op read op://vault/api/credential"
+TOKEN="cmd:vault kv get -field=token secret/app"
+```
+
+This works with secret managers that support **non-interactive** (sessionless or pre-authenticated) CLI access:
+
+| Provider | Example | How it works without a password |
+|----------|---------|-------------------------------|
+| macOS Keychain | `cmd:security find-generic-password -s myapp -w` | Unlocked at login |
+| Linux (GNOME Keyring) | `cmd:secret-tool lookup service myapp key password` | Unlocked at login |
+| 1Password CLI | `cmd:op read op://vault/item/field` | Session from `op signin` or biometric unlock |
+| HashiCorp Vault | `cmd:vault kv get -field=password secret/db` | Token cached by `vault login` |
+| AWS SSM | `cmd:aws ssm get-parameter --name /app/secret --with-decryption --query Parameter.Value --output text` | IAM role or `aws configure` |
+| Azure Key Vault | `cmd:az keyvault secret show --name mykey --vault-name myvault --query value -o tsv` | Session from `az login` |
+
+**Important:** `cmd:` only works with providers that can return secrets without prompting. If a provider needs a password or interactive login, the command will fail — k6-rs runs commands with stdin closed, so there is no way to type a password. Ensure your provider session is active before running the test:
+
+```bash
+# Pre-authenticate, then run your test
+op signin              # 1Password
+vault login            # HashiCorp Vault
+az login               # Azure
+aws sso login          # AWS
+
+k6-rs run script.js
+```
+
+A 30-second timeout prevents the test from hanging if a command unexpectedly blocks.
+
+Output masks commands to avoid leaking secrets:
+```
+  reading 3 environment variable(s) from .env file
+  resolving 2 environment variable(s) via shell commands
+    DB_PASS ← cmd:***
+    API_KEY ← cmd:***
+```
+
 ### Not Yet Supported
 
 These k6 flags are not implemented. If you need any of these, open an issue.

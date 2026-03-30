@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use rquickjs::Function;
+use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::metrics::BuiltinMetrics;
 
@@ -123,7 +123,7 @@ pub fn register(
         )?;
     }
 
-    // __ws_recv(session_id, timeout_ms) → JSON event string
+    // __ws_recv(session_id, timeout_ms) → native JS event object
     {
         let h = handle.clone();
         let sess = Arc::clone(&sessions);
@@ -131,13 +131,13 @@ pub fn register(
             "__ws_recv",
             Function::new(
                 ctx.clone(),
-                move |id: String, timeout_ms: f64| -> rquickjs::Result<String> {
+                move |id: String, timeout_ms: f64| -> rquickjs::Result<JsWsEvent> {
                     let evt_rx = {
                         let sessions = sess.lock().unwrap();
                         match sessions.get(&id) {
                             Some(session) => session.evt_rx.clone(),
                             None => {
-                                return Ok(r#"{"type":"close"}"#.to_string());
+                                return Ok(JsWsEvent(WsEvent::Close));
                             }
                         }
                     };
@@ -154,9 +154,9 @@ pub fn register(
                     });
 
                     match result {
-                        Ok(Some(evt)) => Ok(evt.to_json()),
-                        Ok(None) => Ok(r#"{"type":"close"}"#.to_string()),
-                        Err(_) => Ok(r#"{"type":"timeout"}"#.to_string()),
+                        Ok(Some(evt)) => Ok(JsWsEvent(evt)),
+                        Ok(None) => Ok(JsWsEvent(WsEvent::Close)),
+                        Err(_) => Ok(JsWsEvent(WsEvent::Timeout)),
                     }
                 },
             )?,
@@ -202,28 +202,44 @@ enum WsEvent {
     Pong,
     Close,
     Error(String),
+    Timeout,
 }
 
-impl WsEvent {
-    fn to_json(&self) -> String {
-        match self {
+/// Wrapper for converting WsEvent into a native JS object via `IntoJs`.
+struct JsWsEvent(WsEvent);
+
+impl<'js> IntoJs<'js> for JsWsEvent {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        match self.0 {
             WsEvent::Message(text) => {
-                let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(r#"{{"type":"message","data":"{escaped}"}}"#)
+                obj.set("type", "message")?;
+                obj.set("data", text)?;
             }
             WsEvent::BinaryMessage(data) => {
                 use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-                format!(r#"{{"type":"binaryMessage","data":"{b64}"}}"#)
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                obj.set("type", "binaryMessage")?;
+                obj.set("data", b64)?;
             }
-            WsEvent::Ping => r#"{"type":"ping"}"#.to_string(),
-            WsEvent::Pong => r#"{"type":"pong"}"#.to_string(),
-            WsEvent::Close => r#"{"type":"close"}"#.to_string(),
+            WsEvent::Ping => {
+                obj.set("type", "ping")?;
+            }
+            WsEvent::Pong => {
+                obj.set("type", "pong")?;
+            }
+            WsEvent::Close => {
+                obj.set("type", "close")?;
+            }
             WsEvent::Error(msg) => {
-                let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(r#"{{"type":"error","data":"{escaped}"}}"#)
+                obj.set("type", "error")?;
+                obj.set("data", msg)?;
+            }
+            WsEvent::Timeout => {
+                obj.set("type", "timeout")?;
             }
         }
+        Ok(obj.into_value())
     }
 }
 
@@ -372,29 +388,66 @@ mod tests {
     }
 
     #[test]
-    fn ws_event_to_json() {
-        use super::WsEvent;
+    fn ws_event_into_js_message() {
+        use super::{JsWsEvent, WsEvent};
+        let rt = crate::runtime::create_runtime().unwrap();
+        let ctx = crate::runtime::create_context(&rt).unwrap();
 
-        let msg = WsEvent::Message("hello world".to_string());
-        let json = msg.to_json();
-        assert!(json.contains("\"type\":\"message\""));
-        assert!(json.contains("\"data\":\"hello world\""));
-
-        let close = WsEvent::Close;
-        assert_eq!(close.to_json(), r#"{"type":"close"}"#);
-
-        let err = WsEvent::Error("connection reset".to_string());
-        let json = err.to_json();
-        assert!(json.contains("\"type\":\"error\""));
-        assert!(json.contains("connection reset"));
+        ctx.with(|ctx| {
+            let evt = JsWsEvent(WsEvent::Message("hello world".to_string()));
+            let val: rquickjs::Value = rquickjs::IntoJs::into_js(evt, &ctx).unwrap();
+            let obj = val.into_object().unwrap();
+            let typ: String = obj.get("type").unwrap();
+            let data: String = obj.get("data").unwrap();
+            assert_eq!(typ, "message");
+            assert_eq!(data, "hello world");
+        });
     }
 
     #[test]
-    fn ws_event_json_escapes_special_chars() {
-        use super::WsEvent;
+    fn ws_event_into_js_close() {
+        use super::{JsWsEvent, WsEvent};
+        let rt = crate::runtime::create_runtime().unwrap();
+        let ctx = crate::runtime::create_context(&rt).unwrap();
 
-        let msg = WsEvent::Message(r#"he said "hello""#.to_string());
-        let json = msg.to_json();
-        assert!(json.contains(r#"\"hello\""#));
+        ctx.with(|ctx| {
+            let evt = JsWsEvent(WsEvent::Close);
+            let val: rquickjs::Value = rquickjs::IntoJs::into_js(evt, &ctx).unwrap();
+            let obj = val.into_object().unwrap();
+            let typ: String = obj.get("type").unwrap();
+            assert_eq!(typ, "close");
+        });
+    }
+
+    #[test]
+    fn ws_event_into_js_error() {
+        use super::{JsWsEvent, WsEvent};
+        let rt = crate::runtime::create_runtime().unwrap();
+        let ctx = crate::runtime::create_context(&rt).unwrap();
+
+        ctx.with(|ctx| {
+            let evt = JsWsEvent(WsEvent::Error("connection reset".to_string()));
+            let val: rquickjs::Value = rquickjs::IntoJs::into_js(evt, &ctx).unwrap();
+            let obj = val.into_object().unwrap();
+            let typ: String = obj.get("type").unwrap();
+            let data: String = obj.get("data").unwrap();
+            assert_eq!(typ, "error");
+            assert_eq!(data, "connection reset");
+        });
+    }
+
+    #[test]
+    fn ws_event_into_js_handles_special_chars() {
+        use super::{JsWsEvent, WsEvent};
+        let rt = crate::runtime::create_runtime().unwrap();
+        let ctx = crate::runtime::create_context(&rt).unwrap();
+
+        ctx.with(|ctx| {
+            let evt = JsWsEvent(WsEvent::Message(r#"he said "hello""#.to_string()));
+            let val: rquickjs::Value = rquickjs::IntoJs::into_js(evt, &ctx).unwrap();
+            let obj = val.into_object().unwrap();
+            let data: String = obj.get("data").unwrap();
+            assert_eq!(data, r#"he said "hello""#);
+        });
     }
 }

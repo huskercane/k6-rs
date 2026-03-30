@@ -98,8 +98,7 @@
                 if (closed) break;
 
                 // Receive next event from Rust (blocks up to recvTimeout ms)
-                var eventJson = __ws_recv(sessionId, recvTimeout);
-                var event = JSON.parse(eventJson);
+                var event = __ws_recv(sessionId, recvTimeout);
 
                 if (event.type === 'message') {
                     var msgHandlers = handlers['message'];

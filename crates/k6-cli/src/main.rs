@@ -284,58 +284,6 @@ async fn run_test(
     // Parse config, apply CLI overrides (CLI has highest priority)
     let mut test_config = config::parse_options(&options)?;
 
-    // Execution overrides
-    if let Some(v) = cli.vus {
-        test_config.vus = v;
-    }
-    if let Some(d) = &cli.duration {
-        test_config.duration = config::parse_duration(d)?;
-    }
-
-    // HTTP & networking overrides
-    if cli.insecure_skip_tls_verify {
-        test_config.insecure_skip_tls_verify = true;
-    }
-    if cli.no_connection_reuse {
-        test_config.no_connection_reuse = true;
-    }
-    if cli.no_vu_connection_reuse {
-        test_config.no_vu_connection_reuse = true;
-    }
-    if let Some(v) = cli.max_redirects {
-        test_config.max_redirects = Some(v);
-    }
-    if let Some(ref v) = cli.user_agent {
-        test_config.user_agent = Some(v.clone());
-    }
-    if let Some(ref v) = cli.http_debug {
-        test_config.http_debug = Some(v.clone());
-    }
-    if let Some(v) = cli.rps {
-        test_config.rps = v;
-    }
-    if cli.throw {
-        test_config.throw = true;
-    }
-    if cli.discard_response_bodies {
-        test_config.discard_response_bodies = true;
-    }
-    if !cli.blacklist_ips.is_empty() {
-        test_config.blacklist_ips = cli.blacklist_ips.clone();
-    }
-    if !cli.block_hostnames.is_empty() {
-        test_config.block_hostnames = cli.block_hostnames.clone();
-    }
-    if let Some(ref v) = cli.local_ips {
-        test_config.local_ips = v.split(',').map(|s| s.trim().to_string()).collect();
-    }
-    if let Some(ref v) = cli.dns {
-        test_config.dns = Some(parse_dns_flag(v)?);
-    }
-    if let Some(ref v) = cli.console_output {
-        test_config.console_output = Some(v.clone());
-    }
-
     // Parse --env flags into key-value pairs for VUs
     let env_vars: Vec<(String, String)> = cli
         .envs
@@ -363,82 +311,7 @@ async fn run_test(
         })
         .collect::<Result<std::collections::HashMap<_, _>>>()?;
 
-    // Handle --iterations: create shared-iterations default scenario
-    if let Some(iters) = cli.iterations {
-        test_config.scenarios.clear();
-        test_config.scenarios.insert(
-            "default".to_string(),
-            k6_core::config::ScenarioConfig {
-                executor: ExecutorType::SharedIterations {
-                    vus: test_config.vus,
-                    iterations: iters,
-                    max_duration: test_config.duration,
-                },
-                exec: None,
-                start_time: std::time::Duration::ZERO,
-                graceful_stop: std::time::Duration::from_secs(30),
-                env: std::collections::HashMap::new(),
-                tags: std::collections::HashMap::new(),
-            },
-        );
-    // Handle --stage: create ramping-vus default scenario
-    } else if !cli.stages.is_empty() {
-        let stages = cli
-            .stages
-            .iter()
-            .map(|s| {
-                let (dur_str, target_str) = s
-                    .split_once(':')
-                    .with_context(|| format!("invalid --stage format '{s}', expected duration:target"))?;
-                let duration = config::parse_duration(dur_str)?;
-                let target: u32 = target_str
-                    .parse()
-                    .with_context(|| format!("invalid target VU count in --stage '{s}'"))?;
-                Ok(config::Stage { duration, target })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        test_config.scenarios.clear();
-        test_config.scenarios.insert(
-            "default".to_string(),
-            k6_core::config::ScenarioConfig {
-                executor: ExecutorType::RampingVus {
-                    start_vus: test_config.vus,
-                    stages,
-                    graceful_ramp_down: std::time::Duration::from_secs(30),
-                },
-                exec: None,
-                start_time: std::time::Duration::ZERO,
-                graceful_stop: std::time::Duration::from_secs(30),
-                env: std::collections::HashMap::new(),
-                tags: std::collections::HashMap::new(),
-            },
-        );
-    // Rebuild default constant-vus scenario if vus/duration overrides were applied
-    } else if test_config.scenarios.len() == 1 && test_config.scenarios.contains_key("default") {
-        test_config.scenarios.insert(
-            "default".to_string(),
-            k6_core::config::ScenarioConfig {
-                executor: ExecutorType::ConstantVus {
-                    vus: test_config.vus,
-                    duration: test_config.duration,
-                },
-                exec: None,
-                start_time: std::time::Duration::ZERO,
-                graceful_stop: std::time::Duration::from_secs(30),
-                env: std::collections::HashMap::new(),
-                tags: std::collections::HashMap::new(),
-            },
-        );
-    }
-
-    // Apply --tag run-level tags to all scenarios
-    if !run_tags.is_empty() {
-        for scenario in test_config.scenarios.values_mut() {
-            for (k, v) in &run_tags {
-                scenario.tags.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    apply_cli_overrides(&mut test_config, &cli, &run_tags)?;
 
     // Run static analysis
     let max_vus: u32 = test_config
@@ -799,6 +672,320 @@ async fn run_test(
     Ok(())
 }
 
+fn apply_cli_overrides(
+    test_config: &mut TestConfig,
+    cli: &CliOverrides,
+    run_tags: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if let Some(v) = cli.vus {
+        test_config.vus = v;
+    }
+    if let Some(d) = &cli.duration {
+        test_config.duration = config::parse_duration(d)?;
+    }
+
+    if cli.insecure_skip_tls_verify {
+        test_config.insecure_skip_tls_verify = true;
+    }
+    if cli.no_connection_reuse {
+        test_config.no_connection_reuse = true;
+    }
+    if cli.no_vu_connection_reuse {
+        test_config.no_vu_connection_reuse = true;
+    }
+    if let Some(v) = cli.max_redirects {
+        test_config.max_redirects = Some(v);
+    }
+    if let Some(ref v) = cli.user_agent {
+        test_config.user_agent = Some(v.clone());
+    }
+    if let Some(ref v) = cli.http_debug {
+        test_config.http_debug = Some(v.clone());
+    }
+    if let Some(v) = cli.rps {
+        test_config.rps = v;
+    }
+    if cli.throw {
+        test_config.throw = true;
+    }
+    if cli.discard_response_bodies {
+        test_config.discard_response_bodies = true;
+    }
+    if !cli.blacklist_ips.is_empty() {
+        test_config.blacklist_ips = cli.blacklist_ips.clone();
+    }
+    if !cli.block_hostnames.is_empty() {
+        test_config.block_hostnames = cli.block_hostnames.clone();
+    }
+    if let Some(ref v) = cli.local_ips {
+        test_config.local_ips = v.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(ref v) = cli.dns {
+        test_config.dns = Some(parse_dns_flag(v)?);
+    }
+    if let Some(ref v) = cli.console_output {
+        test_config.console_output = Some(v.clone());
+    }
+
+    apply_execution_overrides(test_config, cli)?;
+
+    if !run_tags.is_empty() {
+        for scenario in test_config.scenarios.values_mut() {
+            for (k, v) in run_tags {
+                scenario.tags.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_execution_overrides(test_config: &mut TestConfig, cli: &CliOverrides) -> Result<()> {
+    if let Some(iters) = cli.iterations {
+        let template = default_scenario_template(test_config);
+        replace_default_scenario(
+            test_config,
+            template,
+            ExecutorType::SharedIterations {
+                vus: test_config.vus,
+                iterations: iters,
+                max_duration: test_config.duration,
+            },
+        );
+        return Ok(());
+    }
+
+    if !cli.stages.is_empty() {
+        let stages = parse_stage_flags(&cli.stages)?;
+        let template = default_scenario_template(test_config);
+        let graceful_ramp_down = match &template.executor {
+            ExecutorType::RampingVus {
+                graceful_ramp_down, ..
+            } => *graceful_ramp_down,
+            _ => std::time::Duration::from_secs(30),
+        };
+        replace_default_scenario(
+            test_config,
+            template,
+            ExecutorType::RampingVus {
+                start_vus: test_config.vus,
+                stages,
+                graceful_ramp_down,
+            },
+        );
+        return Ok(());
+    }
+
+    let Some(default) = test_config.scenarios.get_mut("default") else {
+        if test_config.scenarios.is_empty() && test_config.vus > 0 {
+            test_config.scenarios.insert(
+                "default".to_string(),
+                default_scenario_with_executor(ExecutorType::ConstantVus {
+                    vus: test_config.vus,
+                    duration: test_config.duration,
+                }),
+            );
+        }
+        return Ok(());
+    };
+
+    if let ExecutorType::ConstantVus { vus, duration } = &mut default.executor {
+        if let Some(v) = cli.vus {
+            *vus = v;
+        }
+        if cli.duration.is_some() {
+            *duration = test_config.duration;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_stage_flags(stages: &[String]) -> Result<Vec<config::Stage>> {
+    stages
+        .iter()
+        .map(|s| {
+            let (dur_str, target_str) = s
+                .split_once(':')
+                .with_context(|| format!("invalid --stage format '{s}', expected duration:target"))?;
+            let duration = config::parse_duration(dur_str)?;
+            let target: u32 = target_str
+                .parse()
+                .with_context(|| format!("invalid target VU count in --stage '{s}'"))?;
+            Ok(config::Stage { duration, target })
+        })
+        .collect()
+}
+
+fn default_scenario_template(test_config: &TestConfig) -> config::ScenarioConfig {
+    test_config
+        .scenarios
+        .get("default")
+        .cloned()
+        .unwrap_or_else(|| {
+            default_scenario_with_executor(ExecutorType::ConstantVus {
+                vus: test_config.vus,
+                duration: test_config.duration,
+            })
+        })
+}
+
+fn default_scenario_with_executor(executor: ExecutorType) -> config::ScenarioConfig {
+    config::ScenarioConfig {
+        executor,
+        exec: None,
+        start_time: std::time::Duration::ZERO,
+        graceful_stop: std::time::Duration::from_secs(30),
+        env: std::collections::HashMap::new(),
+        tags: std::collections::HashMap::new(),
+    }
+}
+
+fn replace_default_scenario(
+    test_config: &mut TestConfig,
+    template: config::ScenarioConfig,
+    executor: ExecutorType,
+) {
+    test_config.scenarios.clear();
+    test_config.scenarios.insert(
+        "default".to_string(),
+        config::ScenarioConfig {
+            executor,
+            exec: template.exec,
+            start_time: template.start_time,
+            graceful_stop: template.graceful_stop,
+            env: template.env,
+            tags: template.tags,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn empty_overrides() -> CliOverrides {
+        CliOverrides {
+            vus: None,
+            duration: None,
+            iterations: None,
+            stages: Vec::new(),
+            insecure_skip_tls_verify: false,
+            no_connection_reuse: false,
+            no_vu_connection_reuse: false,
+            max_redirects: None,
+            user_agent: None,
+            http_debug: None,
+            rps: None,
+            throw: false,
+            discard_response_bodies: false,
+            blacklist_ips: Vec::new(),
+            block_hostnames: Vec::new(),
+            local_ips: None,
+            dns: None,
+            no_setup: false,
+            no_teardown: false,
+            no_thresholds: false,
+            no_summary: false,
+            summary_export: None,
+            console_output: None,
+            envs: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn vus_override_preserves_non_constant_default_executor() {
+        let mut config = TestConfig::default();
+        config.vus = 10;
+        config.duration = std::time::Duration::from_secs(30);
+        config.scenarios.insert(
+            "default".to_string(),
+            config::ScenarioConfig {
+                executor: ExecutorType::ConstantArrivalRate {
+                    rate: 25,
+                    time_unit: std::time::Duration::from_secs(1),
+                    duration: std::time::Duration::from_secs(45),
+                    pre_allocated_vus: 5,
+                    max_vus: Some(20),
+                },
+                exec: Some("login".to_string()),
+                start_time: std::time::Duration::from_secs(2),
+                graceful_stop: std::time::Duration::from_secs(9),
+                env: HashMap::from([("A".to_string(), "1".to_string())]),
+                tags: HashMap::from([("scenario".to_string(), "login".to_string())]),
+            },
+        );
+
+        let mut cli = empty_overrides();
+        cli.vus = Some(99);
+        cli.duration = Some("1m".to_string());
+
+        apply_cli_overrides(&mut config, &cli, &HashMap::new()).unwrap();
+
+        let scenario = config.scenarios.get("default").unwrap();
+        assert!(matches!(
+            scenario.executor,
+            ExecutorType::ConstantArrivalRate { .. }
+        ));
+        assert_eq!(scenario.exec.as_deref(), Some("login"));
+        assert_eq!(scenario.start_time, std::time::Duration::from_secs(2));
+        assert_eq!(scenario.graceful_stop, std::time::Duration::from_secs(9));
+        assert_eq!(scenario.env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(
+            scenario.tags.get("scenario").map(String::as_str),
+            Some("login")
+        );
+    }
+
+    #[test]
+    fn stage_override_preserves_default_scenario_metadata() {
+        let mut config = TestConfig::default();
+        config.vus = 4;
+        config.duration = std::time::Duration::from_secs(20);
+        config.scenarios.insert(
+            "default".to_string(),
+            config::ScenarioConfig {
+                executor: ExecutorType::ConstantVus {
+                    vus: 4,
+                    duration: std::time::Duration::from_secs(20),
+                },
+                exec: Some("checkout".to_string()),
+                start_time: std::time::Duration::from_secs(5),
+                graceful_stop: std::time::Duration::from_secs(11),
+                env: HashMap::from([("TOKEN".to_string(), "abc".to_string())]),
+                tags: HashMap::from([("suite".to_string(), "smoke".to_string())]),
+            },
+        );
+
+        let mut cli = empty_overrides();
+        cli.stages = vec!["10s:7".to_string(), "20s:0".to_string()];
+
+        apply_cli_overrides(&mut config, &cli, &HashMap::new()).unwrap();
+
+        let scenario = config.scenarios.get("default").unwrap();
+        match &scenario.executor {
+            ExecutorType::RampingVus {
+                start_vus,
+                stages,
+                ..
+            } => {
+                assert_eq!(*start_vus, 4);
+                assert_eq!(stages.len(), 2);
+                assert_eq!(stages[0].target, 7);
+                assert_eq!(stages[1].target, 0);
+            }
+            other => panic!("expected ramping-vus, got {other:?}"),
+        }
+        assert_eq!(scenario.exec.as_deref(), Some("checkout"));
+        assert_eq!(scenario.start_time, std::time::Duration::from_secs(5));
+        assert_eq!(scenario.graceful_stop, std::time::Duration::from_secs(11));
+        assert_eq!(scenario.env.get("TOKEN").map(String::as_str), Some("abc"));
+        assert_eq!(scenario.tags.get("suite").map(String::as_str), Some("smoke"));
+    }
+}
+
 /// Parse --dns flag format: "ttl=5m,select=random,policy=preferIPv4"
 fn parse_dns_flag(s: &str) -> Result<config::DnsConfig> {
     let mut dns = config::DnsConfig {
@@ -955,4 +1142,3 @@ fn format_executor_desc(executor: &ExecutorType) -> String {
         }
     }
 }
-

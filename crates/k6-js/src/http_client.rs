@@ -306,15 +306,14 @@ impl HttpClient for ReqwestHttpClient {
         self.debug_response(status, &url, &headers);
 
         let body = if self.discard_response_bodies {
-            let _ = response.bytes().await?;
+            drain_response_body(response).await?;
             ResponseBody::Discarded
         } else {
-            let bytes = response.bytes().await?;
-            if bytes.len() > self.max_response_body_size {
-                ResponseBody::Buffered(bytes[..self.max_response_body_size].to_vec())
-            } else {
-                ResponseBody::Buffered(bytes.to_vec())
-            }
+            ResponseBody::Buffered(buffer_response_body(
+                response,
+                self.max_response_body_size,
+            )
+            .await?)
         };
 
         let receive_done = Instant::now();
@@ -335,6 +334,35 @@ impl HttpClient for ReqwestHttpClient {
             url,
         })
     }
+}
+
+async fn drain_response_body(response: reqwest::Response) -> Result<()> {
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        let _ = chunk;
+    }
+    Ok(())
+}
+
+async fn buffer_response_body(response: reqwest::Response, max_response_body_size: usize) -> Result<Vec<u8>> {
+    let mut response = response;
+    let mut body = Vec::with_capacity(max_response_body_size.min(16 * 1024));
+
+    while let Some(chunk) = response.chunk().await? {
+        append_capped_chunk(&mut body, &chunk, max_response_body_size);
+    }
+
+    Ok(body)
+}
+
+fn append_capped_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    if buffer.len() >= cap {
+        return;
+    }
+
+    let remaining = cap - buffer.len();
+    let take = remaining.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..take]);
 }
 
 #[cfg(test)]
@@ -450,5 +478,28 @@ mod tests {
         let _c2 = pool.next_client();
         // Wraps around
         assert_eq!(pool.index.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn append_capped_chunk_stops_at_limit() {
+        let mut buffer = Vec::new();
+        let cap = 8;
+
+        append_capped_chunk(&mut buffer, b"abcd", cap);
+        append_capped_chunk(&mut buffer, b"efgh", cap);
+        append_capped_chunk(&mut buffer, b"ijkl", cap);
+
+        assert_eq!(buffer, b"abcdefgh");
+    }
+
+    #[test]
+    fn append_capped_chunk_handles_partial_final_chunk() {
+        let mut buffer = Vec::new();
+        let cap = 6;
+
+        append_capped_chunk(&mut buffer, b"abcd", cap);
+        append_capped_chunk(&mut buffer, b"efgh", cap);
+
+        assert_eq!(buffer, b"abcdef");
     }
 }

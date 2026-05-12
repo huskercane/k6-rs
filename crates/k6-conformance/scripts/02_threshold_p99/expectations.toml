@@ -19,4 +19,3 @@ default_trend = "relative:0.30"
 # omits gauges; k6-rs emits them.
 "vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
 "vus_max" = "same as vus"
-"http_req_duration{expected_response:true}" = "submetric missing in k6-rs — blocked on CG-3 (full tag-set preservation)"

@@ -159,7 +159,23 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                     match result {
                         Ok(resp) => {
                             if let Some(ref m) = metrics {
-                                let failed = resp.status >= 400;
+                                // Default expected-statuses semantics: status
+                                // is "expected" iff it falls in upstream's
+                                // `defaultExpectedStatuses` band of
+                                // [200..=399]. Both `expected_response` and
+                                // `http_req_failed` derive from this single
+                                // predicate so they cannot disagree at the
+                                // boundaries (e.g. a 1xx status that
+                                // `status >= 400` would have miscategorized
+                                // as "expected" but upstream's callback
+                                // treats as not-expected). Future
+                                // setResponseCallback / per-request
+                                // `responseCallback` support replaces this
+                                // band check with a callback lookup (and
+                                // gates http_req_failed emission on
+                                // `responseCallback != null`).
+                                let expected = (200..=399).contains(&resp.status);
+                                let failed = !expected;
                                 // CG-3: combine system tags (status, method)
                                 // with user tags into one full-tag set. Order
                                 // doesn't matter — storage canonicalizes via
@@ -171,6 +187,10 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 let mut all_tags: Vec<(String, String)> = user_tags.clone();
                                 all_tags.push(("status".to_string(), resp.status.to_string()));
                                 all_tags.push(("method".to_string(), method.clone()));
+                                all_tags.push((
+                                    "expected_response".to_string(),
+                                    expected.to_string(),
+                                ));
                                 m.record_http_request_tagged(&resp.timings, failed, &all_tags);
                                 // data_sent/data_received are computed in
                                 // http_client.rs as full HTTP message bytes
@@ -208,6 +228,14 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 let mut all_tags: Vec<(String, String)> = user_tags.clone();
                                 all_tags.push(("status".to_string(), "0".to_string()));
                                 all_tags.push(("method".to_string(), method.clone()));
+                                // Transport error never falls in [200..=399],
+                                // so expected_response is unconditionally
+                                // false. Matches upstream's default callback
+                                // returning false for status=0.
+                                all_tags.push((
+                                    "expected_response".to_string(),
+                                    "false".to_string(),
+                                ));
                                 m.record_http_request_tagged(&timings, true, &all_tags);
                                 // Failed before the request hit the wire — no
                                 // bytes sent or received that we can measure
@@ -950,5 +978,235 @@ mod tests {
     fn classify_error_generic() {
         let err = anyhow::anyhow!("something went wrong");
         assert_eq!(super::classify_error(&err), 1000);
+    }
+
+    /// Mock that always returns an error — used for the expected_response
+    /// transport-error regression test below.
+    struct FailingHttpClient;
+
+    impl HttpClient for FailingHttpClient {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+            async move { Err(anyhow::anyhow!("connection refused")) }
+        }
+    }
+
+    /// Snapshot-helper: returns the set of stored trend keys that include
+    /// `expected_response:<expected>` AND have the metric name prefix.
+    fn stored_trend_keys_with_expected(
+        metrics: &BuiltinMetrics,
+        metric_name: &str,
+        expected: bool,
+    ) -> Vec<String> {
+        let snap = metrics.registry.snapshot(1.0);
+        let needle = format!("expected_response:{}", expected);
+        snap.trends
+            .iter()
+            .filter_map(|(name, _)| {
+                if name.starts_with(&format!("{}{{", metric_name)) && name.contains(&needle) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// 2xx/3xx → expected_response:true. Regression-lock for the default
+    /// expected-statuses semantics (matches upstream's [200..=399] band).
+    /// Without the tag attach, no stored key carries `expected_response:true`
+    /// and this assertion fails.
+    #[tokio::test]
+    async fn http_attaches_expected_response_true_for_2xx_3xx() {
+        let handle = tokio::runtime::Handle::current();
+        let metrics = BuiltinMetrics::new();
+        let mh = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(200, ""));
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                let _: i32 = ctx.eval("http.get('http://example.com').status").unwrap();
+            });
+        })
+        .await
+        .unwrap();
+
+        let trues = stored_trend_keys_with_expected(&metrics, "http_req_duration", true);
+        assert!(
+            !trues.is_empty(),
+            "stored http_req_duration must carry expected_response:true for status 200; \
+             snapshot trends were: {:?}",
+            metrics
+                .registry
+                .snapshot(1.0)
+                .trends
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+        );
+        let falses = stored_trend_keys_with_expected(&metrics, "http_req_duration", false);
+        assert!(
+            falses.is_empty(),
+            "no http_req_duration key should carry expected_response:false for status 200"
+        );
+    }
+
+    /// 4xx/5xx → expected_response:false. Locks the inverse case so a future
+    /// refactor that flips the predicate or drops the success-path attach
+    /// can't sneak past.
+    #[tokio::test]
+    async fn http_attaches_expected_response_false_for_4xx_5xx() {
+        let handle = tokio::runtime::Handle::current();
+        let metrics = BuiltinMetrics::new();
+        let mh = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(500, ""));
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                let _: i32 = ctx.eval("http.get('http://example.com').status").unwrap();
+            });
+        })
+        .await
+        .unwrap();
+
+        let falses = stored_trend_keys_with_expected(&metrics, "http_req_duration", false);
+        assert!(
+            !falses.is_empty(),
+            "stored http_req_duration must carry expected_response:false for status 500"
+        );
+        let trues = stored_trend_keys_with_expected(&metrics, "http_req_duration", true);
+        assert!(
+            trues.is_empty(),
+            "no http_req_duration key should carry expected_response:true for status 500"
+        );
+    }
+
+    /// Band boundaries for the unified `(200..=399)` expected-status
+    /// predicate. Specifically locks the 1xx case (status 101 from a
+    /// WebSocket-style upgrade): under the old `failed = status >= 400`
+    /// derivation, 101 was incorrectly categorized as "expected" (true)
+    /// and "not-failed" (false), diverging from upstream's
+    /// `defaultExpectedStatuses.match(101) == false`. With the unified
+    /// predicate, both `expected_response` and `http_req_failed` agree at
+    /// every boundary.
+    #[tokio::test]
+    async fn http_expected_response_band_boundaries() {
+        // (status, expected_response_value, http_req_failed_value)
+        let cases: &[(u16, bool, bool)] = &[
+            (101, false, true),  // 1xx: NOT in [200..=399] — the bug case
+            (199, false, true),  // just below lower band edge
+            (200, true, false),  // lower band edge
+            (399, true, false),  // upper band edge
+            (400, false, true),  // just above upper band edge
+            (500, false, true),  // 5xx
+        ];
+
+        for (status, want_expected, want_failed) in cases {
+            let handle = tokio::runtime::Handle::current();
+            let metrics = BuiltinMetrics::new();
+            let mh = metrics.clone();
+            let status_v = *status;
+            tokio::task::spawn_blocking(move || {
+                let rt = runtime::create_runtime().unwrap();
+                let ctx = runtime::create_context(&rt).unwrap();
+                let client = Arc::new(MockHttpClient::new(status_v, ""));
+                let bp = Backpressure::new(10);
+                ctx.with(|ctx| {
+                    register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                    let _: i32 = ctx.eval("http.get('http://example.com').status").unwrap();
+                });
+            })
+            .await
+            .unwrap();
+
+            // expected_response tag: assert exactly one of true/false present
+            // matching the expected value.
+            let want_keys = stored_trend_keys_with_expected(
+                &metrics,
+                "http_req_duration",
+                *want_expected,
+            );
+            assert!(
+                !want_keys.is_empty(),
+                "status {status}: stored http_req_duration must carry \
+                 expected_response:{want_expected} (unified band predicate)"
+            );
+            let wrong_keys = stored_trend_keys_with_expected(
+                &metrics,
+                "http_req_duration",
+                !*want_expected,
+            );
+            assert!(
+                wrong_keys.is_empty(),
+                "status {status}: no http_req_duration key should carry \
+                 expected_response:{} (got {wrong_keys:?})",
+                !*want_expected,
+            );
+
+            // http_req_failed rate: passes = failed-count, total = all
+            // requests, rate = passes/total. The boundary bug shows up
+            // here too — for status 101 the old predicate put it in the
+            // success bucket (passes=0) when upstream's default callback
+            // would put it in failures (passes=1).
+            let snap = metrics.registry.snapshot(1.0);
+            let (_, passes, total) = snap
+                .rates
+                .iter()
+                .find(|(n, _, _, _)| n.starts_with("http_req_failed"))
+                .map(|(_, r, p, t)| (*r, *p, *t))
+                .expect("http_req_failed must be recorded for every request");
+            assert_eq!(
+                total, 1,
+                "status {status}: exactly one request recorded, got total={total}"
+            );
+            assert_eq!(
+                passes, *want_failed as u64,
+                "status {status}: http_req_failed.passes (=count of failed) \
+                 must be {} but was {passes}",
+                *want_failed as u64,
+            );
+        }
+    }
+
+    /// Transport error → expected_response:false. Status is "0" (sentinel)
+    /// which is outside [200..=399], so the tag must be false on this path
+    /// too. Without the error-branch attach this fails because the stored
+    /// key has no `expected_response:` segment at all.
+    #[tokio::test]
+    async fn http_attaches_expected_response_false_on_transport_error() {
+        let handle = tokio::runtime::Handle::current();
+        let metrics = BuiltinMetrics::new();
+        let mh = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(FailingHttpClient);
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                // The script must not throw — http.get returns an error
+                // response object, not a JS exception.
+                let status: i32 = ctx
+                    .eval("http.get('http://example.com').status")
+                    .unwrap();
+                assert_eq!(status, 0, "transport error must surface status=0");
+            });
+        })
+        .await
+        .unwrap();
+
+        let falses = stored_trend_keys_with_expected(&metrics, "http_req_duration", false);
+        assert!(
+            !falses.is_empty(),
+            "transport-error path must attach expected_response:false"
+        );
     }
 }

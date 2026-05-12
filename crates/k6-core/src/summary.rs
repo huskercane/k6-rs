@@ -117,7 +117,7 @@ pub fn build_summary_data(
     // whitespace differences don't cause a filter miss.
     use crate::selector::MetricSelector;
     let filter_active = thresholds.is_some();
-    let threshold_selectors: Vec<MetricSelector> = thresholds
+    let mut threshold_selectors: Vec<MetricSelector> = thresholds
         .map(|t| {
             t.keys()
                 .filter_map(|k| MetricSelector::parse(k).ok())
@@ -125,6 +125,19 @@ pub fn build_summary_data(
                 .collect()
         })
         .unwrap_or_default();
+    // Mirror upstream's auto-registration of the
+    // `http_req_duration{expected_response:true}` submetric (see
+    // `internal/metrics/engine/engine.go:147-153`): when the
+    // `expected_response` system tag is enabled — the default — upstream
+    // always tracks this submetric whether or not a user threshold targets
+    // it. This is a literal special case in upstream, NOT a general "auto-
+    // include any default-system-tag submetric" rule, so we mirror it as a
+    // single hard-coded selector here. The selector is canonicalized
+    // through MetricSelector so the allow-set key matches snapshot storage.
+    threshold_selectors.push(
+        MetricSelector::parse("http_req_duration{expected_response:true}")
+            .expect("hard-coded auto-include selector must parse"),
+    );
     let allowed_tagged: std::collections::HashSet<String> = threshold_selectors
         .iter()
         .map(|s| s.canonical())
@@ -1049,6 +1062,93 @@ mod tests {
         // Group with a check inside still works.
         let api = summary.root_group.groups.get("api").expect("api group present");
         assert!(api.checks.contains_key("ok"));
+    }
+
+    #[test]
+    fn summary_auto_includes_http_req_duration_expected_response_true_without_threshold() {
+        // Mirrors upstream `internal/metrics/engine/engine.go:147-153`:
+        // when the `expected_response` system tag is enabled (the default),
+        // upstream emits `http_req_duration{expected_response:true}` in
+        // `--summary-export` whether or not the user defined a threshold
+        // for it.
+        //
+        // Storage in k6-rs after the CG-3 follow-up holds full-tag entries
+        // like `http_req_duration{expected_response:true,method:GET,
+        // status:200}`. Without the auto-include, the threshold-driven
+        // submetric filter drops everything that isn't explicitly
+        // referenced. With the auto-include in place, subset-merge
+        // synthesizes the `{expected_response:true}` submetric from the
+        // full-tag storage.
+        use crate::metrics::MetricsRegistry;
+        use std::collections::HashMap;
+        let reg = MetricsRegistry::new();
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("expected_response".to_string(), "true".to_string());
+        tags.insert("method".to_string(), "GET".to_string());
+        tags.insert("status".to_string(), "200".to_string());
+        for ms in 1..=50 {
+            reg.trend_add_with_tags("http_req_duration", ms as f64, &tags);
+        }
+
+        // No user thresholds — auto-include must still fire.
+        let thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
+        let summary =
+            build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+
+        let entry = summary
+            .metrics
+            .get("http_req_duration{expected_response:true}")
+            .expect(
+                "auto-included submetric must appear without a user threshold targeting it",
+            );
+        assert_eq!(entry.metric_type, "trend");
+        assert!(
+            (entry.values["count"] - 50.0).abs() < 0.01,
+            "subset-merge aggregates all 50 samples, got count={}",
+            entry.values["count"]
+        );
+    }
+
+    #[test]
+    fn summary_auto_include_does_not_emit_expected_response_false_submetric() {
+        // Locks the asymmetry: upstream auto-registers ONLY the `:true`
+        // submetric. The `:false` form only appears when a user threshold
+        // targets it. Without this lock a future refactor could grow the
+        // auto-include list and silently start emitting both — which
+        // would diverge from upstream's `--summary-export`.
+        use crate::metrics::MetricsRegistry;
+        use std::collections::HashMap;
+        let reg = MetricsRegistry::new();
+        // Storage carries BOTH true and false samples (failed and ok mix).
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("expected_response".to_string(), "true".to_string());
+        ok.insert("status".to_string(), "200".to_string());
+        for ms in 1..=10 {
+            reg.trend_add_with_tags("http_req_duration", ms as f64, &ok);
+        }
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("expected_response".to_string(), "false".to_string());
+        bad.insert("status".to_string(), "500".to_string());
+        for ms in 1..=10 {
+            reg.trend_add_with_tags("http_req_duration", ms as f64, &bad);
+        }
+
+        let thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
+        let summary =
+            build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+
+        assert!(
+            summary
+                .metrics
+                .contains_key("http_req_duration{expected_response:true}"),
+            "true variant must appear via auto-include"
+        );
+        assert!(
+            !summary
+                .metrics
+                .contains_key("http_req_duration{expected_response:false}"),
+            "false variant must NOT appear without a user threshold targeting it"
+        );
     }
 
     #[test]

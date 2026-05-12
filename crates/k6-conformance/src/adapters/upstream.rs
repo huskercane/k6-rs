@@ -68,6 +68,11 @@ impl Adapter for UpstreamAdapter {
             exit_code: artifacts.exit_code,
             checks,
             groups,
+            // CG-6: the runner reads the event stream + sidecar
+            // separately and populates these post-adapt. Keeps the
+            // summary-export adapter focused on its single concern.
+            event_stream: None,
+            reliability: None,
         })
     }
 }

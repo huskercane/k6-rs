@@ -7,7 +7,9 @@
 pub mod counters;
 pub mod trends;
 
-use crate::canonical::{CanonicalMetricKind, CanonicalRun};
+use crate::canonical::{
+    CanonicalEventStream, CanonicalMetricKind, CanonicalRun,
+};
 use crate::expectations::{Expectations, Tolerance};
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,31 @@ pub enum FindingKind {
     /// `id` (CG-2). Mirrors `CheckIdMismatch`: a hash/serialization-layer
     /// bug, not a tree-shape bug.
     GroupIdMismatch,
+    /// CG-6 — Metric definition event present in only one side's event
+    /// stream.
+    MissingMetricDef,
+    /// CG-6 — Metric definition kind differs (e.g. counter vs trend).
+    MetricKindMismatch,
+    /// CG-6 — Metric definition `contains` field differs (`"default"` vs
+    /// `"time"`).
+    MetricContainsMismatch,
+    /// CG-6 — Per-metric sample count differs beyond the script's
+    /// tolerance. Catches dropped emissions or extra spurious emissions.
+    SampleCountMismatch,
+    /// CG-6 follow-up — The per-side `--out json` event-stream file
+    /// either didn't exist after the run OR was unparseable. Hard
+    /// finding (FAIL): a missing/corrupt stream file means the sink
+    /// pipeline broke and the diff has no evidence to work from.
+    /// Distinct from UNRELIABLE (drops happened but evidence is intact)
+    /// because here the evidence itself is gone.
+    StreamFileError,
+    /// CG-6 follow-up — The k6-rs `.diagnostics.json` sidecar was
+    /// missing or unparseable. Always set on the k6-rs side; tolerated
+    /// (no finding) on upstream because upstream's writer is unbounded
+    /// and doesn't emit a sidecar. The presence of this finding marks
+    /// the run UNRELIABLE — we have no reliability evidence for the
+    /// k6-rs side, so its stream can't be trusted as parity evidence.
+    SidecarUnreadable,
 }
 
 /// Compare two runs and produce findings. Caller is responsible for
@@ -150,6 +177,19 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
         }
     }
 
+    // CG-6: per-sample event stream diff (Metric defs + per-metric sample
+    // counts). Only runs when BOTH sides produced a stream — older scripts
+    // without sink-stream coverage carry None and skip this. Tag-bucket
+    // counts are intentionally NOT compared in the first cut: k6-rs is
+    // missing several upstream-default tags (name/url/proto/group/
+    // scenario), so per-tag-bucket diff would fail every script until
+    // those tag-emission gaps close (tracked separately).
+    if let (Some(l_stream), Some(r_stream)) =
+        (&left.event_stream, &right.event_stream)
+    {
+        out.extend(diff_event_streams(l_stream, r_stream, exp));
+    }
+
     // CG-2: per-group identity diff. Pass-through on the same `known_drift`
     // filter — paths can be acknowledged as architectural asymmetries.
     let mut group_keys: Vec<&String> =
@@ -178,6 +218,101 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
                 }
             }
             (None, None) => unreachable!(),
+        }
+    }
+
+    out
+}
+
+/// CG-6 — event-stream diff. Compares Metric definitions and per-metric
+/// sample counts symmetrically. Per the spike acceptance criterion: no
+/// adapter-specific branches. The `left` and `right` arguments are
+/// interchangeable; identical inputs always produce identical findings.
+pub(crate) fn diff_event_streams(
+    left: &CanonicalEventStream,
+    right: &CanonicalEventStream,
+    exp: &Expectations,
+) -> Vec<DiffFinding> {
+    let mut out = Vec::new();
+
+    // 1. Metric definition union: missing + kind + contains mismatches.
+    let mut def_names: Vec<&String> = left
+        .metric_defs
+        .keys()
+        .chain(right.metric_defs.keys())
+        .collect();
+    def_names.sort();
+    def_names.dedup();
+    for name in def_names {
+        if exp.is_known_drift(name) {
+            continue;
+        }
+        match (
+            left.metric_defs.get(name),
+            right.metric_defs.get(name),
+        ) {
+            (None, Some(_)) | (Some(_), None) => out.push(DiffFinding {
+                kind: FindingKind::MissingMetricDef,
+                selector: name.clone(),
+                detail: "Metric event present on only one side".into(),
+            }),
+            (Some(l), Some(r)) => {
+                if l.kind != r.kind {
+                    out.push(DiffFinding {
+                        kind: FindingKind::MetricKindMismatch,
+                        selector: name.clone(),
+                        detail: format!(
+                            "kind differs: {} vs {}",
+                            l.kind.as_str(),
+                            r.kind.as_str()
+                        ),
+                    });
+                }
+                if l.contains != r.contains {
+                    out.push(DiffFinding {
+                        kind: FindingKind::MetricContainsMismatch,
+                        selector: name.clone(),
+                        detail: format!(
+                            "contains differs: {:?} vs {:?}",
+                            l.contains, r.contains
+                        ),
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    // 2. Per-metric sample count diff. Uses the metric's tolerance (from
+    // expectations.toml) — `Exact` for counters, `Relative(eps)` for
+    // metrics with naturally-variable sample counts. A metric present in
+    // only one side counts the other as 0 and either matches (if drift
+    // tolerated) or is flagged.
+    let mut count_names: Vec<&String> = left
+        .sample_counts
+        .keys()
+        .chain(right.sample_counts.keys())
+        .collect();
+    count_names.sort();
+    count_names.dedup();
+    for name in count_names {
+        if exp.is_known_drift(name) {
+            continue;
+        }
+        let l = *left.sample_counts.get(name).unwrap_or(&0);
+        let r = *right.sample_counts.get(name).unwrap_or(&0);
+        // Sample counts are integer-valued — use the `count` tolerance
+        // from the script's expectations (matches the counter-metric
+        // tolerance dimension; trends/rates would use different fields).
+        let profile = exp.tolerance_for(name);
+        if let Some(detail) =
+            check_tolerance("sample_count", l as f64, r as f64, &profile.count)
+        {
+            out.push(DiffFinding {
+                kind: FindingKind::SampleCountMismatch,
+                selector: name.clone(),
+                detail,
+            });
         }
     }
 

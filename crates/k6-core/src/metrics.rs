@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use parking_lot::RwLock;
+
+use crate::output::event_stream::{EventSink, MetricKind, SinkEvent};
 use crate::selector::MetricSelector;
 
 /// A thread-safe metrics registry that collects all built-in and custom metrics.
@@ -30,6 +33,15 @@ pub struct MetricsRegistry {
     rates: Mutex<HashMap<String, RateMetric>>,
     trends: Mutex<HashMap<String, TrendMetric>>,
     group_tree: Mutex<GroupNode>,
+    /// CG-6 — set when `--out json` is in use. Each metric write also
+    /// emits a `SinkEvent` for the upstream-compatible event stream.
+    /// `RwLock<Option<...>>` because the sink must be droppable at stop
+    /// (so the writer task's bounded channel closes and final flush +
+    /// sidecar emit run); `OnceLock` was wrong since it can't be cleared,
+    /// which would leak a sender clone and hang the writer forever.
+    /// Read overhead on the hot path is one uncontended rwlock read,
+    /// which parking_lot makes effectively free in steady state.
+    event_sink: RwLock<Option<EventSink>>,
 }
 
 /// One node in the run's group tree (CG-2). `children` keys are child group
@@ -174,6 +186,30 @@ fn stored_matches_query(stored: &str, query: &Option<MetricSelector>, raw_query:
         return false;
     }
     q.tags.iter().all(|(k, v)| s.tags.get(k) == Some(v))
+}
+
+/// CG-6 hot-path helper: split a canonical metric key into `(base_name,
+/// tag_map)` for sink emission. Fast path: untagged names skip parsing
+/// entirely. Tagged path mirrors `MetricSelector::canonical()`'s output
+/// shape (alphabetical key order, single `:` separator) — does NOT
+/// validate; the writer trusts that storage keys are well-formed.
+fn split_canonical_for_sink(canonical: &str) -> (String, BTreeMap<String, String>) {
+    let Some(brace_idx) = canonical.find('{') else {
+        return (canonical.to_string(), BTreeMap::new());
+    };
+    let name = canonical[..brace_idx].to_string();
+    let mut tags = BTreeMap::new();
+    let end = canonical.len().saturating_sub(1); // drop trailing '}'
+    if end <= brace_idx + 1 {
+        return (name, tags);
+    }
+    let body = &canonical[brace_idx + 1..end];
+    for pair in body.split(',') {
+        if let Some(colon) = pair.find(':') {
+            tags.insert(pair[..colon].to_string(), pair[colon + 1..].to_string());
+        }
+    }
+    (name, tags)
 }
 
 /// A monotonically increasing counter (e.g., http_reqs, iterations, data_sent).
@@ -440,6 +476,47 @@ impl MetricsRegistry {
         Self::default()
     }
 
+    /// CG-6 — install the event-stream sink. Called once at CLI parse when
+    /// `--out json=...` is configured. Returns the sink in Err if already
+    /// set (shouldn't happen in normal flows; surfaces a wiring bug).
+    pub fn set_event_sink(&self, sink: EventSink) -> Result<(), EventSink> {
+        let mut slot = self.event_sink.write();
+        if slot.is_some() {
+            return Err(sink);
+        }
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    /// CG-6 — drop the registry's sender clone. Must be called at stop
+    /// BEFORE awaiting the writer task handle, otherwise the channel
+    /// stays open (writer's `rx.recv()` blocks forever) and the run
+    /// hangs at exit.
+    pub fn clear_event_sink(&self) {
+        *self.event_sink.write() = None;
+    }
+
+    /// CG-6 — emit a sample event if a sink is installed. Hot path: one
+    /// uncontended rwlock read returns None in the common case (no JSON
+    /// output configured). When a sink is present, the canonical metric
+    /// key is split into (base name, tag map) cheaply (single linear
+    /// scan, no full MetricSelector::parse on the hot path) before being
+    /// handed to the sink.
+    fn emit_to_sink(&self, kind: MetricKind, canonical_name: &str, value: f64) {
+        let guard = self.event_sink.read();
+        let Some(sink) = guard.as_ref() else {
+            return;
+        };
+        let (metric_name, tags) = split_canonical_for_sink(canonical_name);
+        sink.try_record(SinkEvent {
+            metric_name,
+            metric_kind: kind,
+            time: time::OffsetDateTime::now_utc(),
+            value,
+            tags,
+        });
+    }
+
     // --- Tagged metric helpers (CG-3) ---
     //
     // Storage keys by the FULL normalized tag set, encoded via
@@ -522,12 +599,15 @@ impl MetricsRegistry {
     // --- Counter operations ---
 
     pub fn counter_add(&self, name: &str, value: u64) {
-        let mut counters = self.counters.lock().unwrap();
-        counters
-            .entry(name.to_string())
-            .or_insert_with(CounterMetric::new)
-            .value
-            .fetch_add(value, Ordering::Relaxed);
+        {
+            let mut counters = self.counters.lock().unwrap();
+            counters
+                .entry(name.to_string())
+                .or_insert_with(CounterMetric::new)
+                .value
+                .fetch_add(value, Ordering::Relaxed);
+        }
+        self.emit_to_sink(MetricKind::Counter, name, value as f64);
     }
 
     /// CG-3: aggregate all stored counter entries whose name matches and
@@ -550,15 +630,18 @@ impl MetricsRegistry {
     // --- Gauge operations ---
 
     pub fn gauge_set(&self, name: &str, value: f64) {
-        let mut gauges = self.gauges.lock().unwrap();
-        let gauge = gauges
-            .entry(name.to_string())
-            .or_insert_with(GaugeMetric::new);
+        {
+            let mut gauges = self.gauges.lock().unwrap();
+            let gauge = gauges
+                .entry(name.to_string())
+                .or_insert_with(GaugeMetric::new);
 
-        let bits = value.to_bits();
-        gauge.value.store(bits, Ordering::Relaxed);
-        gauge.min.fetch_min(bits, Ordering::Relaxed);
-        gauge.max.fetch_max(bits, Ordering::Relaxed);
+            let bits = value.to_bits();
+            gauge.value.store(bits, Ordering::Relaxed);
+            gauge.min.fetch_min(bits, Ordering::Relaxed);
+            gauge.max.fetch_max(bits, Ordering::Relaxed);
+        }
+        self.emit_to_sink(MetricKind::Gauge, name, value);
     }
 
     pub fn gauge_get(&self, name: &str) -> f64 {
@@ -572,15 +655,22 @@ impl MetricsRegistry {
     // --- Rate operations ---
 
     pub fn rate_add(&self, name: &str, passed: bool) {
-        let mut rates = self.rates.lock().unwrap();
-        let rate = rates
-            .entry(name.to_string())
-            .or_insert_with(RateMetric::new);
+        {
+            let mut rates = self.rates.lock().unwrap();
+            let rate = rates
+                .entry(name.to_string())
+                .or_insert_with(RateMetric::new);
 
-        rate.total.fetch_add(1, Ordering::Relaxed);
-        if passed {
-            rate.passes.fetch_add(1, Ordering::Relaxed);
+            rate.total.fetch_add(1, Ordering::Relaxed);
+            if passed {
+                rate.passes.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        // Wire-format value: 1.0 if the tracked event occurred, 0.0 otherwise.
+        // For http_req_failed (where `passed` is actually `failed`), this
+        // matches upstream's per-sample emission semantic — each sample
+        // contributes one bool to the rate denominator.
+        self.emit_to_sink(MetricKind::Rate, name, if passed { 1.0 } else { 0.0 });
     }
 
     /// CG-3: aggregate matching rate entries. Same subset semantics as
@@ -607,11 +697,14 @@ impl MetricsRegistry {
     // --- Trend operations ---
 
     pub fn trend_add(&self, name: &str, value_ms: f64) {
-        let mut trends = self.trends.lock().unwrap();
-        trends
-            .entry(name.to_string())
-            .or_insert_with(TrendMetric::new)
-            .record(value_ms);
+        {
+            let mut trends = self.trends.lock().unwrap();
+            trends
+                .entry(name.to_string())
+                .or_insert_with(TrendMetric::new)
+                .record(value_ms);
+        }
+        self.emit_to_sink(MetricKind::Trend, name, value_ms);
     }
 
     /// CG-3: aggregate matching trend entries via histogram merge. Same

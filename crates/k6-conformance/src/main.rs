@@ -27,6 +27,13 @@ enum Cmd {
         /// Directory containing scripts/*/script.js + expectations.toml.
         #[arg(long, default_value = "crates/k6-conformance/scripts")]
         scripts_dir: String,
+
+        /// CG-6 — write a structured JSON report to this path. Includes
+        /// top-level `overall_status` and per-script `status` +
+        /// `reliability` block so downstream tooling (CI, dashboards)
+        /// doesn't have to parse finding text.
+        #[arg(long)]
+        report_json: Option<String>,
     },
 }
 
@@ -39,6 +46,7 @@ async fn main() -> Result<()> {
             upstream_bin,
             k6rs_bin,
             scripts_dir,
+            report_json,
         } => {
             let cfg = k6_conformance::runner::Config {
                 upstream_bin: upstream_bin
@@ -49,6 +57,7 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "target/debug/k6-rs".into()),
                 scripts_dir: scripts_dir.into(),
                 filter,
+                report_json: report_json.map(std::path::PathBuf::from),
             };
             k6_conformance::runner::run(cfg).await
         }

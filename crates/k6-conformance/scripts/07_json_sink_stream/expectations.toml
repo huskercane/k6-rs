@@ -1,0 +1,26 @@
+[run]
+expected_exit_code = 0
+
+[tolerances]
+# Mirrors 01_http_get's tolerance profile — script shape is identical
+# (10 http.gets, no thresholds). 07's purpose is sink wire format, not
+# timing parity; chronic localhost µs-noise stays out of scope.
+default_counter = "exact"
+default_trend = "relative:0.50"
+
+[tolerances.overrides]
+# Sample counts: every http request emits a fixed number of metric writes,
+# so exact-match on counter metrics is the right gate. iterations/http_reqs
+# rate variance is the same µs-noise as 01.
+"http_reqs" = { count = "exact", rate = "relative:0.50" }
+"iterations" = { count = "exact", rate = "relative:0.50" }
+"data_sent" = { count = "relative:0.10", rate = "relative:0.50" }
+"data_received" = { count = "relative:0.10", rate = "relative:0.50" }
+
+# CG-6 — Known asymmetries between the upstream and k6-rs event streams.
+# These are real engine gaps but DELIBERATELY out of CG-6's scope per the
+# design's "don't bundle unrelated engine fixes" rule. Each has a
+# dedicated follow-up task on the parity backlog.
+[known_drift]
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry, unchanged by CG-6)"
+"vus_max" = "same as vus"

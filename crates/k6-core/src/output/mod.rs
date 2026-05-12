@@ -9,6 +9,7 @@
 
 pub mod csv;
 pub mod duckdb;
+pub mod event_stream;
 pub mod influxdb;
 pub mod json;
 pub mod prometheus;
@@ -61,6 +62,24 @@ pub trait Output: Send {
 
     /// Human-readable description for banner output (e.g., "json (results.json)")
     fn description(&self) -> String;
+
+    /// CG-6 — return the per-sample event sink if this output participates
+    /// in upstream-shaped event streaming. Snapshot-only outputs (CSV,
+    /// InfluxDB, Prometheus, DuckDB) return `None`; the caller installs
+    /// any returned sink on the `MetricsRegistry` so every metric write
+    /// fans out to this output's stream.
+    fn event_sink(&self) -> Option<event_stream::EventSink> {
+        None
+    }
+
+    /// CG-6 — companion to `event_sink`. Snapshot-only outputs return
+    /// `None`. JsonOutput returns the writer-task handle on first call so
+    /// the runner can await final flush + sidecar emit at process stop.
+    fn take_writer_handle(
+        &mut self,
+    ) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
+        None
+    }
 }
 
 /// Parse `--out` flag value into (plugin_name, arg).
@@ -75,10 +94,22 @@ pub fn parse_out_flag(value: &str) -> (&str, Option<&str>) {
 
 /// Create an output plugin from a parsed `--out` flag.
 pub fn create_output(name: &str, arg: Option<&str>) -> anyhow::Result<Box<dyn Output>> {
+    create_output_with_buffer_size(name, arg, None)
+}
+
+/// CG-6 variant: like `create_output` but threads `buffer_size` to outputs
+/// that use a bounded event sink (currently just `json`). Snapshot-only
+/// outputs ignore the value.
+pub fn create_output_with_buffer_size(
+    name: &str,
+    arg: Option<&str>,
+    buffer_size: Option<usize>,
+) -> anyhow::Result<Box<dyn Output>> {
     match name {
         "json" => {
             let path = arg.unwrap_or("results.json");
-            Ok(Box::new(json::JsonOutput::new(path)))
+            let cap = buffer_size.unwrap_or(event_stream::DEFAULT_CHANNEL_CAPACITY);
+            Ok(Box::new(json::JsonOutput::with_capacity(path, cap)))
         }
         "csv" => {
             let path = arg.unwrap_or("results.csv");

@@ -66,6 +66,13 @@ enum Commands {
         #[arg(long)]
         influxdb: Option<String>,
 
+        /// Bounded channel capacity for the --out json event sink (CG-6).
+        /// Drop-newest policy on overflow; per-metric drop counts are
+        /// emitted to the `<path>.diagnostics.json` sidecar. Default
+        /// 1_048_576 (~256 MB worst case at ~256 B/event).
+        #[arg(long = "out-buffer-size")]
+        out_buffer_size: Option<usize>,
+
         // --- HTTP & networking ---
         /// Skip verification of TLS certificates
         #[arg(long)]
@@ -181,6 +188,7 @@ struct CliOverrides {
     console_output: Option<String>,
     envs: Vec<String>,
     tags: Vec<String>,
+    out_buffer_size: Option<usize>,
 }
 
 #[tokio::main]
@@ -197,6 +205,7 @@ async fn main() -> Result<()> {
             stages,
             mut outputs,
             influxdb,
+            out_buffer_size,
             insecure_skip_tls_verify,
             no_connection_reuse,
             no_vu_connection_reuse,
@@ -249,6 +258,7 @@ async fn main() -> Result<()> {
                 console_output,
                 envs,
                 tags,
+                out_buffer_size,
             };
             run_test(&script, config.as_deref(), overrides, &outputs).await
         }
@@ -328,7 +338,8 @@ async fn run_test(
     let mut output_plugins: Vec<Box<dyn k6_core::output::Output>> = Vec::new();
     for spec in output_specs {
         let (name, arg) = k6_core::output::parse_out_flag(spec);
-        let mut plugin = k6_core::output::create_output(name, arg)?;
+        let mut plugin =
+            k6_core::output::create_output_with_buffer_size(name, arg, cli.out_buffer_size)?;
         plugin.start()?;
         output_plugins.push(plugin);
     }
@@ -352,6 +363,23 @@ async fn run_test(
     let handle = tokio::runtime::Handle::current();
     let cancel = CancellationToken::new();
     let metrics = BuiltinMetrics::new();
+
+    // CG-6: install any output-provided event sinks on the metrics
+    // registry so per-sample emission flows to the JSON event stream.
+    // Snapshot-only outputs return None and are skipped. The OnceLock
+    // accepts a single install; if multiple sinks ever needed to coexist
+    // we'd build a fan-out wrapper, but today only `--out json` provides
+    // one. Failure to install (already set) surfaces as a wiring bug.
+    for plugin in &output_plugins {
+        if let Some(sink) = plugin.event_sink() {
+            metrics
+                .registry
+                .set_event_sink(sink)
+                .map_err(|_| anyhow::anyhow!(
+                    "multiple --out json sinks attempted to install on a single registry"
+                ))?;
+        }
+    }
 
     // Set up global rate limiter if rps is configured
     let rate_limiter = k6_core::backpressure::RateLimiter::new(test_config.rps);
@@ -723,10 +751,27 @@ async fn run_test(
         }
     }
 
-    // Stop output plugins
+    // Stop output plugins. CG-6: also await event-stream writer tasks so
+    // the final NDJSON flush + sidecar emit complete before we exit.
+    // Order matters in three steps:
+    //   1. plugin.stop() — drops the plugin's local EventSink clone.
+    //   2. clear_event_sink() on the registry — drops the REGISTRY's
+    //      EventSink clone. Without this, the bounded channel keeps a
+    //      live sender and the writer's `rx.recv()` blocks forever.
+    //   3. await writer_handle — waits for the drained-and-closed signal.
+    let mut writer_handles = Vec::new();
     for plugin in &mut output_plugins {
         if let Err(e) = plugin.stop() {
             eprintln!("  warning: output plugin stop error: {e}");
+        }
+        if let Some(h) = plugin.take_writer_handle() {
+            writer_handles.push(h);
+        }
+    }
+    metrics.registry.clear_event_sink();
+    for h in writer_handles {
+        if let Err(e) = h.await {
+            eprintln!("  warning: output writer task join error: {e}");
         }
     }
 
@@ -962,6 +1007,7 @@ mod tests {
             console_output: None,
             envs: Vec::new(),
             tags: Vec::new(),
+            out_buffer_size: None,
         }
     }
 

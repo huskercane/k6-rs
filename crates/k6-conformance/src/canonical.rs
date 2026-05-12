@@ -35,6 +35,119 @@ pub struct CanonicalRun {
     /// diff against until sink-stream parity work lands. Identity (name,
     /// path, id) is what CG-2's conformance surface gates on.
     pub groups: BTreeMap<String, CanonicalGroup>,
+    /// CG-6 — per-sample event stream parsed from `--out json` artifacts on
+    /// both sides. `None` when the script doesn't exercise sink parity (or
+    /// when the adapter doesn't produce one yet). The diff layer treats
+    /// `None` on either side as "skip stream diff", so existing scripts
+    /// continue to work unchanged.
+    pub event_stream: Option<CanonicalEventStream>,
+    /// CG-6 — reliability tracking. Populated from the `.diagnostics.json`
+    /// sidecar each binary emits. A non-zero `drops_total` on EITHER side
+    /// flags the script as UNRELIABLE in the reporter — drops mean the
+    /// stream is incomplete and parity findings can't be trusted as
+    /// evidence. UNRELIABLE dominates PASS but does NOT hide other
+    /// findings; diff still runs and findings are listed.
+    pub reliability: Option<Reliability>,
+}
+
+/// CG-6 — canonical event-stream model. Both adapters (upstream + k6-rs)
+/// parse identical wire formats into this shape, so the diff layer is
+/// symmetric and adapter-agnostic.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalEventStream {
+    /// Metric definitions keyed by canonical name (base name with no tag
+    /// braces). Each metric must be defined exactly once before its first
+    /// sample. Upstream auto-creates the definition lazily on first sight;
+    /// k6-rs emits via the `DefState` queue in `event_stream.rs`.
+    pub metric_defs: BTreeMap<String, CanonicalMetricDef>,
+    /// Per-metric sample counts. We keep counts (not full sample lists)
+    /// because tag-set asymmetries between upstream and k6-rs (k6-rs is
+    /// missing `name`/`url`/`proto`/`group`/`scenario` system tags today)
+    /// would make any per-sample identity diff fail at every boundary.
+    /// First-cut diff strategy is metric-level counts only.
+    pub sample_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalMetricDef {
+    pub name: String,
+    pub kind: CanonicalMetricKindTag,
+    /// Upstream's `contains` field: `"default"` or `"time"`. We treat it
+    /// as opaque-but-comparable — the diff flags mismatches without
+    /// interpreting the semantic.
+    pub contains: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalMetricKindTag {
+    Counter,
+    Gauge,
+    Rate,
+    Trend,
+}
+
+impl CanonicalMetricKindTag {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "counter" => Self::Counter,
+            "gauge" => Self::Gauge,
+            "rate" => Self::Rate,
+            "trend" => Self::Trend,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Rate => "rate",
+            Self::Trend => "trend",
+        }
+    }
+}
+
+/// CG-6 — per-side reliability snapshot. Read from the
+/// `<out-json>.diagnostics.json` sidecar that k6-rs writes (and that
+/// upstream may or may not emit — see adapter notes). When upstream
+/// doesn't emit one, we synthesize a zero-drop entry: upstream's writer
+/// is unbounded and back-pressures producers, so by construction it
+/// never drops samples.
+#[derive(Debug, Clone)]
+pub struct Reliability {
+    pub upstream: SideReliability,
+    pub k6rs: SideReliability,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SideReliability {
+    pub capacity: u64,
+    pub peak_occupancy: u64,
+    pub drops_total: u64,
+    pub drops_per_metric: BTreeMap<String, u64>,
+    /// CG-6 follow-up: set when the sidecar evidence is missing or
+    /// unparseable. Tolerant for upstream (its writer is unbounded —
+    /// no sidecar by design); REQUIRED for k6-rs (the writer task
+    /// always emits one). When set, the run is UNRELIABLE because we
+    /// have no evidence about drops — analogous to a non-zero drop
+    /// count: we cannot trust this side's stream as parity evidence.
+    pub error: Option<String>,
+}
+
+impl Reliability {
+    /// A run is UNRELIABLE iff either side has drops OR either side's
+    /// reliability evidence is missing/unparseable (k6-rs sidecar
+    /// absence). Per the CG-6 design: UNRELIABLE dominates PASS, but
+    /// does NOT hide actual parity findings.
+    pub fn is_unreliable(&self) -> bool {
+        self.upstream.is_unreliable() || self.k6rs.is_unreliable()
+    }
+}
+
+impl SideReliability {
+    pub fn is_unreliable(&self) -> bool {
+        self.drops_total > 0 || self.error.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -34,6 +34,11 @@ impl Adapter for K6rsAdapter {
             exit_code: artifacts.exit_code,
             checks,
             groups,
+            // CG-6: event_stream + reliability are populated by the
+            // runner from the per-side json_stream + sidecar files; the
+            // summary-export adapter doesn't own that responsibility.
+            event_stream: None,
+            reliability: None,
         })
     }
 }

@@ -5,6 +5,7 @@
 //! else { ... }` appears in `src/diff/`, the canonical boundary is leaking and
 //! the architecture is wrong.
 
+pub mod json_stream;
 pub mod k6rs;
 pub mod upstream;
 

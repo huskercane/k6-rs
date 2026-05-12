@@ -19,6 +19,7 @@ use k6_core::executor::shared_iterations::SharedIterationsExecutor;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::vu_pool::VuPool;
 use k6_js::http_client::ReqwestHttpClient;
+use k6_js::hyper_client::{AnyHttpClient, HyperHttpClient};
 use k6_js::vu::{self, QuickJsVu};
 
 #[derive(Parser)]
@@ -335,8 +336,19 @@ async fn run_test(
     // Print banner
     print_banner(&test_config, script_path, &output_plugins);
 
-    // Create HTTP client and shared metrics
-    let client = Arc::new(ReqwestHttpClient::from_config(&test_config)?);
+    // Create HTTP client and shared metrics.
+    // K6RS_HTTP_CLIENT=hyper switches to the (b)-spike hyper-level client,
+    // which captures DNS/TCP/sending phase timings and exact wire-byte
+    // counts that the high-level reqwest API can't surface. Reqwest stays
+    // the default; the hyper path is plain-HTTP-only for now.
+    let use_hyper_client =
+        std::env::var("K6RS_HTTP_CLIENT").as_deref() == Ok("hyper");
+    let client = Arc::new(if use_hyper_client {
+        eprintln!("  http client: hyper (engine spike — plain HTTP only)");
+        AnyHttpClient::Hyper(HyperHttpClient::new())
+    } else {
+        AnyHttpClient::Reqwest(ReqwestHttpClient::from_config(&test_config)?)
+    });
     let handle = tokio::runtime::Handle::current();
     let cancel = CancellationToken::new();
     let metrics = BuiltinMetrics::new();
@@ -369,6 +381,58 @@ async fn run_test(
     });
 
     let test_start = std::time::Instant::now();
+
+    // CG-4: periodic threshold evaluator. Spawns only when at least one
+    // threshold has `abort_on_fail` set — without that, mid-run state
+    // tracking has no observable effect (end-of-run eval still runs
+    // unconditionally). The task snapshots metrics every 1s, updates
+    // per-threshold state, and triggers `cancel.cancel()` if any
+    // `abort_on_fail` threshold has been failing continuously for at
+    // least its `delay_abort_eval` grace period.
+    //
+    // The snapshot's `duration_secs` MUST be the real elapsed time since
+    // test start, not zero — counter rates are computed as
+    // `value / duration_secs`, and a zero duration makes all counter
+    // rates collapse to 0. Without this, a rate-based abort threshold
+    // like `http_reqs: 'rate<1'` would always see rate=0 mid-run and
+    // either spuriously pass or spuriously fail depending on direction.
+    if !cli.no_thresholds
+        && test_config
+            .thresholds
+            .values()
+            .flatten()
+            .any(|t| t.abort_on_fail)
+    {
+        let thresholds = test_config.thresholds.clone();
+        let registry = Arc::clone(&metrics.registry);
+        let cancel_eval = cancel.clone();
+        let eval_start = test_start;
+        tokio::spawn(async move {
+            use k6_core::thresholds::{update_states, TickDecision};
+            let mut states = std::collections::HashMap::new();
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            // Skip the immediate first tick — give the run ~1s to
+            // accumulate samples before the first eval.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel_eval.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let elapsed_secs = eval_start.elapsed().as_secs_f64();
+                        let snap = registry.snapshot(elapsed_secs);
+                        let now = std::time::Instant::now();
+                        if update_states(&thresholds, &snap, &mut states, now)
+                            == TickDecision::Abort
+                        {
+                            eprintln!("threshold abort: failing threshold(s) crossed delayAbortEval window — stopping run");
+                            cancel_eval.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Run setup() if the script defines it (unless --no-setup)
     let setup_data = if cli.no_setup {
@@ -582,9 +646,21 @@ async fn run_test(
         None
     };
 
+    // CG-4 follow-up: `--no-thresholds` means "disable threshold behavior
+    // entirely" — both end-of-run evaluation AND the threshold-driven
+    // summary shaping (filter to threshold-targeted tagged submetrics +
+    // subset-merge synthesis from CG-3). Passing `Some(&thresholds)` to
+    // build_summary_data while skipping the evaluator would leave summary
+    // shape coupled to a config the user asked to ignore.
+    let summary_thresholds = if cli.no_thresholds {
+        None
+    } else {
+        Some(&test_config.thresholds)
+    };
+
     // Export summary as JSON if --summary-export is set
     if let Some(ref path) = cli.summary_export {
-        let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration);
+        let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration, summary_thresholds);
         let json = serde_json::to_string_pretty(&summary_data)?;
         std::fs::write(path, &json)
             .with_context(|| format!("writing summary export to {path}"))?;
@@ -610,7 +686,7 @@ async fn run_test(
             )?;
 
             if summary_vu.has_handle_summary() {
-                let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration);
+                let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration, summary_thresholds);
                 let data_json = serde_json::to_string(&summary_data)?;
                 match summary_vu.run_handle_summary(&data_json) {
                     Ok(outputs) => {

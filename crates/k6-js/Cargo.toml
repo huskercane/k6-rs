@@ -33,6 +33,9 @@ aes-gcm = { workspace = true }
 cbc = { workspace = true }
 ctr = { workspace = true }
 pbkdf2 = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 
 [dev-dependencies]
 axum = "0.8"

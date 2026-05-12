@@ -3,6 +3,7 @@ pub mod config;
 pub mod executor;
 pub mod metrics;
 pub mod output;
+pub mod selector;
 pub mod shared;
 pub mod summary;
 pub mod thresholds;

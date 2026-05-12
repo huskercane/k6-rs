@@ -1,0 +1,22 @@
+[run]
+# Threshold fails immediately and abortOnFail triggers — both binaries
+# exit 99 (threshold failure).
+expected_exit_code = 99
+
+[tolerances]
+default_counter = "exact"
+default_trend = "relative:0.50"
+
+[tolerances.overrides]
+# Iteration count varies per binary depending on exact abort timing
+# (different VU loop overheads). The threshold itself is what we're
+# verifying; the iteration count just needs to be in the ballpark.
+"http_reqs" = { count = "relative:0.80", rate = "relative:0.80" }
+"iterations" = { count = "relative:0.80", rate = "relative:0.80" }
+"data_sent" = { count = "relative:0.80", rate = "relative:0.80" }
+"data_received" = { count = "relative:0.80", rate = "relative:0.80" }
+
+[known_drift]
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
+"vus_max" = "same as vus"
+"http_req_duration{expected_response:true}" = "k6-rs does not yet emit `expected_response` tag on http samples (post-CG-3 follow-up)"

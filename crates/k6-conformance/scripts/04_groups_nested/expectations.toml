@@ -1,0 +1,21 @@
+[run]
+expected_exit_code = 0
+
+[tolerances]
+default_counter = "exact"
+default_trend = "relative:0.30"
+
+[tolerances.overrides]
+"http_reqs" = { count = "exact", rate = "relative:0.50" }
+"iterations" = { count = "exact", rate = "relative:0.50" }
+"data_sent" = { count = "relative:0.10", rate = "relative:0.50" }
+"data_received" = { count = "relative:0.10", rate = "relative:0.50" }
+# Aggregate group_duration trend: 300 samples (3 group invocations × 100
+# iterations). Same µs-scale localhost variance as other trends.
+"group_duration" = { count = "exact", trend = "relative:0.30" }
+
+# Known asymmetries — acknowledged architectural gaps, NOT engine bugs.
+[known_drift]
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
+"vus_max" = "same as vus"
+"http_req_duration{expected_response:true}" = "submetric missing in k6-rs — blocked on CG-3 (full tag-set preservation)"

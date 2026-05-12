@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/k6-core", "crates/k6-js", "crates/k6-cli"]
+members = ["crates/k6-core", "crates/k6-js", "crates/k6-cli", "crates/k6-conformance"]
 resolver = "2"
 
 [workspace.package]
@@ -37,7 +37,7 @@ futures-util = "0.3"
 tonic = "0.13"
 prost = "0.13"
 prost-types = "0.13"
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 snap = "1"

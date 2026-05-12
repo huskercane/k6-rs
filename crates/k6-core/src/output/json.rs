@@ -72,13 +72,13 @@ mod tests {
         let mut output = JsonOutput::new(path.to_str().unwrap());
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot {
+        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 50, 5.0)],
             gauges: vec![],
             rates: vec![],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats {
+                TrendStats { p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,

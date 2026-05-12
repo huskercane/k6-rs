@@ -239,13 +239,13 @@ mod tests {
     fn snapshot_to_samples_converts() {
         use crate::metrics::{MetricsSnapshot, TrendStats};
 
-        let snapshot = MetricsSnapshot {
+        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![("vus".to_string(), 5.0, 1.0, 10.0)],
             rates: vec![("checks".to_string(), 0.95, 95, 100)],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats {
+                TrendStats { p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,

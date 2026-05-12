@@ -291,8 +291,16 @@ impl HttpClient for ReqwestHttpClient {
             builder = builder.timeout(timeout);
         }
 
+        // Materialize the request so we can count the bytes that go on the wire
+        // (request line + headers + blank line + body). Without this we'd be
+        // limited to body-only counting, which loses the lion's share of the
+        // bytes for headerful or empty-body requests — matching upstream k6's
+        // data_sent semantic requires the full message.
+        let request = builder.build()?;
+        let data_sent = estimate_request_bytes(&request);
+
         let send_start = Instant::now();
-        let response = builder.send().await?;
+        let response = client.execute(request).await?;
         let waiting_done = Instant::now();
 
         let status = response.status().as_u16();
@@ -302,24 +310,40 @@ impl HttpClient for ReqwestHttpClient {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let url = response.url().to_string();
+        // Compute response header bytes before consuming the body. Same shape
+        // (status line + headers + blank line) as upstream's data_received scope.
+        let response_header_bytes = estimate_response_header_bytes(&response);
 
         self.debug_response(status, &url, &headers);
 
+        let body_bytes_len: u64;
         let body = if self.discard_response_bodies {
-            drain_response_body(response).await?;
+            body_bytes_len = drain_response_body(response).await?;
             ResponseBody::Discarded
         } else {
-            ResponseBody::Buffered(buffer_response_body(
-                response,
-                self.max_response_body_size,
-            )
-            .await?)
+            let buffered =
+                buffer_response_body(response, self.max_response_body_size).await?;
+            body_bytes_len = buffered.len() as u64;
+            ResponseBody::Buffered(buffered)
         };
+        let data_received = response_header_bytes + body_bytes_len;
 
         let receive_done = Instant::now();
 
+        // reqwest's high-level API exposes three observable points:
+        //   send_start   — just before builder.send().await
+        //   waiting_done — when .send().await? returns (response headers received)
+        //   receive_done — when body buffering finishes
+        // It does NOT separate "request bytes written" from "first response byte",
+        // so we cannot measure the `sending` phase here without dropping to
+        // hyper-level instrumentation. Until that lands, sending is reported as
+        // 0 and the (write + TTFB) interval is folded into `waiting`. This
+        // matches what reqwest can actually distinguish; the previous code
+        // computed `sending = send_start.elapsed()` AFTER receive_done, which
+        // made `sending` effectively equal to `duration` and inflated the
+        // http_req_sending trend by ~100x in the conformance harness.
         let timings = Timings {
-            sending: send_start.elapsed().as_secs_f64() * 1000.0,
+            sending: 0.0,
             waiting: waiting_done.duration_since(send_start).as_secs_f64() * 1000.0,
             receiving: receive_done.duration_since(waiting_done).as_secs_f64() * 1000.0,
             duration: start.elapsed().as_secs_f64() * 1000.0,
@@ -332,15 +356,89 @@ impl HttpClient for ReqwestHttpClient {
             body,
             timings,
             url,
+            data_sent,
+            data_received,
         })
     }
 }
 
-async fn drain_response_body(mut response: reqwest::Response) -> Result<()> {
+async fn drain_response_body(mut response: reqwest::Response) -> Result<u64> {
+    let mut total: u64 = 0;
     while let Some(chunk) = response.chunk().await? {
-        let _ = chunk;
+        total += chunk.len() as u64;
     }
-    Ok(())
+    Ok(total)
+}
+
+/// Estimate the byte size of an HTTP/1.1 request as serialised on the wire:
+/// `METHOD path[?query] HTTP/1.1\r\n` + `Name: Value\r\n` per header + `\r\n` + body.
+///
+/// Synthesis, not transport-level measurement. We add the `Host` header
+/// explicitly because hyper inserts it at the connection layer from the URL —
+/// it's always present on the wire but absent from `request.headers()` until
+/// hyper writes the request. Reqwest may add a few more headers at that layer
+/// (e.g. `User-Agent` if the builder configured one, `Content-Length` for
+/// fixed-size bodies, `Connection: keep-alive` for pooled connections); those
+/// are not captured here, so this is a **lower bound** on what actually goes
+/// on the wire. Closing the gap to upstream's exact-byte counts requires
+/// hyper-level instrumentation (the (b) work). HTTP/2 (HPACK) would invalidate
+/// the estimate entirely; not in scope today (no HTTPS path exercised).
+fn estimate_request_bytes(request: &reqwest::Request) -> u64 {
+    let method = request.method().as_str();
+    let url = request.url();
+    let path = url.path();
+    let query_len = url.query().map(|q| q.len() + 1).unwrap_or(0); // +1 for '?'
+
+    // Request line: METHOD<sp>PATH[?QUERY]<sp>HTTP/1.1\r\n
+    let mut bytes: u64 = (method.len() + 1 + path.len() + query_len + 1 + 8 + 2) as u64;
+
+    // Host header (hyper inserts it at the connection layer; not in headers()).
+    if !request
+        .headers()
+        .keys()
+        .any(|k| k.as_str().eq_ignore_ascii_case("host"))
+    {
+        if let Some(host) = url.host_str() {
+            let host_value_len = match url.port() {
+                Some(p) => host.len() + 1 + p.to_string().len(),
+                None => host.len(),
+            };
+            // "Host" + ": " + value + "\r\n"
+            bytes += 4 + 2 + host_value_len as u64 + 2;
+        }
+    }
+
+    for (name, value) in request.headers() {
+        // "name: value\r\n"
+        bytes += name.as_str().len() as u64 + 2 + value.as_bytes().len() as u64 + 2;
+    }
+    bytes += 2; // blank line separator
+
+    if let Some(body) = request.body() {
+        if let Some(body_bytes) = body.as_bytes() {
+            bytes += body_bytes.len() as u64;
+        }
+    }
+
+    bytes
+}
+
+/// Estimate the byte size of an HTTP/1.1 response prelude (status line +
+/// headers + blank line), excluding body. Same caveats as
+/// [`estimate_request_bytes`].
+fn estimate_response_header_bytes(response: &reqwest::Response) -> u64 {
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("");
+
+    // Status line: HTTP/1.1<sp>NNN<sp>REASON\r\n
+    let mut bytes: u64 = (8 + 1 + 3 + 1 + reason.len() + 2) as u64;
+
+    for (name, value) in response.headers() {
+        bytes += name.as_str().len() as u64 + 2 + value.as_bytes().len() as u64 + 2;
+    }
+    bytes += 2; // blank line separator
+
+    bytes
 }
 
 async fn buffer_response_body(mut response: reqwest::Response, max_response_body_size: usize) -> Result<Vec<u8>> {
@@ -437,6 +535,165 @@ mod tests {
         let client = ReqwestHttpClient::from_config(&config).unwrap();
         assert_eq!(client.http_debug, Some("full".to_string()));
         assert!(client.throw);
+    }
+
+    /// Regression for bug (a): `sending` was being computed as
+    /// `send_start.elapsed()` AFTER receive_done, which equalled total request
+    /// duration instead of just-sending. After the fix, sending=0 (not
+    /// measurable from reqwest's high-level API), waiting absorbs the
+    /// write+TTFB interval, and waiting + receiving ≈ duration.
+    #[tokio::test]
+    async fn http_phase_boundaries_match_reqwest_observability() {
+        use axum::extract::Path;
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        async fn delay_handler(Path(ms): Path<u64>) -> String {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            "x".repeat(256) // give receiving phase something to do
+        }
+
+        let app = Router::new().route("/delay/{ms}", get(delay_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = ReqwestHttpClient::new(false).unwrap();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: format!("http://127.0.0.1:{}/delay/50", addr.port()),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+        let resp = client.send(req).await.unwrap();
+
+        // sending is not measurable here and must be 0 — not the duration.
+        assert_eq!(
+            resp.timings.sending, 0.0,
+            "sending should be 0 (reqwest can't separate it); was {}",
+            resp.timings.sending
+        );
+        // waiting must absorb the server delay (50ms) plus connection setup.
+        assert!(
+            resp.timings.waiting >= 45.0,
+            "waiting should be >= 45ms (server delay 50ms); was {}",
+            resp.timings.waiting
+        );
+        // Sanity: duration >= waiting + receiving, and waiting is NOT the same
+        // as duration (the bug equated them).
+        assert!(
+            resp.timings.duration >= resp.timings.waiting + resp.timings.receiving - 0.5,
+            "duration ({}) must cover waiting ({}) + receiving ({})",
+            resp.timings.duration,
+            resp.timings.waiting,
+            resp.timings.receiving
+        );
+        assert!(
+            resp.timings.receiving >= 0.0,
+            "receiving must be non-negative"
+        );
+    }
+
+    /// Regression for bug (3): data_sent / data_received used to be body-only
+    /// counts (`body_bytes.len()` for sent, response-body length for received),
+    /// missing the request line + headers entirely. Upstream k6 counts the full
+    /// HTTP message. This test asserts the new full-message scope and the
+    /// approximate magnitude against a known-size response.
+    #[tokio::test]
+    async fn data_sent_and_received_count_headers_plus_body() {
+        use axum::routing::{get, post};
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Known fixed-size response body so we can reason about totals.
+        const RESP_BODY: &str = "abcdefghij"; // 10 bytes
+
+        let app = Router::new()
+            .route("/get", get(|| async { RESP_BODY }))
+            .route("/post", post(|body: String| async move { body }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = ReqwestHttpClient::new(false).unwrap();
+
+        // GET: no request body, small response body. data_sent must include
+        // the request line + headers (well above the previous 0 for body-less
+        // GETs). data_received must include status line + headers + body (>>
+        // the previous 10).
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("http://127.0.0.1:{}/get", addr.port()),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        // Lock the SEMANTIC: a body-less GET previously reported data_sent = 0;
+        // it must now cover at least the request line ("GET /get HTTP/1.1\r\n\r\n"
+        // = 21 bytes) plus a Host header (always present on the wire). The
+        // absolute number is a lower bound — closing the gap to upstream's
+        // exact-byte count requires hyper-level instrumentation (the (b) work).
+        assert!(
+            resp.data_sent >= 40,
+            "data_sent for a GET must cover request line + Host header; got {}",
+            resp.data_sent
+        );
+        assert_ne!(resp.data_sent, 0, "regression: data_sent must not be 0");
+
+        let body_len = match &resp.body {
+            ResponseBody::Buffered(b) => b.len() as u64,
+            ResponseBody::Discarded => 0,
+        };
+        assert_eq!(body_len, RESP_BODY.len() as u64);
+        assert!(
+            resp.data_received > body_len,
+            "data_received ({}) must exceed body length ({}) by status line + headers",
+            resp.data_received,
+            body_len
+        );
+        // Sanity: prelude is at least "HTTP/1.1 200 OK\r\n\r\n" = 19 bytes,
+        // plus whatever headers axum sends (content-length, content-type,
+        // date, etc.) — easily another 60+ bytes.
+        assert!(
+            resp.data_received - body_len >= 30,
+            "response prelude bytes too small: {} - {} = {}",
+            resp.data_received,
+            body_len,
+            resp.data_received - body_len
+        );
+
+        // POST with a body: data_sent must include the explicit body bytes
+        // PLUS request line + headers. Old behaviour returned just body_len.
+        let body_payload = b"x".repeat(100);
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Post,
+                url: format!("http://127.0.0.1:{}/post", addr.port()),
+                headers: Vec::new(),
+                body: Some(body_payload.clone()),
+                timeout: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            resp.data_sent > body_payload.len() as u64,
+            "data_sent ({}) for POST must exceed body ({})",
+            resp.data_sent,
+            body_payload.len()
+        );
     }
 
     #[test]

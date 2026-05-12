@@ -1,0 +1,22 @@
+[run]
+expected_exit_code = 0
+
+[tolerances]
+default_counter = "exact"
+# Wider trend tolerance: 100 iterations on localhost still has tail variance
+# at the µs/ms scale, especially at p95 and p99. The point of this script is
+# to prove p(99) flows end-to-end, not to lock in p99 to within 5%.
+default_trend = "relative:0.30"
+
+[tolerances.overrides]
+"http_reqs"   = { count = "exact", rate = "relative:0.50" }
+"iterations"  = { count = "exact", rate = "relative:0.50" }
+"data_sent"   = { count = "relative:0.10", rate = "relative:0.50" }
+"data_received" = { count = "relative:0.10", rate = "relative:0.50" }
+
+[known_drift]
+# Same architectural asymmetries as 01_http_get — upstream's --summary-export
+# omits gauges; k6-rs emits them.
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
+"vus_max" = "same as vus"
+"http_req_duration{expected_response:true}" = "submetric missing in k6-rs — blocked on CG-3 (full tag-set preservation)"

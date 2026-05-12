@@ -107,8 +107,16 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
             "__http_request",
             Function::new(
                 ctx.clone(),
-                move |method: String, url: String, body: rquickjs::Value<'_>, headers_json: String, timeout_ms: f64| -> rquickjs::Result<JsHttpResponse> {
+                move |method: String, url: String, body: rquickjs::Value<'_>, headers_json: String, timeout_ms: f64, tags_json: String| -> rquickjs::Result<JsHttpResponse> {
                     let headers: Vec<(String, String)> = serde_json::from_str(&headers_json)
+                        .unwrap_or_default();
+                    // CG-3: user-provided `tags: { k: v }` flows through to
+                    // the metric sample tagging. Combined with the system
+                    // tags below (status, method) the engine can store one
+                    // submetric per unique full-tag combination, which
+                    // makes thresholds like `http_req_duration{name:X,
+                    // status:200}` work as users expect.
+                    let user_tags: Vec<(String, String)> = serde_json::from_str(&tags_json)
                         .unwrap_or_default();
                     let timeout = if timeout_ms > 0.0 {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
@@ -123,8 +131,6 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                     } else {
                         None
                     };
-
-                    let send_bytes = body_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
 
                     let http_method = match method.as_str() {
                         "GET" => HttpMethod::Get,
@@ -154,13 +160,24 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                         Ok(resp) => {
                             if let Some(ref m) = metrics {
                                 let failed = resp.status >= 400;
-                                m.record_http_request(&resp.timings, failed);
-                                m.record_data_sent(send_bytes);
-                                let recv_bytes = match &resp.body {
-                                    ResponseBody::Buffered(b) => b.len() as u64,
-                                    ResponseBody::Discarded => 0,
-                                };
-                                m.record_data_received(recv_bytes);
+                                // CG-3: combine system tags (status, method)
+                                // with user tags into one full-tag set. Order
+                                // doesn't matter — storage canonicalizes via
+                                // MetricSelector. The `status` system tag is
+                                // what makes thresholds like
+                                // `http_req_duration{status:200}` work; the
+                                // user `name` tag is what scripts use to
+                                // distinguish endpoints in summary output.
+                                let mut all_tags: Vec<(String, String)> = user_tags.clone();
+                                all_tags.push(("status".to_string(), resp.status.to_string()));
+                                all_tags.push(("method".to_string(), method.clone()));
+                                m.record_http_request_tagged(&resp.timings, failed, &all_tags);
+                                // data_sent/data_received are computed in
+                                // http_client.rs as full HTTP message bytes
+                                // (request/status line + headers + body),
+                                // matching upstream k6's data_* metric scope.
+                                m.record_data_sent(resp.data_sent);
+                                m.record_data_received(resp.data_received);
                             }
 
                             let body_str = match &resp.body {
@@ -183,7 +200,18 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                         Err(e) => {
                             if let Some(ref m) = metrics {
                                 let timings = Timings::default();
-                                m.record_http_request(&timings, true);
+                                // CG-3: on transport failure we still know
+                                // method + the user tags. status is "0"
+                                // (sentinel for no response received) so
+                                // failure-bucket thresholds like
+                                // `http_req_duration{status:0}` work.
+                                let mut all_tags: Vec<(String, String)> = user_tags.clone();
+                                all_tags.push(("status".to_string(), "0".to_string()));
+                                all_tags.push(("method".to_string(), method.clone()));
+                                m.record_http_request_tagged(&timings, true, &all_tags);
+                                // Failed before the request hit the wire — no
+                                // bytes sent or received that we can measure
+                                // from reqwest's high-level error.
                             }
 
                             let error_code = classify_error(&e);
@@ -300,7 +328,13 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                 const headers = JSON.stringify(Object.entries(allHeaders));
                 const bodyArg = (typeof body === 'object' && body !== null) ? JSON.stringify(body) : (body || null);
                 const timeoutMs = (params && params.timeout) ? Number(params.timeout) : 0;
-                const responseObj = __http_request(method, url, bodyArg, headers, timeoutMs);
+                // CG-3: forward user-provided `tags: { k: v }` so the engine
+                // can attach them to http metric samples and store the full
+                // tag combination.
+                const tagsJson = (params && params.tags && typeof params.tags === 'object')
+                    ? JSON.stringify(Object.entries(params.tags))
+                    : '[]';
+                const responseObj = __http_request(method, url, bodyArg, headers, timeoutMs, tagsJson);
                 return __wrap_response(responseObj);
             },
             get: function(url, params) {
@@ -480,6 +514,8 @@ mod tests {
                     ..Default::default()
                 },
                 url: "http://mock.test".to_string(),
+                data_sent: 0,
+                data_received: 0,
             };
             async move { Ok(resp) }
         }
@@ -501,6 +537,8 @@ mod tests {
                     ..Default::default()
                 },
                 url: "http://mock.test".to_string(),
+                data_sent: 0,
+                data_received: 0,
             };
             async move { Ok(resp) }
         }

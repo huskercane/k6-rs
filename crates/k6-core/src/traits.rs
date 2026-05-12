@@ -89,6 +89,14 @@ pub struct HttpResponse {
     pub body: ResponseBody,
     pub timings: Timings,
     pub url: String,
+    /// Total bytes of the HTTP REQUEST as it appears on the wire:
+    /// request line + all request headers + blank line + body. Matches the
+    /// `data_sent` semantics upstream k6 uses (full HTTP message, not body only).
+    pub data_sent: u64,
+    /// Total bytes of the HTTP RESPONSE as it appears on the wire:
+    /// status line + all response headers + blank line + body. Matches the
+    /// `data_received` semantics upstream k6 uses.
+    pub data_received: u64,
 }
 
 /// Response body with memory controls.
@@ -106,9 +114,18 @@ pub type Tags = Vec<(String, String)>;
 ///
 /// Implementations can aggregate in-memory (for summary output)
 /// or stream to external systems (JSON, InfluxDB, etc.).
+///
+/// `record_check` carries `group_path` so per-check identity (CG-1 in
+/// [`crate::metrics::MetricsRegistry`]) is preserved regardless of which
+/// collector backs the runtime. A collector that drops the path will
+/// silently collapse all checks of the same name across different groups
+/// into a single record — exactly the bug CG-1 closed for the
+/// `BuiltinMetrics` path. This trait has no implementors today; the
+/// signature is kept faithful so the next implementor can't accidentally
+/// regress.
 pub trait MetricsCollector: Send + Sync {
     fn record_http(&self, timings: &Timings, tags: &Tags);
-    fn record_check(&self, passed: bool, name: &str, tags: &Tags);
+    fn record_check(&self, passed: bool, name: &str, group_path: &str, tags: &Tags);
     fn record_iteration(&self, duration: Duration, tags: &Tags);
     fn record_dropped(&self);
     fn record_data_sent(&self, bytes: u64, tags: &Tags);

@@ -9,6 +9,10 @@ use serde_json::Value;
 pub struct TestConfig {
     pub vus: u32,
     pub duration: Duration,
+    /// Top-level `options.iterations` — when set without an explicit `scenarios`
+    /// block, the default scenario becomes shared-iterations rather than
+    /// constant-vus. Matches upstream k6 behavior.
+    pub iterations: Option<u32>,
     pub scenarios: HashMap<String, ScenarioConfig>,
     pub discard_response_bodies: bool,
     pub max_redirects: Option<u32>,
@@ -16,7 +20,11 @@ pub struct TestConfig {
     pub no_connection_reuse: bool,
     pub no_vu_connection_reuse: bool,
     pub insecure_skip_tls_verify: bool,
-    pub thresholds: HashMap<String, Vec<String>>,
+    /// CG-4: thresholds now carry per-entry `abort_on_fail` +
+    /// `delay_abort_eval` config alongside the expression. Parsed from
+    /// either the legacy string form or the object form — see
+    /// `parse_thresholds`.
+    pub thresholds: HashMap<String, Vec<crate::thresholds::Threshold>>,
     /// TLS minimum version: "tls1.0", "tls1.1", "tls1.2", "tls1.3"
     pub tls_version: Option<TlsVersionConfig>,
     /// DNS configuration
@@ -62,6 +70,7 @@ impl Default for TestConfig {
         Self {
             vus: 1,
             duration: Duration::from_secs(10),
+            iterations: None,
             scenarios: HashMap::new(),
             discard_response_bodies: false,
             max_redirects: None,
@@ -215,6 +224,13 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
         config.duration = parse_duration(s)?;
     }
 
+    if let Some(v) = obj.get("iterations") {
+        let n = v.as_u64().context("iterations must be a number")?;
+        if n > 0 {
+            config.iterations = Some(n as u32);
+        }
+    }
+
     if let Some(v) = obj.get("discardResponseBodies") {
         config.discard_response_bodies = v.as_bool().context("discardResponseBodies must be bool")?;
     }
@@ -292,15 +308,28 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
         config.scenarios = parse_scenarios(scenarios)?;
     }
 
-    // If no scenarios defined but vus+duration are set, create a default scenario
+    // If no scenarios defined but vus is set, create a default scenario.
+    // Iterations (if set) wins over duration — pick shared-iterations executor,
+    // matching upstream k6's behavior for top-level `iterations`. `duration`
+    // then acts as the max-duration cap. (CLI -i path in k6-cli/src/main.rs
+    // already does this; we just bring the script-options path into line.)
     if config.scenarios.is_empty() && config.vus > 0 {
+        let executor = if let Some(iters) = config.iterations {
+            ExecutorType::SharedIterations {
+                vus: config.vus,
+                iterations: iters,
+                max_duration: config.duration,
+            }
+        } else {
+            ExecutorType::ConstantVus {
+                vus: config.vus,
+                duration: config.duration,
+            }
+        };
         config.scenarios.insert(
             "default".to_string(),
             ScenarioConfig {
-                executor: ExecutorType::ConstantVus {
-                    vus: config.vus,
-                    duration: config.duration,
-                },
+                executor,
                 exec: None,
                 start_time: Duration::ZERO,
                 graceful_stop: Duration::from_secs(30),
@@ -313,7 +342,7 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
     Ok(config)
 }
 
-fn parse_thresholds(value: &Value) -> Result<HashMap<String, Vec<String>>> {
+fn parse_thresholds(value: &Value) -> Result<HashMap<String, Vec<crate::thresholds::Threshold>>> {
     let obj = value
         .as_object()
         .context("thresholds must be an object")?;
@@ -323,18 +352,55 @@ fn parse_thresholds(value: &Value) -> Result<HashMap<String, Vec<String>>> {
         let conditions = match val {
             Value::Array(arr) => arr
                 .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(|s| s.to_string())
-                        .context("threshold value must be a string")
-                })
+                .map(|v| parse_one_threshold(name, v))
                 .collect::<Result<Vec<_>>>()?,
-            Value::String(s) => vec![s.clone()],
-            _ => bail!("threshold for {name} must be a string or array of strings"),
+            Value::String(s) => vec![crate::thresholds::Threshold::from_expression(s.clone())],
+            _ => bail!("threshold for {name} must be a string, array of strings, or array of objects"),
         };
         thresholds.insert(name.clone(), conditions);
     }
     Ok(thresholds)
+}
+
+/// CG-4: parse one entry in a threshold array. Accepts either:
+///   - a bare string `"p(95)<2000"` (legacy form, `abort_on_fail = false`)
+///   - an object `{ threshold: "...", abortOnFail: bool, delayAbortEval: "500ms" }`
+/// Object form matches upstream's `thresholdConfig` shape. `delayAbortEval`
+/// is parsed via the shared `parse_duration` so `'500ms'`, `'10s'`, `'1m30s'`
+/// all work; default is zero (immediate abort once the threshold first
+/// fails).
+fn parse_one_threshold(metric_name: &str, v: &Value) -> Result<crate::thresholds::Threshold> {
+    if let Some(s) = v.as_str() {
+        return Ok(crate::thresholds::Threshold::from_expression(s));
+    }
+    if let Some(obj) = v.as_object() {
+        let expression = obj
+            .get("threshold")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!("threshold object for {metric_name} missing required string field `threshold`")
+            })?
+            .to_string();
+        let abort_on_fail = obj
+            .get("abortOnFail")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let delay_abort_eval = match obj.get("delayAbortEval") {
+            None => std::time::Duration::ZERO,
+            Some(Value::String(s)) => parse_duration(s).with_context(|| {
+                format!("threshold for {metric_name}: invalid delayAbortEval {s:?}")
+            })?,
+            Some(other) => bail!(
+                "threshold for {metric_name}: delayAbortEval must be a duration string, got {other:?}"
+            ),
+        };
+        return Ok(crate::thresholds::Threshold {
+            expression,
+            abort_on_fail,
+            delay_abort_eval,
+        });
+    }
+    bail!("threshold entry for {metric_name} must be a string or object, got {v:?}")
 }
 
 fn parse_scenarios(value: &Value) -> Result<HashMap<String, ScenarioConfig>> {
@@ -581,6 +647,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_options_with_iterations_builds_shared_iterations_scenario() {
+        // Regression: previously top-level `iterations` was silently dropped,
+        // causing the conformance harness to see ~475K iterations in 10s
+        // instead of stopping at the requested count.
+        let opts = json!({
+            "vus": 1,
+            "iterations": 10,
+        });
+        let config = parse_options(&opts).unwrap();
+        assert_eq!(config.iterations, Some(10));
+        assert_eq!(config.scenarios.len(), 1);
+        let default = &config.scenarios["default"];
+        assert_eq!(
+            default.executor,
+            ExecutorType::SharedIterations {
+                vus: 1,
+                iterations: 10,
+                max_duration: Duration::from_secs(10), // default duration acts as the cap
+            }
+        );
+    }
+
+    #[test]
+    fn parse_options_iterations_zero_is_ignored() {
+        let opts = json!({ "vus": 1, "iterations": 0 });
+        let config = parse_options(&opts).unwrap();
+        assert_eq!(config.iterations, None);
+        // Falls back to constant-vus, since zero iterations is meaningless.
+        assert!(matches!(
+            config.scenarios["default"].executor,
+            ExecutorType::ConstantVus { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_options_explicit_scenarios_override_top_level_iterations() {
+        // If the script declares scenarios explicitly, top-level iterations
+        // is recorded but does not synthesize a default scenario.
+        let opts = json!({
+            "vus": 1,
+            "iterations": 10,
+            "scenarios": {
+                "custom": {
+                    "executor": "constant-vus",
+                    "vus": 3,
+                    "duration": "5s"
+                }
+            }
+        });
+        let config = parse_options(&opts).unwrap();
+        assert_eq!(config.iterations, Some(10));
+        assert_eq!(config.scenarios.len(), 1);
+        assert!(config.scenarios.contains_key("custom"));
+        assert!(!config.scenarios.contains_key("default"));
+    }
+
+    #[test]
     fn parse_with_thresholds() {
         let opts = json!({
             "vus": 1,
@@ -593,10 +716,64 @@ mod tests {
 
         let config = parse_options(&opts).unwrap();
         assert_eq!(config.thresholds.len(), 2);
-        assert_eq!(
-            config.thresholds["http_req_duration"],
-            vec!["p(95)<2000"]
-        );
+        // CG-4: legacy string-form thresholds parse with abort_on_fail=false.
+        let dur = &config.thresholds["http_req_duration"];
+        assert_eq!(dur.len(), 1);
+        assert_eq!(dur[0].expression, "p(95)<2000");
+        assert!(!dur[0].abort_on_fail);
+        assert_eq!(dur[0].delay_abort_eval, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn parse_with_object_form_thresholds() {
+        // CG-4 regression: object-form threshold parses abortOnFail +
+        // delayAbortEval. Backward-compatible — string and object forms
+        // can interleave in the same array.
+        let opts = json!({
+            "thresholds": {
+                "http_req_failed": [
+                    "rate<0.01",
+                    { "threshold": "rate<0.02", "abortOnFail": true, "delayAbortEval": "500ms" }
+                ]
+            }
+        });
+        let config = parse_options(&opts).unwrap();
+        let xs = &config.thresholds["http_req_failed"];
+        assert_eq!(xs.len(), 2);
+        // String form: defaults.
+        assert_eq!(xs[0].expression, "rate<0.01");
+        assert!(!xs[0].abort_on_fail);
+        assert_eq!(xs[0].delay_abort_eval, std::time::Duration::ZERO);
+        // Object form: full config.
+        assert_eq!(xs[1].expression, "rate<0.02");
+        assert!(xs[1].abort_on_fail);
+        assert_eq!(xs[1].delay_abort_eval, std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn parse_object_form_threshold_omitted_fields_default() {
+        // delayAbortEval omitted → zero (immediate). abortOnFail omitted →
+        // false. Only `threshold` is required.
+        let opts = json!({
+            "thresholds": {
+                "checks": [{ "threshold": "rate>0.95" }]
+            }
+        });
+        let config = parse_options(&opts).unwrap();
+        let xs = &config.thresholds["checks"];
+        assert_eq!(xs[0].expression, "rate>0.95");
+        assert!(!xs[0].abort_on_fail);
+        assert_eq!(xs[0].delay_abort_eval, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn parse_object_form_missing_threshold_field_errors() {
+        let opts = json!({
+            "thresholds": {
+                "checks": [{ "abortOnFail": true }]
+            }
+        });
+        assert!(parse_options(&opts).is_err());
     }
 
     #[test]

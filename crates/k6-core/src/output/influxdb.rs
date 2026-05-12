@@ -181,7 +181,7 @@ mod tests {
         let mut output = InfluxDbOutput::new("http://localhost:8086/k6").unwrap();
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot {
+        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![],

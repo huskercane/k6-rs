@@ -1,0 +1,82 @@
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+  # Pin upstream k6 deliberately. Bump as a separate, intentional PR.
+  # Matches the version ../k6 is checked out at when this port was last validated.
+  # Bump only as a deliberate conformance campaign.
+  K6_UPSTREAM_VERSION: "v2.0.0"
+
+jobs:
+  conformance:
+    name: Spike (http_get)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache upstream k6 binary
+        id: cache-k6
+        uses: actions/cache@v4
+        with:
+          path: ~/bin/k6
+          key: k6-upstream-${{ env.K6_UPSTREAM_VERSION }}-linux-amd64
+
+      - name: Download upstream k6
+        if: steps.cache-k6.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/bin
+          VERSION="${K6_UPSTREAM_VERSION#v}"
+          URL="https://github.com/grafana/k6/releases/download/${K6_UPSTREAM_VERSION}/k6-v${VERSION}-linux-amd64.tar.gz"
+          curl -sSL "$URL" -o /tmp/k6.tar.gz
+          tar -xzf /tmp/k6.tar.gz -C /tmp
+          mv "/tmp/k6-v${VERSION}-linux-amd64/k6" ~/bin/k6
+          chmod +x ~/bin/k6
+
+      - name: Build k6-rs
+        run: cargo build -p k6-rs
+
+      - name: Build conformance harness
+        run: cargo build -p k6-conformance
+
+      - name: Run conformance (http_get only)
+        env:
+          K6_BIN: /home/runner/bin/k6
+          K6RS_BIN: ${{ github.workspace }}/target/debug/k6-rs
+        run: cargo run -p k6-conformance -- run --filter 01_http_get
+
+      - name: Spike acceptance — zero adapter branches in diff/
+        run: |
+          set -e
+          # Only the comment in src/diff/mod.rs that explains the constraint may
+          # mention "upstream" or "k6rs". No other matches allowed.
+          MATCHES=$(grep -rEn '\b(upstream|k6rs|k6_rs)\b' crates/k6-conformance/src/diff/ \
+            | grep -v 'src/diff/mod.rs:.*//' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "FAIL: adapter-specific references found in diff/:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "OK: diff layer has no adapter branches."

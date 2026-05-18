@@ -349,7 +349,10 @@ fn merged_trend_for_threshold(
 }
 
 /// CG-3: same subset semantics for counters. Returns (value, rate) or None.
-fn merged_counter_for_threshold(threshold_key: &str, snapshot: &MetricsSnapshot) -> Option<(u64, f64)> {
+fn merged_counter_for_threshold(
+    threshold_key: &str,
+    snapshot: &MetricsSnapshot,
+) -> Option<(u64, f64)> {
     let mut value: u64 = 0;
     let mut rate: f64 = 0.0;
     let mut had = false;
@@ -361,15 +364,14 @@ fn merged_counter_for_threshold(threshold_key: &str, snapshot: &MetricsSnapshot)
         value += *v;
         rate += *r;
     }
-    if had {
-        Some((value, rate))
-    } else {
-        None
-    }
+    if had { Some((value, rate)) } else { None }
 }
 
 /// CG-3: same subset semantics for rates. Returns (rate, passes, total).
-fn merged_rate_for_threshold(threshold_key: &str, snapshot: &MetricsSnapshot) -> Option<(f64, u64, u64)> {
+fn merged_rate_for_threshold(
+    threshold_key: &str,
+    snapshot: &MetricsSnapshot,
+) -> Option<(f64, u64, u64)> {
     let mut passes: u64 = 0;
     let mut total: u64 = 0;
     let mut had = false;
@@ -419,11 +421,17 @@ fn resolve_stat(metric: &str, stat: &ThresholdStat, snapshot: &MetricsSnapshot) 
                     return h.value_at_quantile(q) as f64 / 1000.0;
                 }
             }
-            if (p - 50.0).abs() < 0.5 { synth.fallback_med }
-            else if (p - 90.0).abs() < 0.5 { synth.fallback_p90 }
-            else if (p - 95.0).abs() < 0.5 { synth.fallback_p95 }
-            else if (p - 99.0).abs() < 0.5 { synth.fallback_p99 }
-            else { synth.fallback_p95 }
+            if (p - 50.0).abs() < 0.5 {
+                synth.fallback_med
+            } else if (p - 90.0).abs() < 0.5 {
+                synth.fallback_p90
+            } else if (p - 95.0).abs() < 0.5 {
+                synth.fallback_p95
+            } else if (p - 99.0).abs() < 0.5 {
+                synth.fallback_p99
+            } else {
+                synth.fallback_p95
+            }
         };
         return match stat {
             ThresholdStat::Avg => synth.avg,
@@ -473,8 +481,7 @@ fn resolve_stat(metric: &str, stat: &ThresholdStat, snapshot: &MetricsSnapshot) 
                 // CG-5: feed the histogram lookup the snapshot's actual
                 // stored name, not the (possibly differently-canonicalized)
                 // threshold key.
-                if let Some(v) = crate::metrics::snapshot_percentile_ms(snapshot, stored_name, *p)
-                {
+                if let Some(v) = crate::metrics::snapshot_percentile_ms(snapshot, stored_name, *p) {
                     return v;
                 }
                 if (*p - 90.0).abs() < 0.5 {
@@ -604,7 +611,9 @@ mod tests {
     use crate::metrics::TrendStats;
 
     fn sample_snapshot() -> MetricsSnapshot {
-        MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![
                 ("http_reqs".to_string(), 1000, 100.0),
                 ("iterations".to_string(), 500, 50.0),
@@ -617,7 +626,8 @@ mod tests {
             trends: vec![
                 (
                     "http_req_duration".to_string(),
-                    TrendStats { p99: 0.0,
+                    TrendStats {
+                        p99: 0.0,
                         avg: 150.0,
                         min: 10.0,
                         med: 120.0,
@@ -629,7 +639,8 @@ mod tests {
                 ),
                 (
                     "iteration_duration".to_string(),
-                    TrendStats { p99: 0.0,
+                    TrendStats {
+                        p99: 0.0,
                         avg: 200.0,
                         min: 50.0,
                         med: 180.0,
@@ -731,7 +742,10 @@ mod tests {
     fn threshold_checks_rate() {
         let snap = sample_snapshot();
         let mut thresholds = HashMap::new();
-        thresholds.insert("checks".to_string(), vec![Threshold::from_expression("rate>0.95")]);
+        thresholds.insert(
+            "checks".to_string(),
+            vec![Threshold::from_expression("rate>0.95")],
+        );
 
         let results = evaluate(&thresholds, &snap);
         assert!(results.all_passed());
@@ -756,7 +770,10 @@ mod tests {
         let mut thresholds = HashMap::new();
         thresholds.insert(
             "http_req_duration".to_string(),
-            vec![Threshold::from_expression("avg<200"), Threshold::from_expression("max<5000")],
+            vec![
+                Threshold::from_expression("avg<200"),
+                Threshold::from_expression("max<5000"),
+            ],
         );
 
         let results = evaluate(&thresholds, &snap);
@@ -770,7 +787,10 @@ mod tests {
         let mut thresholds = HashMap::new();
         thresholds.insert(
             "http_req_duration".to_string(),
-            vec![Threshold::from_expression("p(95)<2000"), Threshold::from_expression("avg<100")], // avg=150 > 100
+            vec![
+                Threshold::from_expression("p(95)<2000"),
+                Threshold::from_expression("avg<100"),
+            ], // avg=150 > 100
         );
 
         let results = evaluate(&thresholds, &snap);
@@ -869,7 +889,10 @@ mod tests {
             vec![Threshold::from_expression("p(95)<2500")],
         );
         let results = evaluate(&thresholds, &snapshot);
-        assert!(results.all_passed(), "selector-aware match must find the stored metric despite tag order");
+        assert!(
+            results.all_passed(),
+            "selector-aware match must find the stored metric despite tag order"
+        );
         assert!(
             (results.results[0].actual_value - 2000.0).abs() < 1.0,
             "actual value should come from the stored submetric, got {}",
@@ -911,7 +934,10 @@ mod tests {
         let mut thresholds = HashMap::new();
         thresholds.insert(
             "name{a:1,b:2}".to_string(),
-            vec![Threshold::from_expression("count>0"), Threshold::from_expression("avg<60")],
+            vec![
+                Threshold::from_expression("count>0"),
+                Threshold::from_expression("avg<60"),
+            ],
         );
         let results = evaluate(&thresholds, &snapshot);
         assert!(
@@ -1004,7 +1030,10 @@ mod tests {
             )],
         };
         let mut thresholds = HashMap::new();
-        thresholds.insert("weird}name".to_string(), vec![Threshold::from_expression("avg<50")]);
+        thresholds.insert(
+            "weird}name".to_string(),
+            vec![Threshold::from_expression("avg<50")],
+        );
         let results = evaluate(&thresholds, &snapshot);
         assert!(results.all_passed());
         assert!((results.results[0].actual_value - 42.0).abs() < 0.01);
@@ -1048,8 +1077,8 @@ mod tests {
         let thresholds = one_threshold(
             "http_reqs",
             "count==999",
-            true,                                // abort_on_fail
-            Duration::from_millis(500),          // grace
+            true,                       // abort_on_fail
+            Duration::from_millis(500), // grace
         );
         let snap = snapshot_with_counter("http_reqs", 10); // count==999 fails
         let mut states = HashMap::new();
@@ -1100,12 +1129,7 @@ mod tests {
         // returns `Abort`. Without this gating, abortOnFail would fire
         // on the very first failing eval — defeating the purpose of
         // `delayAbortEval`.
-        let thresholds = one_threshold(
-            "http_reqs",
-            "count<10",
-            true,
-            Duration::from_millis(500),
-        );
+        let thresholds = one_threshold("http_reqs", "count<10", true, Duration::from_millis(500));
         let snap = snapshot_with_counter("http_reqs", 100); // 100 < 10 → fail
         let mut states = HashMap::new();
         let t0 = Instant::now();
@@ -1140,7 +1164,7 @@ mod tests {
         let thresholds = one_threshold(
             "http_reqs",
             "count<10",
-            false,                              // abort_on_fail OFF
+            false, // abort_on_fail OFF
             Duration::from_millis(0),
         );
         let snap = snapshot_with_counter("http_reqs", 100);
@@ -1175,22 +1199,12 @@ mod tests {
         // Threshold: aborts if rate is below 10/s. With 100 events over
         // 5s the real rate is 20/s — should pass. With duration=0 the
         // snapshot reports rate=0 → threshold fails → abort would fire.
-        let thresholds = one_threshold(
-            "http_reqs",
-            "rate>10",
-            true,
-            Duration::ZERO,
-        );
+        let thresholds = one_threshold("http_reqs", "rate>10", true, Duration::ZERO);
 
         // Wrong: snapshot with zero duration (the bug).
         let snap_zero = reg.snapshot(0.0);
         let mut states_zero = HashMap::new();
-        let d_zero = update_states(
-            &thresholds,
-            &snap_zero,
-            &mut states_zero,
-            Instant::now(),
-        );
+        let d_zero = update_states(&thresholds, &snap_zero, &mut states_zero, Instant::now());
         assert_eq!(
             d_zero,
             TickDecision::Abort,
@@ -1200,12 +1214,7 @@ mod tests {
         // Correct: snapshot with real elapsed time. 100 reqs / 5s = 20/s.
         let snap_real = reg.snapshot(5.0);
         let mut states_real = HashMap::new();
-        let d_real = update_states(
-            &thresholds,
-            &snap_real,
-            &mut states_real,
-            Instant::now(),
-        );
+        let d_real = update_states(&thresholds, &snap_real, &mut states_real, Instant::now());
         assert_eq!(
             d_real,
             TickDecision::Continue,
@@ -1286,30 +1295,50 @@ mod tests {
     #[test]
     fn threshold_with_tag_filter() {
         // Simulate tagged metrics in snapshot
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![],
             gauges: vec![],
             rates: vec![],
             trends: vec![
                 (
                     "http_req_duration".to_string(),
-                    TrendStats { p99: 0.0,
-                        avg: 500.0, min: 10.0, med: 400.0, max: 5000.0,
-                        p90: 1000.0, p95: 2000.0, count: 1000,
+                    TrendStats {
+                        p99: 0.0,
+                        avg: 500.0,
+                        min: 10.0,
+                        med: 400.0,
+                        max: 5000.0,
+                        p90: 1000.0,
+                        p95: 2000.0,
+                        count: 1000,
                     },
                 ),
                 (
                     "http_req_duration{scenario:light}".to_string(),
-                    TrendStats { p99: 0.0,
-                        avg: 100.0, min: 5.0, med: 80.0, max: 500.0,
-                        p90: 200.0, p95: 300.0, count: 500,
+                    TrendStats {
+                        p99: 0.0,
+                        avg: 100.0,
+                        min: 5.0,
+                        med: 80.0,
+                        max: 500.0,
+                        p90: 200.0,
+                        p95: 300.0,
+                        count: 500,
                     },
                 ),
                 (
                     "http_req_duration{scenario:heavy}".to_string(),
-                    TrendStats { p99: 0.0,
-                        avg: 900.0, min: 100.0, med: 800.0, max: 5000.0,
-                        p90: 2000.0, p95: 3000.0, count: 500,
+                    TrendStats {
+                        p99: 0.0,
+                        avg: 900.0,
+                        min: 100.0,
+                        med: 800.0,
+                        max: 5000.0,
+                        p90: 2000.0,
+                        p95: 3000.0,
+                        count: 500,
                     },
                 ),
             ],
@@ -1330,11 +1359,19 @@ mod tests {
         let results = evaluate(&thresholds, &snapshot);
         assert!(!results.all_passed()); // heavy fails
 
-        let light = results.results.iter().find(|r| r.metric.contains("light")).unwrap();
+        let light = results
+            .results
+            .iter()
+            .find(|r| r.metric.contains("light"))
+            .unwrap();
         assert!(light.passed);
         assert!((light.actual_value - 300.0).abs() < 1.0);
 
-        let heavy = results.results.iter().find(|r| r.metric.contains("heavy")).unwrap();
+        let heavy = results
+            .results
+            .iter()
+            .find(|r| r.metric.contains("heavy"))
+            .unwrap();
         assert!(!heavy.passed);
         assert!((heavy.actual_value - 3000.0).abs() < 1.0);
     }

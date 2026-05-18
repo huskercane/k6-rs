@@ -13,10 +13,10 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::adapters::{collect_root_group_tree, read_to_string, Adapter, RunArtifacts};
+use crate::adapters::{Adapter, RunArtifacts, collect_root_group_tree, read_to_string};
 use crate::canonical::{
-    selector_string, CanonicalCheck, CanonicalGroup, CanonicalMetric, CanonicalMetricKind,
-    CanonicalRun, CanonicalSummary, CanonicalTrend, NormalizedTagSet,
+    CanonicalCheck, CanonicalGroup, CanonicalMetric, CanonicalMetricKind, CanonicalRun,
+    CanonicalSummary, CanonicalTrend, NormalizedTagSet, selector_string,
 };
 
 pub struct K6rsAdapter;
@@ -120,14 +120,7 @@ fn parse(
             _ => continue,
         };
         let selector = selector_string(&name, &tags);
-        out.insert(
-            selector,
-            CanonicalMetric {
-                name,
-                tags,
-                kind,
-            },
-        );
+        out.insert(selector, CanonicalMetric { name, tags, kind });
     }
     Ok((summary, out, checks, groups))
 }

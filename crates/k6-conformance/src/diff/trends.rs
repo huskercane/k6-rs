@@ -1,4 +1,4 @@
-use super::{check_tolerance, DiffFinding, FindingKind};
+use super::{DiffFinding, FindingKind, check_tolerance};
 use crate::canonical::CanonicalTrend;
 use crate::expectations::ToleranceProfile;
 

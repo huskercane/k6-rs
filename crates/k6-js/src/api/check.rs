@@ -21,7 +21,8 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
 /// summary group tree mostly flat under root, but the path is real from day
 /// one so CG-2's tree assembly is a pure summary-time concern.
 pub fn register_with_metrics(ctx: &Ctx<'_>, metrics: Option<BuiltinMetrics>) -> Result<()> {
-    ctx.eval::<(), _>(r#"
+    ctx.eval::<(), _>(
+        r#"
         if (typeof globalThis.__current_group_path !== 'string') {
             globalThis.__current_group_path = '';
         }
@@ -43,7 +44,8 @@ pub fn register_with_metrics(ctx: &Ctx<'_>, metrics: Option<BuiltinMetrics>) -> 
             }
             return allPassed;
         };
-    "#)?;
+    "#,
+    )?;
 
     let globals = ctx.globals();
     globals.set(
@@ -84,10 +86,7 @@ pub fn register_group(ctx: &Ctx<'_>) -> Result<()> {
 /// registration is now an explicit invariant, not a side effect of
 /// `__group_end`. The exit hook `__group_end(fullPath, ms)` still fires
 /// (also in `finally`) to record the per-group duration.
-pub fn register_group_with_metrics(
-    ctx: &Ctx<'_>,
-    metrics: Option<BuiltinMetrics>,
-) -> Result<()> {
+pub fn register_group_with_metrics(ctx: &Ctx<'_>, metrics: Option<BuiltinMetrics>) -> Result<()> {
     let entry_metrics = metrics.clone();
     ctx.globals().set(
         "__group_enter",
@@ -99,17 +98,15 @@ pub fn register_group_with_metrics(
     )?;
     ctx.globals().set(
         "__group_end",
-        rquickjs::Function::new(
-            ctx.clone(),
-            move |group_path: String, duration_ms: f64| {
-                if let Some(ref m) = metrics {
-                    m.record_group_duration(&group_path, duration_ms);
-                }
-            },
-        )?,
+        rquickjs::Function::new(ctx.clone(), move |group_path: String, duration_ms: f64| {
+            if let Some(ref m) = metrics {
+                m.record_group_duration(&group_path, duration_ms);
+            }
+        })?,
     )?;
 
-    ctx.eval::<(), _>(r#"
+    ctx.eval::<(), _>(
+        r#"
         if (typeof globalThis.__current_group_path !== 'string') {
             globalThis.__current_group_path = '';
         }
@@ -126,7 +123,8 @@ pub fn register_group_with_metrics(
                 __group_end(fullPath, Date.now() - start);
             }
         };
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -145,12 +143,14 @@ mod tests {
             register(&ctx).unwrap();
 
             let result: bool = ctx
-                .eval(r#"
+                .eval(
+                    r#"
                     check({ status: 200 }, {
                         'status is 200': (r) => r.status === 200,
                         'has status': (r) => r.status !== undefined,
                     })
-                "#)
+                "#,
+                )
                 .unwrap();
 
             assert!(result);
@@ -166,12 +166,14 @@ mod tests {
             register(&ctx).unwrap();
 
             let result: bool = ctx
-                .eval(r#"
+                .eval(
+                    r#"
                     check({ status: 500 }, {
                         'status is 200': (r) => r.status === 200,
                         'has status': (r) => r.status !== undefined,
                     })
-                "#)
+                "#,
+                )
                 .unwrap();
 
             assert!(!result);
@@ -187,11 +189,13 @@ mod tests {
             register(&ctx).unwrap();
 
             let result: bool = ctx
-                .eval(r#"
+                .eval(
+                    r#"
                     check(null, {
                         'throws': (r) => r.nonexistent.property,
                     })
-                "#)
+                "#,
+                )
                 .unwrap();
 
             // Exception in check function → treated as failure
@@ -208,11 +212,13 @@ mod tests {
             register_group(&ctx).unwrap();
 
             let result: i32 = ctx
-                .eval(r#"
+                .eval(
+                    r#"
                     group('test group', function() {
                         return 42;
                     })
-                "#)
+                "#,
+                )
                 .unwrap();
 
             assert_eq!(result, 42);

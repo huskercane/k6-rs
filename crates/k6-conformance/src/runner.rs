@@ -7,10 +7,10 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::adapters::{
-    json_stream, k6rs::K6rsAdapter, upstream::UpstreamAdapter, Adapter, RunArtifacts,
+    Adapter, RunArtifacts, json_stream, k6rs::K6rsAdapter, upstream::UpstreamAdapter,
 };
 use crate::canonical::{CanonicalEventStream, CanonicalRun, Reliability, SideReliability};
-use crate::diff::{diff, DiffFinding, FindingKind};
+use crate::diff::{DiffFinding, FindingKind, diff};
 use crate::expectations::Expectations;
 use crate::fixtures::http::HttpFixture;
 use crate::report::ScriptReport;
@@ -40,9 +40,8 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     if let Some(path) = &cfg.report_json {
         let json = crate::report::build_json_report(&reports);
-        let f = std::fs::File::create(path).with_context(|| {
-            format!("creating report-json file {}", path.display())
-        })?;
+        let f = std::fs::File::create(path)
+            .with_context(|| format!("creating report-json file {}", path.display()))?;
         serde_json::to_writer_pretty(f, &json).context("serializing JSON report")?;
     }
 
@@ -95,10 +94,22 @@ async fn run_one(cfg: &Config, script: &ScriptDef) -> Result<ScriptReport> {
 
     // Fresh fixture per binary. Stateful fixtures (counters, connection state)
     // must not leak from one runner into the other.
-    let upstream_artifacts =
-        invoke_against_fresh_fixture(&cfg.upstream_bin, &script.script_path, &exp, workdir.path(), "upstream").await?;
-    let k6rs_artifacts =
-        invoke_against_fresh_fixture(&cfg.k6rs_bin, &script.script_path, &exp, workdir.path(), "k6rs").await?;
+    let upstream_artifacts = invoke_against_fresh_fixture(
+        &cfg.upstream_bin,
+        &script.script_path,
+        &exp,
+        workdir.path(),
+        "upstream",
+    )
+    .await?;
+    let k6rs_artifacts = invoke_against_fresh_fixture(
+        &cfg.k6rs_bin,
+        &script.script_path,
+        &exp,
+        workdir.path(),
+        "k6rs",
+    )
+    .await?;
 
     let mut left: CanonicalRun = UpstreamAdapter.adapt(&upstream_artifacts)?;
     let mut right: CanonicalRun = K6rsAdapter.adapt(&k6rs_artifacts)?;
@@ -248,10 +259,7 @@ struct SinkArtifacts {
     pre_diff_findings: Vec<DiffFinding>,
 }
 
-fn load_sink_artifacts(
-    upstream_stream_path: &Path,
-    k6rs_stream_path: &Path,
-) -> SinkArtifacts {
+fn load_sink_artifacts(upstream_stream_path: &Path, k6rs_stream_path: &Path) -> SinkArtifacts {
     let mut pre_diff_findings: Vec<DiffFinding> = Vec::new();
 
     // Stream file reads — Err is a hard finding (StreamFileError). The
@@ -388,8 +396,7 @@ mod tests {
             .find(|f| f.kind == FindingKind::StreamFileError && f.selector == "<k6rs-stream>")
             .expect("k6-rs stream file error finding must surface");
         assert!(
-            stream_err.detail.contains("No such file")
-                || stream_err.detail.contains("reading"),
+            stream_err.detail.contains("No such file") || stream_err.detail.contains("reading"),
             "finding detail must explain the cause; got {:?}",
             stream_err.detail
         );
@@ -407,11 +414,11 @@ mod tests {
         write_sidecar(&k6rs, well_formed_sidecar());
 
         let result = load_sink_artifacts(&upstream_path, &k6rs);
-        assert!(result
-            .pre_diff_findings
-            .iter()
-            .any(|f| f.kind == FindingKind::StreamFileError
-                && f.selector == "<upstream-stream>"));
+        assert!(
+            result.pre_diff_findings.iter().any(
+                |f| f.kind == FindingKind::StreamFileError && f.selector == "<upstream-stream>"
+            )
+        );
         assert!(result.upstream_stream.is_none());
     }
 
@@ -453,10 +460,12 @@ mod tests {
 
         let result = load_sink_artifacts(&upstream, &k6rs);
         // No SidecarUnreadable finding (upstream tolerated).
-        assert!(!result
-            .pre_diff_findings
-            .iter()
-            .any(|f| f.kind == FindingKind::SidecarUnreadable));
+        assert!(
+            !result
+                .pre_diff_findings
+                .iter()
+                .any(|f| f.kind == FindingKind::SidecarUnreadable)
+        );
         assert!(!result.reliability.is_unreliable());
     }
 
@@ -471,10 +480,12 @@ mod tests {
         write_sidecar(&k6rs, "NOT JSON {{{");
 
         let result = load_sink_artifacts(&upstream, &k6rs);
-        assert!(result
-            .pre_diff_findings
-            .iter()
-            .any(|f| f.kind == FindingKind::SidecarUnreadable));
+        assert!(
+            result
+                .pre_diff_findings
+                .iter()
+                .any(|f| f.kind == FindingKind::SidecarUnreadable)
+        );
         assert!(result.reliability.is_unreliable());
     }
 }

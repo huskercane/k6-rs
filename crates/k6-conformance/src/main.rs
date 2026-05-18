@@ -2,7 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "k6-conformance", about = "k6 / k6-rs behavioral parity harness")]
+#[command(
+    name = "k6-conformance",
+    about = "k6 / k6-rs behavioral parity harness"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -47,7 +47,9 @@ impl<V: VirtualUser + 'static> ExternallyControlledExecutor<V> {
         let api_iters = Arc::clone(&total_iterations);
 
         let api_handle = tokio::spawn(async move {
-            if let Err(e) = run_api_server(api_active, api_stopped, api_cancel, api_iters, max_vus).await {
+            if let Err(e) =
+                run_api_server(api_active, api_stopped, api_cancel, api_iters, max_vus).await
+            {
                 eprintln!("  externally-controlled API error: {e}");
             }
         });
@@ -244,7 +246,9 @@ mod tests {
     impl VirtualUser for MockVu {
         fn run_iteration(&mut self) -> Result<IterationResult> {
             std::thread::sleep(Duration::from_millis(10));
-            Ok(IterationResult { duration: Duration::from_millis(10) })
+            Ok(IterationResult {
+                duration: Duration::from_millis(10),
+            })
         }
         fn reset(&mut self) {}
     }
@@ -287,8 +291,8 @@ mod tests {
 
         let executor = ExternallyControlledExecutor::new(
             pool,
-            2, // initial 2 VUs
-            4, // max 4
+            2,              // initial 2 VUs
+            4,              // max 4
             Duration::ZERO, // no duration limit
         );
 
@@ -302,12 +306,7 @@ mod tests {
         let vus: Vec<MockVu> = (0..2).map(|_| MockVu).collect();
         let pool = Arc::new(VuPool::new(vus));
 
-        let executor = ExternallyControlledExecutor::new(
-            pool,
-            1,
-            2,
-            Duration::from_millis(200),
-        );
+        let executor = ExternallyControlledExecutor::new(pool, 1, 2, Duration::from_millis(200));
 
         let summary = executor.run(CancellationToken::new()).await.unwrap();
         assert!(summary.iterations_completed > 0);

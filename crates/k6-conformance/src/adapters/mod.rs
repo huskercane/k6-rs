@@ -34,8 +34,7 @@ pub trait Adapter {
 
 /// Helper: read a path as String, with context.
 pub(crate) fn read_to_string(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))
+    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))
 }
 
 /// Flatten an upstream-shape `root_group` JSON tree into flat per-group and
@@ -98,16 +97,28 @@ fn walk_group(
 
     if let Some(checks) = obj.get("checks").and_then(Value::as_object) {
         for (_, raw_check) in checks {
-            let Some(c) = raw_check.as_object() else { continue };
-            let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            let path = c.get("path").and_then(Value::as_str)
+            let Some(c) = raw_check.as_object() else {
+                continue;
+            };
+            let name = c
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = c
+                .get("path")
+                .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{group_path}::{name}"));
             // Capture the serialized id (md5 of path on a correct
             // implementation). The diff compares it across runners — if it
             // disagrees with the other side's id for the same path, that's
             // a serialization-layer bug, not a counts bug.
-            let id = c.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = c
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let passes = c.get("passes").and_then(Value::as_u64).unwrap_or(0);
             let fails = c.get("fails").and_then(Value::as_u64).unwrap_or(0);
             checks_out.insert(
@@ -191,7 +202,10 @@ mod tests {
         // Groups (CG-2 surface): root excluded; every other path included
         // including the group-only `::audit` branch with no checks.
         assert_eq!(groups.len(), 3);
-        assert!(!groups.contains_key(""), "root group must not be in the map");
+        assert!(
+            !groups.contains_key(""),
+            "root group must not be in the map"
+        );
         let api = &groups["::api"];
         assert_eq!(api.name, "api");
         assert_eq!(api.id, "id-api");

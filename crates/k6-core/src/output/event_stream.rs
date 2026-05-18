@@ -447,7 +447,10 @@ fn format_rfc3339(t: time::OffsetDateTime) -> String {
         .unwrap_or_else(|_| String::new())
 }
 
-fn write_sidecar(stream_path: &std::path::Path, sidecar: &DiagnosticsSidecar) -> std::io::Result<()> {
+fn write_sidecar(
+    stream_path: &std::path::Path,
+    sidecar: &DiagnosticsSidecar,
+) -> std::io::Result<()> {
     let mut sidecar_path = stream_path.as_os_str().to_owned();
     sidecar_path.push(".diagnostics.json");
     let f = std::fs::File::create(sidecar_path)?;
@@ -652,7 +655,10 @@ mod tests {
         // drained some between sends, but it's bounded above by 30 and
         // below by 1.
         let snapshot = sink.diagnostics_snapshot();
-        assert!(snapshot.peak_occupancy > 0, "peak should be > 0 after burst");
+        assert!(
+            snapshot.peak_occupancy > 0,
+            "peak should be > 0 after burst"
+        );
         assert_eq!(snapshot.capacity, 64);
 
         drop(sink);
@@ -712,7 +718,10 @@ mod tests {
         // thresholds is always [] (empty array), submetrics is always null
         // for this first cut. Known_drift covers the gap vs upstream.
         assert!(metric_event["data"]["thresholds"].is_array());
-        assert_eq!(metric_event["data"]["thresholds"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            metric_event["data"]["thresholds"].as_array().unwrap().len(),
+            0
+        );
         assert!(metric_event["data"]["submetrics"].is_null());
     }
 

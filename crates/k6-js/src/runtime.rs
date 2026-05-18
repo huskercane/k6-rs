@@ -75,10 +75,8 @@ mod tests {
         let ctx = create_context(&rt).unwrap();
 
         ctx.with(|ctx| {
-            ctx.eval::<(), _>(
-                "globalThis.add = function(a, b) { return a + b; }",
-            )
-            .unwrap();
+            ctx.eval::<(), _>("globalThis.add = function(a, b) { return a + b; }")
+                .unwrap();
 
             let globals = ctx.globals();
             let func: rquickjs::Function = globals.get("add").unwrap();

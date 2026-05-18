@@ -1,40 +1,54 @@
-//! Hyper-level HTTP client — engine spike for bug (b).
+//! Hyper-level HTTP client.
 //!
 //! Lives alongside the production [`crate::http_client::ReqwestHttpClient`]
 //! and is selected at runtime by setting `K6RS_HTTP_CLIENT=hyper`. The trade
 //! is: this client gives us connection-level visibility (DNS, TCP, write
 //! completion, exact wire bytes) that reqwest's high-level API hides, at the
-//! cost of a much smaller feature surface.
+//! cost of a smaller feature surface today.
 //!
-//! Scope of this spike — intentionally narrow:
-//!   - Plain HTTP only. HTTPS, TLS handshake timing, and HTTP/2 are out.
-//!   - No connection pooling (each request opens a new TCP connection).
-//!   - No proxies, no redirects, no blacklist/blocklist, no local-IP pool.
-//!   - No request body streaming — body is sent as a single `Full<Bytes>`.
+//! Originally landed as the (b) spike for bug (b) — phase timing
+//! instrumentation. As of S0 it has graduated into the "promote hyper toward
+//! default" track: [`HyperHttpClient::from_config`] consumes the same
+//! [`TestConfig`] surface that `ReqwestHttpClient::from_config` does.
+//! Feature parity is being closed slice by slice (S0..S12 in the plan); fields
+//! present on [`HyperConfig`] but not yet read are marked with the slice that
+//! will consume them, so subsequent slices are purely additive.
 //!
-//! The acceptance bar is: prove we can measure
-//! `blocked / connecting / sending` plus exact `data_sent` / `data_received`
-//! for one simple HTTP script. Once that lands cleanly and the conformance
-//! report agrees, broader parity with the reqwest feature set can follow.
+//! Scope at S0+S1:
+//!   - Plain HTTP only. HTTPS, TLS handshake timing, and HTTP/2 are out (S7).
+//!   - Pooling by [`RouteKey`] — same as the spike's per-authority pool, but
+//!     keyed on a type whose shape is frozen now (transport + origin host +
+//!     port + source-IP bind + proxy route) so HTTPS/local_ips/proxy slices
+//!     don't have to mutate pool identity.
+//!   - No timeout (S2), no `no_connection_reuse` bypass (S3), no user-agent
+//!     override (S4), no blacklist/blocklist/hosts (S5), no http_debug (S6),
+//!     no redirects (S8), no local-IP source-bind (S9), no proxy (S10).
+//!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
+//!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
+//!     of the response is ALWAYS drained to end-of-stream before the pooled
+//!     conn is released, so a capped or discarded body never poisons the
+//!     pool. Drain failures evict the conn rather than re-pooling it.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1::{self, SendRequest};
-use hyper::header::{HeaderValue, HOST, USER_AGENT};
+use hyper::header::{HOST, HeaderValue, USER_AGENT};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
+use k6_core::config::TestConfig;
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
 
 use crate::http_client::ReqwestHttpClient;
@@ -48,15 +62,99 @@ use crate::http_client::ReqwestHttpClient;
 /// disguise k6-rs as k6.
 const DEFAULT_USER_AGENT: &str = concat!("k6-rs/", env!("CARGO_PKG_VERSION"));
 
+/// Default per-request timeout, matching reqwest's `from_config` default.
+/// Applied in S2 — stored in [`HyperConfig`] today, not yet wrapped around
+/// `send_request().await`.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default response-body buffer cap, matching reqwest's hardcoded 10 MiB.
+/// Beyond this, the response body is drained but not retained.
+const DEFAULT_MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Identity of a reusable connection.
+///
+/// Keying the pool on this struct (rather than a raw `"host:port"` string)
+/// means subsequent slices can extend connection identity without overloading
+/// existing fields' semantics:
+///   - S7 will add `Transport::Https`.
+///   - S5 will write the **resolved** host into `target_host` after the
+///     static `hosts` override resolves.
+///   - S9 will populate `source_ip` when `localIPs` round-robin binds a
+///     specific outbound IP.
+///   - S10 will populate `proxy` for proxied routes.
+///
+/// `target_host` is the **origin authority** — the URL's host after any
+/// `hosts` static override, but BEFORE any HTTP proxy rewrite. With
+/// `proxy: Some(...)` the socket actually opens against the proxy and the
+/// origin authority still matters for CONNECT and Host/SNI behavior;
+/// [`ProxyRoute`] will carry the proxy's identity separately when S10 lands.
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub(crate) struct RouteKey {
+    pub(crate) transport: Transport,
+    pub(crate) target_host: String,
+    pub(crate) target_port: u16,
+    pub(crate) source_ip: Option<IpAddr>,
+    pub(crate) proxy: Option<ProxyRoute>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+pub(crate) enum Transport {
+    Http,
+    // S7 adds Https.
+}
+
+/// Stub today — exists so [`RouteKey`]'s shape is frozen for S5..S10. S10
+/// will populate this with the proxy socket destination and any required
+/// auth identity.
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub(crate) struct ProxyRoute {
+    _unused: (),
+}
+
+/// Snapshot of every HTTP-shaping knob the hyper client cares about, captured
+/// at [`HyperHttpClient::from_config`] time.
+///
+/// Fields actively read in S0+S1: `discard_response_bodies`,
+/// `max_response_body_size`. Other fields are stored so later slices' edits
+/// are pure additions; each is annotated with the slice that will consume it.
+#[derive(Clone)]
+#[allow(dead_code)] // S2..S6 fields stored intentionally; see per-field comments.
+struct HyperConfig {
+    // S1 — body buffer policy.
+    discard_response_bodies: bool,
+    max_response_body_size: usize,
+
+    // S2 — per-request timeout wrapper.
+    request_timeout: Duration,
+
+    // S3 — when true, bypass pool acquire/release entirely.
+    no_connection_reuse: bool,
+
+    // S4 — replaces the hardcoded default user-agent if set.
+    user_agent_override: Option<HeaderValue>,
+
+    // S5 — pre-send filters and static DNS override. Stored in the same
+    // shapes ReqwestHttpClient holds, so the port of `check_blocked` and the
+    // hosts lookup is mechanical.
+    blacklist_ips: Vec<ipnet::IpNet>,
+    block_hostnames: Vec<String>,
+    hosts: HashMap<String, String>,
+
+    // S6 — request/response logging to stderr.
+    http_debug: Option<String>,
+    // S7 fields (insecure_skip_tls_verify, tls_version min/max) enter
+    // HyperConfig when HTTPS lands.
+}
+
 /// Hyper-backed HTTP client. See module docs.
 pub struct HyperHttpClient {
+    config: HyperConfig,
     user_agent: HeaderValue,
-    /// Per-authority pool of idle connections. A connection that finished its
-    /// previous request without error is returned here and reused by the next
-    /// caller. Not size-bounded — for a soak test this can grow unbounded; the
-    /// spike accepts that. Eviction policies (idle timeout, max-per-authority)
-    /// are follow-up work.
-    pool: Mutex<HashMap<String, Vec<PooledConn>>>,
+    /// Per-[`RouteKey`] pool of idle connections. A connection whose previous
+    /// request **and** subsequent body drain both completed without error is
+    /// returned here and reused by the next caller. Not size-bounded —
+    /// per-authority caps + idle-timeout eviction are S3 follow-up work.
+    pool: Mutex<HashMap<RouteKey, Vec<PooledConn>>>,
 }
 
 impl Default for HyperHttpClient {
@@ -66,21 +164,62 @@ impl Default for HyperHttpClient {
 }
 
 impl HyperHttpClient {
+    /// Convenience constructor. Equivalent to
+    /// `from_config(&TestConfig::default()).expect(...)` — `TestConfig`'s
+    /// defaults never produce a build failure, so the unwrap is total.
+    /// Kept primarily for test ergonomics and as a back-compat shim for the
+    /// pre-S0 spike callers.
     pub fn new() -> Self {
-        Self {
+        Self::from_config(&TestConfig::default())
+            .expect("default TestConfig must always build a HyperHttpClient")
+    }
+
+    /// Build a hyper client from the parsed test configuration.
+    ///
+    /// Stores every field S1..S6 will consume. S0 only reads the body-buffer
+    /// fields; the rest are stored so each subsequent slice's diff is a pure
+    /// addition (locks the API surface up front).
+    pub fn from_config(config: &TestConfig) -> Result<Self> {
+        let blacklist_ips: Vec<ipnet::IpNet> = config
+            .blacklist_ips
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        let user_agent_override = match &config.user_agent {
+            Some(ua) => Some(
+                HeaderValue::from_str(ua).with_context(|| format!("invalid userAgent {ua:?}"))?,
+            ),
+            None => None,
+        };
+
+        let hcfg = HyperConfig {
+            discard_response_bodies: config.discard_response_bodies,
+            max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            no_connection_reuse: config.no_connection_reuse,
+            user_agent_override,
+            blacklist_ips,
+            block_hostnames: config.block_hostnames.clone(),
+            hosts: config.hosts.clone(),
+            http_debug: config.http_debug.clone(),
+        };
+
+        Ok(Self {
+            config: hcfg,
             user_agent: HeaderValue::from_static(DEFAULT_USER_AGENT),
             pool: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
-    fn try_acquire(&self, authority: &str) -> Option<PooledConn> {
+    fn try_acquire(&self, key: &RouteKey) -> Option<PooledConn> {
         let mut pool = self.pool.lock().unwrap();
-        pool.get_mut(authority).and_then(|v| v.pop())
+        pool.get_mut(key).and_then(|v| v.pop())
     }
 
-    fn release(&self, authority: String, conn: PooledConn) {
+    fn release(&self, key: RouteKey, conn: PooledConn) {
         let mut pool = self.pool.lock().unwrap();
-        pool.entry(authority).or_default().push(conn);
+        pool.entry(key).or_default().push(conn);
     }
 }
 
@@ -163,17 +302,11 @@ impl AsyncWrite for CountingStream {
         result
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 
@@ -247,17 +380,30 @@ async fn send_inner(
     let scheme = uri.scheme_str().unwrap_or("http");
     anyhow::ensure!(
         scheme == "http",
-        "HyperHttpClient spike supports plain HTTP only (got scheme `{scheme}`); \
-         the spike accepts this limitation until HTTPS work lands."
+        "HyperHttpClient supports plain HTTP only (got scheme `{scheme}`); \
+         HTTPS support lands in S7."
     );
     let host = uri.host().context("URL missing host")?.to_string();
     let port = uri.port_u16().unwrap_or(80);
     let authority = format!("{host}:{port}");
 
+    // RouteKey identifies the pool slot for this connection. In S0 every axis
+    // except `transport`/`target_host`/`target_port` is fixed (no local-IP
+    // bind, no proxy, plain HTTP). The shape is frozen so S5/S7/S9/S10 each
+    // populate their own axis without overloading existing semantics — see
+    // the type's doc-comment.
+    let route_key = RouteKey {
+        transport: Transport::Http,
+        target_host: host.clone(),
+        target_port: port,
+        source_ip: None,
+        proxy: None,
+    };
+
     // Try the pool first. On a hit, `blocked` and `connecting` are 0 — the
     // request reuses an existing TCP connection. On a miss, do the DNS+TCP
     // dance and record real timings for those phases.
-    let (mut pooled, blocked_ms, connecting_ms) = if let Some(p) = client.try_acquire(&authority) {
+    let (mut pooled, blocked_ms, connecting_ms) = if let Some(p) = client.try_acquire(&route_key) {
         (p, 0.0, 0.0)
     } else {
         let blocked_start = Instant::now();
@@ -269,7 +415,9 @@ async fn send_inner(
         let blocked_done = Instant::now();
 
         let connect_start = Instant::now();
-        let tcp = TcpStream::connect(addr).await.context("TCP connect failed")?;
+        let tcp = TcpStream::connect(addr)
+            .await
+            .context("TCP connect failed")?;
         let connect_done = Instant::now();
 
         let wire = WireMetrics::default();
@@ -353,12 +501,23 @@ async fn send_inner(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let body_collect_result = response.into_body().collect().await;
-    let body_bytes = match body_collect_result {
-        Ok(c) => c.to_bytes().to_vec(),
+    // Read the response body with the cap + drain rule. CRUCIAL: even when
+    // we are not buffering bytes (discard mode, or post-cap in buffered mode)
+    // the body is iterated to end-of-stream. Stopping early would leave
+    // pending bytes in hyper's internal buffer; the next request reusing
+    // this pooled connection would either see them as part of its response
+    // or hit a protocol error. Drain failures evict the conn.
+    let response_body = match read_body_with_cap_and_drain(
+        response.into_body(),
+        client.config.discard_response_bodies,
+        client.config.max_response_body_size,
+    )
+    .await
+    {
+        Ok(rb) => rb,
         Err(e) => {
             drop(pooled);
-            return Err(anyhow::Error::from(e).context("reading response body"));
+            return Err(e.context("reading response body"));
         }
     };
     let receive_done = Instant::now();
@@ -395,27 +554,72 @@ async fn send_inner(
         duration: start.elapsed().as_secs_f64() * 1000.0,
     };
 
-    let bytes_sent =
-        pooled.wire.bytes_written.load(Ordering::Relaxed) - bytes_sent_before;
-    let bytes_received =
-        pooled.wire.bytes_read.load(Ordering::Relaxed) - bytes_recv_before;
+    let bytes_sent = pooled.wire.bytes_written.load(Ordering::Relaxed) - bytes_sent_before;
+    let bytes_received = pooled.wire.bytes_read.load(Ordering::Relaxed) - bytes_recv_before;
 
-    // Return the connection to the pool for reuse. Both directions of this
-    // request completed without error, so the connection is assumed healthy
-    // for HTTP/1.1 keep-alive. If the server actually sent `Connection: close`,
+    // Return the connection to the pool for reuse. Send + drain both
+    // completed without error, so the connection is assumed healthy for
+    // HTTP/1.1 keep-alive. If the server actually sent `Connection: close`,
     // the next caller's send_request will fail and trigger the drop-on-err
     // path above; the pool self-heals one mistake at a time.
-    client.release(authority, pooled);
+    client.release(route_key, pooled);
 
     Ok(HttpResponse {
         status,
         headers,
-        body: ResponseBody::Buffered(body_bytes),
+        body: response_body,
         timings,
         url: req.url,
         data_sent: bytes_sent,
         data_received: bytes_received,
     })
+}
+
+/// Read the response body to end-of-stream while applying the cap-buffer or
+/// discard rule.
+///
+/// **Invariant:** the body is always iterated to end-of-stream before this
+/// function returns `Ok(_)`. Stopping early when the buffer hits the cap (or
+/// in discard mode) would leave bytes pending in hyper's internal channel;
+/// the pooled connection would then be returned in a dirty state and the
+/// next request reusing it would either see those leftover bytes as part of
+/// its response or hit a protocol error mid-handshake.
+///
+/// `data_received` byte accounting is handled separately by the IO-level
+/// [`CountingStream`] wrapper — every byte read from the socket is counted
+/// regardless of whether this loop retains it. The role of this function is
+/// purely buffer-policy + drain.
+async fn read_body_with_cap_and_drain(
+    mut body: hyper::body::Incoming,
+    discard: bool,
+    cap: usize,
+) -> Result<ResponseBody> {
+    if discard {
+        while let Some(frame_result) = body.frame().await {
+            // Any error mid-drain poisons the connection. Propagating Err
+            // here causes the caller to drop the PooledConn (the Drop impl
+            // aborts the conn task) so the dirty conn never re-enters the
+            // pool.
+            let _frame = frame_result.context("draining response body (discard mode)")?;
+        }
+        return Ok(ResponseBody::Discarded);
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.context("reading response body frame")?;
+        if let Some(data) = frame.data_ref() {
+            if buffer.len() < cap {
+                let remaining = cap - buffer.len();
+                let take = remaining.min(data.len());
+                buffer.extend_from_slice(&data[..take]);
+            }
+            // Frames past the cap are intentionally discarded but the loop
+            // continues so the body drains to completion. Bytes still flow
+            // through CountingStream and contribute to data_received.
+        }
+    }
+    Ok(ResponseBody::Buffered(buffer))
 }
 
 fn hyper_method(m: HttpMethod) -> Method {
@@ -433,8 +637,8 @@ fn hyper_method(m: HttpMethod) -> Method {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{get, post};
     use axum::Router;
+    use axum::routing::{get, post};
     use tokio::net::TcpListener;
 
     /// The (b) spike's acceptance criterion in test form: a single HTTP call
@@ -647,6 +851,432 @@ mod tests {
         assert!(
             msg.contains("HTTP only"),
             "error should mention HTTP-only scope; got: {msg}"
+        );
+    }
+
+    // ── S0+S1 regression tests ─────────────────────────────────────────────
+
+    /// S0 — from_config must carry the body-policy fields and the four config
+    /// fields S5/S6 will consume. Locks the API surface before subsequent
+    /// slices add behavior to it.
+    #[test]
+    fn from_config_persists_discard_cap_and_route_fields() {
+        let mut config = TestConfig::default();
+        config.discard_response_bodies = true;
+        config.user_agent = Some("custom-ua/1.0".to_string());
+        config.no_connection_reuse = true;
+        config.block_hostnames = vec!["*.internal".to_string()];
+        config.blacklist_ips = vec!["10.0.0.0/8".to_string()];
+        config
+            .hosts
+            .insert("svc.local".to_string(), "127.0.0.1".to_string());
+        config.http_debug = Some("full".to_string());
+
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        // S1 fields actively read in S0+S1
+        assert!(client.config.discard_response_bodies);
+        assert_eq!(
+            client.config.max_response_body_size,
+            DEFAULT_MAX_RESPONSE_BODY_SIZE
+        );
+        // Stored-but-not-yet-read fields (S2..S6) must round-trip so the
+        // slices that come later are pure additions.
+        assert_eq!(client.config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert!(client.config.no_connection_reuse);
+        assert_eq!(
+            client
+                .config
+                .user_agent_override
+                .as_ref()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "custom-ua/1.0"
+        );
+        assert_eq!(client.config.blacklist_ips.len(), 1);
+        assert_eq!(
+            client.config.block_hostnames,
+            vec!["*.internal".to_string()]
+        );
+        assert_eq!(client.config.hosts.get("svc.local").unwrap(), "127.0.0.1");
+        assert_eq!(client.config.http_debug.as_deref(), Some("full"));
+    }
+
+    /// S0 — RouteKey shape is the load-bearing identity for the pool. Each
+    /// axis (transport, host, port, source_ip, proxy) must independently
+    /// distinguish two otherwise-identical keys, or pool reuse will leak
+    /// across routes the moment S5/S7/S9/S10 start populating axes.
+    #[test]
+    fn route_key_equality_distinguishes_transport_host_port_source_proxy() {
+        use std::collections::HashSet;
+
+        let base = RouteKey {
+            transport: Transport::Http,
+            target_host: "example.com".to_string(),
+            target_port: 80,
+            source_ip: None,
+            proxy: None,
+        };
+
+        // Same axes → equal.
+        assert_eq!(base, base.clone());
+
+        // Different host → distinct.
+        let mut other_host = base.clone();
+        other_host.target_host = "other.com".to_string();
+        assert_ne!(base, other_host);
+
+        // Different port → distinct.
+        let mut other_port = base.clone();
+        other_port.target_port = 8080;
+        assert_ne!(base, other_port);
+
+        // Different source_ip → distinct (S9 lookahead).
+        let mut other_src = base.clone();
+        other_src.source_ip = Some("127.0.0.2".parse().unwrap());
+        assert_ne!(base, other_src);
+
+        // Different proxy → distinct (S10 lookahead).
+        let mut other_proxy = base.clone();
+        other_proxy.proxy = Some(ProxyRoute { _unused: () });
+        assert_ne!(base, other_proxy);
+
+        // HashSet keying must agree with Eq — store one of each variant
+        // and verify all are present.
+        let set: HashSet<RouteKey> = [base, other_host, other_port, other_src, other_proxy]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            set.len(),
+            5,
+            "five distinct RouteKey variants must hash to five distinct buckets"
+        );
+    }
+
+    /// S1 — discard mode drops the body buffer but the byte counter still
+    /// reflects everything that came off the wire.
+    ///
+    /// 100 KB body is deliberate — it exceeds hyper's internal body channel
+    /// capacity, so a broken implementation that skipped the drain loop
+    /// would leave bytes unread from the socket and `data_received` would
+    /// fall below the body length. That makes this test regression-lock the
+    /// drain invariant, not just the discard-vs-buffer choice.
+    #[tokio::test]
+    async fn discard_response_bodies_drops_body_keeps_byte_count() {
+        let body_text = "x".repeat(100_000);
+        let body_for_handler = body_text.clone();
+        let app = Router::new().route(
+            "/big",
+            get(move || {
+                let b = body_for_handler.clone();
+                async move { b }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut config = TestConfig::default();
+        config.discard_response_bodies = true;
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("http://127.0.0.1:{}/big", addr.port()),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resp.body, ResponseBody::Discarded),
+            "discard mode must return Discarded, not Buffered"
+        );
+        assert!(
+            resp.data_received >= body_text.len() as u64,
+            "data_received ({}) must cover full body ({}) plus headers \
+             even when buffer is discarded",
+            resp.data_received,
+            body_text.len()
+        );
+    }
+
+    /// S1 — buffer truncates at the cap but `data_received` still reflects
+    /// the full wire bytes (the IO wrapper counts past the buffer cutoff).
+    /// 100 KB body forces hyper to span multiple TCP reads / frames, so a
+    /// broken drain that early-returned on the first frame past the cap
+    /// would leave socket bytes unread and `data_received` would fall short
+    /// of the body length.
+    #[tokio::test]
+    async fn max_response_body_size_truncates_buffer_not_count() {
+        let body_text = "y".repeat(100_000);
+        let body_len = body_text.len();
+        let body_for_handler = body_text.clone();
+        let app = Router::new().route(
+            "/big",
+            get(move || {
+                let b = body_for_handler.clone();
+                async move { b }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Build a client with a deliberately-low cap. The public ctor uses
+        // the 10 MB default; override the field directly here since the cap
+        // is intentionally not yet exposed through TestConfig.
+        let mut client = HyperHttpClient::from_config(&TestConfig::default()).unwrap();
+        client.config.max_response_body_size = 1024;
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("http://127.0.0.1:{}/big", addr.port()),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        let buffered_len = match &resp.body {
+            ResponseBody::Buffered(b) => b.len(),
+            ResponseBody::Discarded => panic!("buffered mode expected"),
+        };
+        assert_eq!(
+            buffered_len, 1024,
+            "buffer must truncate at the cap; got {buffered_len}"
+        );
+        assert!(
+            resp.data_received >= body_len as u64,
+            "data_received ({}) must reflect FULL wire bytes ({}+) regardless of cap",
+            resp.data_received,
+            body_len
+        );
+    }
+
+    /// S0 — from_config without an explicit max-body knob must inherit the
+    /// 10 MiB default. Locks the policy that the cap is currently a constant
+    /// inside HyperConfig (not yet a TestConfig field), so a future move to
+    /// TestConfig is a deliberate API change rather than an accidental one.
+    #[test]
+    fn default_max_body_unset_means_10mb_cap() {
+        let client = HyperHttpClient::from_config(&TestConfig::default()).unwrap();
+        assert_eq!(client.config.max_response_body_size, 10 * 1024 * 1024);
+    }
+
+    /// S1 — the central drain-after-cap invariant. Three back-to-back
+    /// requests against a server that returns far more body than the buffer
+    /// cap. Requests 2 and 3 must reuse the pooled connection (connecting =
+    /// 0), AND every response's `data_received` must cover the full body —
+    /// the second condition is the load-bearing one. A broken implementation
+    /// that capped the buffer without draining the rest would either leave
+    /// bytes in hyper's internal channel (and `data_received` would fall
+    /// short) OR poison the next request via pooled-conn reuse. 100 KB body
+    /// + 1 KB cap exercises both paths.
+    #[tokio::test]
+    async fn capped_body_drains_full_response_then_returns_clean_conn_to_pool() {
+        let body_text = "z".repeat(100_000);
+        let body_len = body_text.len() as u64;
+        let body_for_handler = body_text.clone();
+        let app = Router::new().route(
+            "/big",
+            get(move || {
+                let b = body_for_handler.clone();
+                async move { b }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut client = HyperHttpClient::from_config(&TestConfig::default()).unwrap();
+        client.config.max_response_body_size = 1024;
+
+        let url = format!("http://127.0.0.1:{}/big", addr.port());
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let r1 = client.send(req()).await.unwrap();
+        let r2 = client.send(req()).await.unwrap();
+        let r3 = client.send(req()).await.unwrap();
+
+        // All three responses must report identical buffer truncation AND
+        // covered the full body bytes on the wire.
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            let buf_len = match &r.body {
+                ResponseBody::Buffered(b) => b.len(),
+                ResponseBody::Discarded => panic!("buffered mode expected"),
+            };
+            assert_eq!(buf_len, 1024, "request {i} must truncate at the cap");
+            assert!(
+                r.data_received >= body_len,
+                "request {i} data_received ({}) must cover full body ({}) — \
+                 drain must continue past the buffer cap so the IO wrapper sees \
+                 every byte",
+                r.data_received,
+                body_len,
+            );
+        }
+
+        // First request pays for connection setup; subsequent requests reuse
+        // — proves the connection was clean after the drain-past-cap.
+        assert!(r1.timings.connecting > 0.0, "r1 must open a fresh conn");
+        assert_eq!(
+            r2.timings.connecting, 0.0,
+            "r2 must reuse the pool — drain-after-cap kept the conn clean"
+        );
+        assert_eq!(r2.timings.blocked, 0.0, "r2 must skip DNS");
+        assert_eq!(r3.timings.connecting, 0.0, "r3 must reuse the pool");
+    }
+
+    /// S1 — same invariant as the capped-buffer test, but for the discard
+    /// path. Three requests over a 100 KB body; r2 and r3 must reuse the
+    /// pooled connection AND every response's `data_received` must cover
+    /// the full body — proving the discard path drains rather than just
+    /// dropping the Incoming and leaving bytes pending.
+    #[tokio::test]
+    async fn discard_drains_full_body_and_keeps_pooled_conn_healthy_across_requests() {
+        let body_text = "w".repeat(100_000);
+        let body_len = body_text.len() as u64;
+        let body_for_handler = body_text.clone();
+        let app = Router::new().route(
+            "/big",
+            get(move || {
+                let b = body_for_handler.clone();
+                async move { b }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut config = TestConfig::default();
+        config.discard_response_bodies = true;
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let url = format!("http://127.0.0.1:{}/big", addr.port());
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let r1 = client.send(req()).await.unwrap();
+        let r2 = client.send(req()).await.unwrap();
+        let r3 = client.send(req()).await.unwrap();
+
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            assert!(
+                matches!(r.body, ResponseBody::Discarded),
+                "response {i} must be Discarded"
+            );
+            assert!(
+                r.data_received >= body_len,
+                "response {i} data_received ({}) must cover full body ({}) — \
+                 the discard path must drain to end-of-stream",
+                r.data_received,
+                body_len,
+            );
+        }
+        assert!(r1.timings.connecting > 0.0);
+        assert_eq!(
+            r2.timings.connecting, 0.0,
+            "r2 must reuse — discard path must have drained the body"
+        );
+        assert_eq!(r3.timings.connecting, 0.0);
+    }
+
+    /// S1 — when the drain phase itself errors (server lies about
+    /// Content-Length and closes early), the poisoned PooledConn must NOT
+    /// re-enter the pool. The next request must succeed via a fresh TCP
+    /// connection (connecting > 0).
+    #[tokio::test]
+    async fn drain_error_evicts_pooled_conn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mock server: connection 1 emits a content-length-mismatched
+        // response (declares 100 bytes, sends only 4 before close).
+        // Connection 2 emits a well-formed response.
+        tokio::spawn(async move {
+            // Connection 1: bad response.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\nABCD",
+            )
+            .await
+            .unwrap();
+            sock.shutdown().await.ok();
+            drop(sock);
+
+            // Connection 2: good response, well-formed body, Connection: close.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+            sock.shutdown().await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = HyperHttpClient::new();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        // First request must fail at body drain.
+        let r1 = client.send(req()).await;
+        assert!(
+            r1.is_err(),
+            "request must error on content-length mismatch during drain"
+        );
+
+        // Second request must succeed against a fresh TCP connection — the
+        // poisoned first-attempt conn must NOT have been re-pooled. If it
+        // were, r2 would either reuse it (connecting = 0) AND return garbage
+        // or fail similarly. We assert fresh setup.
+        let r2 = client
+            .send(req())
+            .await
+            .expect("second request must succeed via fresh conn");
+        assert_eq!(r2.status, 200);
+        assert!(
+            r2.timings.connecting > 0.0,
+            "r2 must NOT reuse the poisoned conn; got connecting={}",
+            r2.timings.connecting
         );
     }
 }

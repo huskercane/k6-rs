@@ -205,11 +205,7 @@ impl MetricSelector {
         if self.tags.is_empty() {
             return self.name.clone();
         }
-        let inner: Vec<String> = self
-            .tags
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect();
+        let inner: Vec<String> = self.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         format!("{}{{{}}}", self.name, inner.join(","))
     }
 }
@@ -374,7 +370,9 @@ mod tests {
 
     #[test]
     fn display_writes_canonical() {
-        let s = MetricSelector::new("name").with_tag("b", "2").with_tag("a", "1");
+        let s = MetricSelector::new("name")
+            .with_tag("b", "2")
+            .with_tag("a", "1");
         assert_eq!(format!("{s}"), "name{a:1,b:2}");
     }
 
@@ -434,10 +432,7 @@ mod tests {
         assert_eq!(s.name, "ws_metric");
         assert_eq!(s.tags["url"], "ws://localhost:8080/path");
         // Round-trips losslessly.
-        assert_eq!(
-            MetricSelector::parse(&s.canonical()).unwrap(),
-            s
-        );
+        assert_eq!(MetricSelector::parse(&s.canonical()).unwrap(), s);
     }
 
     #[test]
@@ -448,7 +443,10 @@ mod tests {
         let err = MetricSelector::parse("name{a:1,a:2}").unwrap_err();
         match err {
             SelectorParseError::MalformedTagPair(d) => {
-                assert!(d.contains("duplicate"), "diagnostic should mention duplicate: {d:?}");
+                assert!(
+                    d.contains("duplicate"),
+                    "diagnostic should mention duplicate: {d:?}"
+                );
                 assert!(d.contains('a'), "diagnostic should name the key: {d:?}");
             }
             other => panic!("expected MalformedTagPair, got {other:?}"),

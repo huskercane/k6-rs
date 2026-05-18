@@ -15,8 +15,8 @@
 
 use std::path::PathBuf;
 
-use super::event_stream::{self, EventSink, DEFAULT_CHANNEL_CAPACITY};
 use super::Output;
+use super::event_stream::{self, DEFAULT_CHANNEL_CAPACITY, EventSink};
 use crate::metrics::MetricsSnapshot;
 
 /// Builder for the JSON output. Caller `take_sink()` after `new` to install
@@ -41,7 +41,6 @@ impl JsonOutput {
             writer_handle: None,
         }
     }
-
 }
 
 impl Output for JsonOutput {
@@ -80,9 +79,7 @@ impl Output for JsonOutput {
         self.sink.clone()
     }
 
-    fn take_writer_handle(
-        &mut self,
-    ) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
+    fn take_writer_handle(&mut self) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
         self.writer_handle.take()
     }
 }

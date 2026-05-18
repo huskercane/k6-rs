@@ -58,7 +58,8 @@ pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
     }
 
     // JS constructors that wrap the Rust functions
-    ctx.eval::<(), _>(r#"
+    ctx.eval::<(), _>(
+        r#"
         function Trend(name, isTime) {
             this.name = name;
             this.isTime = isTime !== false;
@@ -92,7 +93,8 @@ pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
         globalThis.Counter = Counter;
         globalThis.Rate = Rate;
         globalThis.Gauge = Gauge;
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -111,12 +113,14 @@ mod tests {
         ctx.with(|ctx| {
             register(&ctx, Arc::clone(&registry)).unwrap();
 
-            ctx.eval::<(), _>(r#"
+            ctx.eval::<(), _>(
+                r#"
                 const myTrend = new Trend('my_trend');
                 myTrend.add(100);
                 myTrend.add(200);
                 myTrend.add(300);
-            "#)
+            "#,
+            )
             .unwrap();
         });
 
@@ -134,12 +138,14 @@ mod tests {
         ctx.with(|ctx| {
             register(&ctx, Arc::clone(&registry)).unwrap();
 
-            ctx.eval::<(), _>(r#"
+            ctx.eval::<(), _>(
+                r#"
                 const myCounter = new Counter('my_counter');
                 myCounter.add(1);
                 myCounter.add(5);
                 myCounter.add(10);
-            "#)
+            "#,
+            )
             .unwrap();
         });
 
@@ -155,12 +161,14 @@ mod tests {
         ctx.with(|ctx| {
             register(&ctx, Arc::clone(&registry)).unwrap();
 
-            ctx.eval::<(), _>(r#"
+            ctx.eval::<(), _>(
+                r#"
                 const myRate = new Rate('my_rate');
                 myRate.add(true);
                 myRate.add(true);
                 myRate.add(false);
-            "#)
+            "#,
+            )
             .unwrap();
         });
 
@@ -179,11 +187,13 @@ mod tests {
         ctx.with(|ctx| {
             register(&ctx, Arc::clone(&registry)).unwrap();
 
-            ctx.eval::<(), _>(r#"
+            ctx.eval::<(), _>(
+                r#"
                 const myGauge = new Gauge('my_gauge');
                 myGauge.add(42);
                 myGauge.add(99);
-            "#)
+            "#,
+            )
             .unwrap();
         });
 
@@ -200,7 +210,8 @@ mod tests {
             register(&ctx, Arc::clone(&registry)).unwrap();
 
             // Common pattern: create metric, use in iteration
-            ctx.eval::<(), _>(r#"
+            ctx.eval::<(), _>(
+                r#"
                 const apiDuration = new Trend('api_duration');
                 const apiErrors = new Rate('api_errors');
 
@@ -209,7 +220,8 @@ mod tests {
                 apiErrors.add(false); // no error
                 apiDuration.add(200);
                 apiErrors.add(true); // error!
-            "#)
+            "#,
+            )
             .unwrap();
         });
 

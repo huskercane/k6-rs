@@ -23,8 +23,7 @@ pub fn register(
     handle: tokio::runtime::Handle,
     metrics: Option<BuiltinMetrics>,
 ) -> Result<()> {
-    let sessions: Arc<Mutex<HashMap<String, WsSession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<Mutex<HashMap<String, WsSession>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // __ws_open(url, timeout_ms) → session_id
     {
@@ -262,8 +261,7 @@ async fn ws_open_impl(
         std::time::Duration::from_secs(60)
     };
 
-    let ws_stream =
-        tokio::time::timeout(timeout, tokio_tungstenite::connect_async(url)).await;
+    let ws_stream = tokio::time::timeout(timeout, tokio_tungstenite::connect_async(url)).await;
 
     let ws_stream = match ws_stream {
         Ok(Ok((stream, _response))) => stream,

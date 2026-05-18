@@ -20,10 +20,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::adapters::{collect_root_group_tree, read_to_string, Adapter, RunArtifacts};
+use crate::adapters::{Adapter, RunArtifacts, collect_root_group_tree, read_to_string};
 use crate::canonical::{
-    selector_string, CanonicalCheck, CanonicalGroup, CanonicalMetric, CanonicalMetricKind,
-    CanonicalRun, CanonicalSummary, CanonicalTrend, NormalizedTagSet,
+    CanonicalCheck, CanonicalGroup, CanonicalMetric, CanonicalMetricKind, CanonicalRun,
+    CanonicalSummary, CanonicalTrend, NormalizedTagSet, selector_string,
 };
 
 pub struct UpstreamAdapter;

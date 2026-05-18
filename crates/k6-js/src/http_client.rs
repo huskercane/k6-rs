@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use k6_core::config::TestConfig;
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
@@ -62,8 +62,7 @@ impl ReqwestHttpClient {
 
     /// Create a client from the full test configuration.
     pub fn from_config(config: &TestConfig) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30));
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
 
         // Connection reuse
         if config.no_connection_reuse {
@@ -321,8 +320,7 @@ impl HttpClient for ReqwestHttpClient {
             body_bytes_len = drain_response_body(response).await?;
             ResponseBody::Discarded
         } else {
-            let buffered =
-                buffer_response_body(response, self.max_response_body_size).await?;
+            let buffered = buffer_response_body(response, self.max_response_body_size).await?;
             body_bytes_len = buffered.len() as u64;
             ResponseBody::Buffered(buffered)
         };
@@ -441,7 +439,10 @@ fn estimate_response_header_bytes(response: &reqwest::Response) -> u64 {
     bytes
 }
 
-async fn buffer_response_body(mut response: reqwest::Response, max_response_body_size: usize) -> Result<Vec<u8>> {
+async fn buffer_response_body(
+    mut response: reqwest::Response,
+    max_response_body_size: usize,
+) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(max_response_body_size.min(16 * 1024));
 
     while let Some(chunk) = response.chunk().await? {
@@ -492,7 +493,11 @@ mod tests {
             hosts: HashMap::new(),
         };
 
-        assert!(client.check_blocked("http://api.internal.com/path").is_err());
+        assert!(
+            client
+                .check_blocked("http://api.internal.com/path")
+                .is_err()
+        );
         assert!(client.check_blocked("http://example.com/path").is_ok());
     }
 
@@ -530,7 +535,9 @@ mod tests {
         config.max_redirects = Some(5);
         config.http_debug = Some("full".to_string());
         config.throw = true;
-        config.hosts.insert("test.local".to_string(), "127.0.0.1".to_string());
+        config
+            .hosts
+            .insert("test.local".to_string(), "127.0.0.1".to_string());
 
         let client = ReqwestHttpClient::from_config(&config).unwrap();
         assert_eq!(client.http_debug, Some("full".to_string()));
@@ -544,9 +551,9 @@ mod tests {
     /// write+TTFB interval, and waiting + receiving ≈ duration.
     #[tokio::test]
     async fn http_phase_boundaries_match_reqwest_observability() {
+        use axum::Router;
         use axum::extract::Path;
         use axum::routing::get;
-        use axum::Router;
         use tokio::net::TcpListener;
 
         async fn delay_handler(Path(ms): Path<u64>) -> String {
@@ -606,8 +613,8 @@ mod tests {
     /// approximate magnitude against a known-size response.
     #[tokio::test]
     async fn data_sent_and_received_count_headers_plus_body() {
-        use axum::routing::{get, post};
         use axum::Router;
+        use axum::routing::{get, post};
         use tokio::net::TcpListener;
 
         // Known fixed-size response body so we can reason about totals.

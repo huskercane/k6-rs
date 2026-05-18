@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use super::{snapshot_to_samples, MetricValue, Output};
+use super::{MetricValue, Output, snapshot_to_samples};
 use crate::metrics::MetricsSnapshot;
 
 pub struct CsvOutput {
@@ -50,7 +50,11 @@ impl Output for CsvOutput {
             let value_str = match &sample.value {
                 MetricValue::Counter { count, rate } => format!("{count},{rate:.6}"),
                 MetricValue::Gauge { value, min, max } => format!("{value},{min},{max}"),
-                MetricValue::Rate { rate, passes, total } => {
+                MetricValue::Rate {
+                    rate,
+                    passes,
+                    total,
+                } => {
                     format!("{rate:.6},{passes},{total}")
                 }
                 MetricValue::Trend {
@@ -108,13 +112,16 @@ mod tests {
         let mut output = CsvOutput::new(path.to_str().unwrap());
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![("checks".to_string(), 0.95, 95, 100)],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,
@@ -131,7 +138,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "metric_name,timestamp,metric_type,metric_value,tags");
+        assert_eq!(
+            lines[0],
+            "metric_name,timestamp,metric_type,metric_value,tags"
+        );
         assert_eq!(lines.len(), 4); // header + 3 metrics
 
         let _ = std::fs::remove_dir_all(&dir);

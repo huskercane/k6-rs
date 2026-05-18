@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -24,12 +24,7 @@ pub struct ConstantArrivalRateExecutor<V: VirtualUser + 'static> {
 }
 
 impl<V: VirtualUser + 'static> ConstantArrivalRateExecutor<V> {
-    pub fn new(
-        pool: Arc<VuPool<V>>,
-        rate: u32,
-        time_unit: Duration,
-        duration: Duration,
-    ) -> Self {
+    pub fn new(pool: Arc<VuPool<V>>, rate: u32, time_unit: Duration, duration: Duration) -> Self {
         Self {
             pool,
             rate,
@@ -184,10 +179,7 @@ mod tests {
         );
         // Total attempts ≈ 50/s * 0.3s = 15
         let total = summary.iterations_completed + summary.iterations_dropped;
-        assert!(
-            total >= 5,
-            "expected >= 5 total attempts, got {total}"
-        );
+        assert!(total >= 5, "expected >= 5 total attempts, got {total}");
     }
 
     #[tokio::test]

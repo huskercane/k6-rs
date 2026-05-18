@@ -10,15 +10,18 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
 
     globals.set(
         "__b64encode",
-        Function::new(ctx.clone(), |input: String, encoding: Option<String>| -> String {
-            let enc = encoding.unwrap_or_else(|| "std".to_string());
-            match enc.as_str() {
-                "rawstd" => general_purpose::STANDARD_NO_PAD.encode(input.as_bytes()),
-                "url" => general_purpose::URL_SAFE.encode(input.as_bytes()),
-                "rawurl" => general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes()),
-                _ => general_purpose::STANDARD.encode(input.as_bytes()),
-            }
-        })?,
+        Function::new(
+            ctx.clone(),
+            |input: String, encoding: Option<String>| -> String {
+                let enc = encoding.unwrap_or_else(|| "std".to_string());
+                match enc.as_str() {
+                    "rawstd" => general_purpose::STANDARD_NO_PAD.encode(input.as_bytes()),
+                    "url" => general_purpose::URL_SAFE.encode(input.as_bytes()),
+                    "rawurl" => general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes()),
+                    _ => general_purpose::STANDARD.encode(input.as_bytes()),
+                }
+            },
+        )?,
     )?;
 
     globals.set(
@@ -106,9 +109,7 @@ mod tests {
     fn b64encode_url() {
         with_ctx(|ctx| {
             let result: String = ctx.eval("b64encode('subjects?_d', 'url')").unwrap();
-            let decoded: String = ctx
-                .eval(format!("b64decode('{}', 'url')", result))
-                .unwrap();
+            let decoded: String = ctx.eval(format!("b64decode('{}', 'url')", result)).unwrap();
             assert_eq!(decoded, "subjects?_d");
         });
     }
@@ -124,8 +125,9 @@ mod tests {
     #[test]
     fn b64_roundtrip() {
         with_ctx(|ctx| {
-            let result: String =
-                ctx.eval("b64decode(b64encode('test data 123!@#'))").unwrap();
+            let result: String = ctx
+                .eval("b64decode(b64encode('test data 123!@#'))")
+                .unwrap();
             assert_eq!(result, "test data 123!@#");
         });
     }

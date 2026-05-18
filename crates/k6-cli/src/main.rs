@@ -279,15 +279,36 @@ async fn run_test(
         .map(|p| p.to_path_buf());
     let script = vu::prepare_script_with_dir(&raw_script, script_dir.as_deref());
 
-    // Extract options from the script by evaluating it in a temporary context
-    let script_options = extract_options(&script)?;
+    // Resolve env vars before option extraction because script options are
+    // often derived from __ENV at init time.
+    let script_dotenv_dir = std::path::Path::new(script_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let script_dotenv_dir_abs = if script_dotenv_dir.is_absolute() {
+        script_dotenv_dir.to_path_buf()
+    } else {
+        cwd.join(script_dotenv_dir)
+    };
+    let env_vars = if cwd == script_dotenv_dir_abs {
+        env::resolve_env_vars(&cli.envs, &cwd, &mut std::io::stderr())?
+    } else {
+        env::resolve_env_vars_from_dirs(
+            &cli.envs,
+            &[&cwd, &script_dotenv_dir_abs],
+            &mut std::io::stderr(),
+        )?
+    };
+
+    // Extract options from the script by evaluating it in a temporary context.
+    let script_options = extract_options(&script, &env_vars)?;
 
     // Merge config file options (lowest priority) with script options (higher priority)
     let options = if let Some(path) = config_path {
-        let config_json = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {path}"))?;
-        let config_value: serde_json::Value =
-            serde_json::from_str(&config_json).with_context(|| format!("parsing config file {path}"))?;
+        let config_json =
+            std::fs::read_to_string(path).with_context(|| format!("reading config file {path}"))?;
+        let config_value: serde_json::Value = serde_json::from_str(&config_json)
+            .with_context(|| format!("parsing config file {path}"))?;
         merge_json(config_value, script_options)
     } else {
         script_options
@@ -295,12 +316,6 @@ async fn run_test(
 
     // Parse config, apply CLI overrides (CLI has highest priority)
     let mut test_config = config::parse_options(&options)?;
-
-    // Resolve env vars: .env file (low priority) merged with --env flags (high priority)
-    let dotenv_dir = std::path::Path::new(script_path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    let env_vars = env::resolve_env_vars(&cli.envs, dotenv_dir, &mut std::io::stderr())?;
 
     // Parse --tag flags into run-level tags
     let run_tags: std::collections::HashMap<String, String> = cli
@@ -325,11 +340,8 @@ async fn run_test(
         .map(|s| scenario_max_vus(&s.executor))
         .sum();
 
-    let lint_warnings = analysis::script_lint::lint_script(
-        &script,
-        max_vus,
-        test_config.discard_response_bodies,
-    );
+    let lint_warnings =
+        analysis::script_lint::lint_script(&script, max_vus, test_config.discard_response_bodies);
     if !lint_warnings.is_empty() {
         eprint!("{}", analysis::script_lint::format_warnings(&lint_warnings));
     }
@@ -348,15 +360,14 @@ async fn run_test(
     print_banner(&test_config, script_path, &output_plugins);
 
     // Create HTTP client and shared metrics.
-    // K6RS_HTTP_CLIENT=hyper switches to the (b)-spike hyper-level client,
-    // which captures DNS/TCP/sending phase timings and exact wire-byte
-    // counts that the high-level reqwest API can't surface. Reqwest stays
-    // the default; the hyper path is plain-HTTP-only for now.
-    let use_hyper_client =
-        std::env::var("K6RS_HTTP_CLIENT").as_deref() == Ok("hyper");
+    // K6RS_HTTP_CLIENT=hyper switches to the hyper-level client, which
+    // captures DNS/TCP/sending phase timings and exact wire-byte counts
+    // that the high-level reqwest API can't surface. Reqwest stays the
+    // default; the hyper path is plain-HTTP-only until S7 lands HTTPS.
+    let use_hyper_client = std::env::var("K6RS_HTTP_CLIENT").as_deref() == Ok("hyper");
     let client = Arc::new(if use_hyper_client {
-        eprintln!("  http client: hyper (engine spike — plain HTTP only)");
-        AnyHttpClient::Hyper(HyperHttpClient::new())
+        eprintln!("  http client: hyper (plain HTTP only — HTTPS lands in S7)");
+        AnyHttpClient::Hyper(HyperHttpClient::from_config(&test_config)?)
     } else {
         AnyHttpClient::Reqwest(ReqwestHttpClient::from_config(&test_config)?)
     });
@@ -372,12 +383,11 @@ async fn run_test(
     // one. Failure to install (already set) surfaces as a wiring bug.
     for plugin in &output_plugins {
         if let Some(sink) = plugin.event_sink() {
-            metrics
-                .registry
-                .set_event_sink(sink)
-                .map_err(|_| anyhow::anyhow!(
+            metrics.registry.set_event_sink(sink).map_err(|_| {
+                anyhow::anyhow!(
                     "multiple --out json sinks attempted to install on a single registry"
-                ))?;
+                )
+            })?;
         }
     }
 
@@ -436,7 +446,7 @@ async fn run_test(
         let cancel_eval = cancel.clone();
         let eval_start = test_start;
         tokio::spawn(async move {
-            use k6_core::thresholds::{update_states, TickDecision};
+            use k6_core::thresholds::{TickDecision, update_states};
             let mut states = std::collections::HashMap::new();
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             // Skip the immediate first tick — give the run ~1s to
@@ -518,7 +528,10 @@ async fn run_test(
     for (name, scenario) in &test_config.scenarios {
         // Delay start if startTime is set
         if !scenario.start_time.is_zero() {
-            eprintln!("  scenario {name}: waiting {:?} (startTime)", scenario.start_time);
+            eprintln!(
+                "  scenario {name}: waiting {:?} (startTime)",
+                scenario.start_time
+            );
             tokio::time::sleep(scenario.start_time).await;
         }
 
@@ -545,14 +558,11 @@ async fn run_test(
                 let bp = Backpressure::from_vus(nv as usize);
                 let vus = create_vus(nv, &bp, &scenario.exec)?;
                 let pool = Arc::new(VuPool::new(vus));
-                let executor =
-                    ConstantArrivalRateExecutor::new(pool, *rate, *time_unit, *duration);
+                let executor = ConstantArrivalRateExecutor::new(pool, *rate, *time_unit, *duration);
                 executor.run(cancel.clone()).await?
             }
             ExecutorType::RampingVus {
-                start_vus,
-                stages,
-                ..
+                start_vus, stages, ..
             } => {
                 let nv = stages
                     .iter()
@@ -619,9 +629,15 @@ async fn run_test(
             }
         };
 
-        eprintln!("  scenario {name}: {} iterations in {:?}", summary.iterations_completed, summary.duration);
+        eprintln!(
+            "  scenario {name}: {} iterations in {:?}",
+            summary.iterations_completed, summary.duration
+        );
         if summary.iterations_dropped > 0 {
-            eprintln!("    dropped: {} (VU pool exhausted)", summary.iterations_dropped);
+            eprintln!(
+                "    dropped: {} (VU pool exhausted)",
+                summary.iterations_dropped
+            );
         }
 
         // Push snapshot to output plugins after each scenario
@@ -688,10 +704,10 @@ async fn run_test(
 
     // Export summary as JSON if --summary-export is set
     if let Some(ref path) = cli.summary_export {
-        let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration, summary_thresholds);
+        let summary_data =
+            k6_core::summary::build_summary_data(&snapshot, total_duration, summary_thresholds);
         let json = serde_json::to_string_pretty(&summary_data)?;
-        std::fs::write(path, &json)
-            .with_context(|| format!("writing summary export to {path}"))?;
+        std::fs::write(path, &json).with_context(|| format!("writing summary export to {path}"))?;
         eprintln!("  summary exported to {path}");
     }
 
@@ -714,7 +730,11 @@ async fn run_test(
             )?;
 
             if summary_vu.has_handle_summary() {
-                let summary_data = k6_core::summary::build_summary_data(&snapshot, total_duration, summary_thresholds);
+                let summary_data = k6_core::summary::build_summary_data(
+                    &snapshot,
+                    total_duration,
+                    summary_thresholds,
+                );
                 let data_json = serde_json::to_string(&summary_data)?;
                 match summary_vu.run_handle_summary(&data_json) {
                     Ok(outputs) => {
@@ -920,9 +940,9 @@ fn parse_stage_flags(stages: &[String]) -> Result<Vec<config::Stage>> {
     stages
         .iter()
         .map(|s| {
-            let (dur_str, target_str) = s
-                .split_once(':')
-                .with_context(|| format!("invalid --stage format '{s}', expected duration:target"))?;
+            let (dur_str, target_str) = s.split_once(':').with_context(|| {
+                format!("invalid --stage format '{s}', expected duration:target")
+            })?;
             let duration = config::parse_duration(dur_str)?;
             let target: u32 = target_str
                 .parse()
@@ -1083,9 +1103,7 @@ mod tests {
         let scenario = config.scenarios.get("default").unwrap();
         match &scenario.executor {
             ExecutorType::RampingVus {
-                start_vus,
-                stages,
-                ..
+                start_vus, stages, ..
             } => {
                 assert_eq!(*start_vus, 4);
                 assert_eq!(stages.len(), 2);
@@ -1098,7 +1116,10 @@ mod tests {
         assert_eq!(scenario.start_time, std::time::Duration::from_secs(5));
         assert_eq!(scenario.graceful_stop, std::time::Duration::from_secs(11));
         assert_eq!(scenario.env.get("TOKEN").map(String::as_str), Some("abc"));
-        assert_eq!(scenario.tags.get("suite").map(String::as_str), Some("smoke"));
+        assert_eq!(
+            scenario.tags.get("suite").map(String::as_str),
+            Some("smoke")
+        );
     }
 }
 
@@ -1143,11 +1164,35 @@ fn merge_json(base: serde_json::Value, overlay: serde_json::Value) -> serde_json
     }
 }
 
-fn extract_options(script: &str) -> Result<serde_json::Value> {
+fn extract_options(script: &str, env_vars: &[(String, String)]) -> Result<serde_json::Value> {
     let rt = k6_js::runtime::create_runtime()?;
     let ctx = k6_js::runtime::create_context(&rt)?;
 
-    let options = ctx.with(|ctx| -> serde_json::Value {
+    let options = ctx.with(|ctx| -> Result<serde_json::Value> {
+        let globals = ctx.globals();
+        let env_obj = rquickjs::Object::new(ctx.clone())?;
+        for (key, val) in env_vars {
+            env_obj.set(key.as_str(), val.as_str())?;
+        }
+        globals.set("__ENV", env_obj)?;
+
+        // Option extraction runs before the real VU context exists. Stub the
+        // metric constructors so init-time declarations don't abort before
+        // `export const options` is reached.
+        ctx.eval::<(), _>(
+            r#"
+            globalThis.Trend = function() { return { add: function() {} }; };
+            globalThis.Rate = function() { return { add: function() {} }; };
+            globalThis.Counter = function() { return { add: function() {} }; };
+            globalThis.Gauge = function() { return { add: function() {} }; };
+            globalThis.console = {
+                log: function() {},
+                warn: function() {},
+                error: function() {},
+            };
+            "#,
+        )?;
+
         // Evaluate just enough to get options — skip HTTP calls
         ctx.eval::<(), _>(script).ok();
 
@@ -1155,15 +1200,19 @@ fn extract_options(script: &str) -> Result<serde_json::Value> {
             .eval("typeof __k6_options === 'object' ? JSON.stringify(__k6_options) : null")
             .ok();
 
-        json_str
+        Ok(json_str
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::json!({}))
-    });
+            .unwrap_or(serde_json::json!({})))
+    })?;
 
     Ok(options)
 }
 
-fn print_banner(config: &TestConfig, script_path: &str, outputs: &[Box<dyn k6_core::output::Output>]) {
+fn print_banner(
+    config: &TestConfig,
+    script_path: &str,
+    outputs: &[Box<dyn k6_core::output::Output>],
+) {
     eprintln!();
     eprintln!("         /\\      k6-rs     /‾‾/  ");
     eprintln!("    /\\  /  \\     |\\  __   /  /   ");
@@ -1195,9 +1244,7 @@ fn print_banner(config: &TestConfig, script_path: &str, outputs: &[Box<dyn k6_co
         format!("{:.0} MB", estimated_mb)
     };
 
-    eprintln!(
-        "     scenarios: {scenario_count} scenario(s), {max_vus} max VUs"
-    );
+    eprintln!("     scenarios: {scenario_count} scenario(s), {max_vus} max VUs");
     eprintln!("        memory: ~{memory_str} (max {max_vus} VUs)");
 
     for (name, scenario) in &config.scenarios {
@@ -1210,15 +1257,24 @@ fn print_banner(config: &TestConfig, script_path: &str, outputs: &[Box<dyn k6_co
 fn scenario_max_vus(executor: &ExecutorType) -> u32 {
     match executor {
         ExecutorType::ConstantVus { vus, .. } => *vus,
-        ExecutorType::RampingVus { start_vus, stages, .. } => {
-            stages.iter().map(|s| s.target).max().unwrap_or(*start_vus).max(*start_vus)
-        }
-        ExecutorType::ConstantArrivalRate { max_vus, pre_allocated_vus, .. } => {
-            max_vus.unwrap_or(*pre_allocated_vus)
-        }
-        ExecutorType::RampingArrivalRate { max_vus, pre_allocated_vus, .. } => {
-            max_vus.unwrap_or(*pre_allocated_vus)
-        }
+        ExecutorType::RampingVus {
+            start_vus, stages, ..
+        } => stages
+            .iter()
+            .map(|s| s.target)
+            .max()
+            .unwrap_or(*start_vus)
+            .max(*start_vus),
+        ExecutorType::ConstantArrivalRate {
+            max_vus,
+            pre_allocated_vus,
+            ..
+        } => max_vus.unwrap_or(*pre_allocated_vus),
+        ExecutorType::RampingArrivalRate {
+            max_vus,
+            pre_allocated_vus,
+            ..
+        } => max_vus.unwrap_or(*pre_allocated_vus),
         ExecutorType::PerVuIterations { vus, .. } => *vus,
         ExecutorType::SharedIterations { vus, .. } => *vus,
         ExecutorType::ExternallyControlled { max_vus, .. } => *max_vus,
@@ -1230,30 +1286,54 @@ fn format_executor_desc(executor: &ExecutorType) -> String {
         ExecutorType::ConstantVus { vus, duration } => {
             format!("{vus} looping VUs for {duration:?}")
         }
-        ExecutorType::RampingVus { stages, start_vus, .. } => {
+        ExecutorType::RampingVus {
+            stages, start_vus, ..
+        } => {
             let max_target = stages.iter().map(|s| s.target).max().unwrap_or(0);
             let total_dur: std::time::Duration = stages.iter().map(|s| s.duration).sum();
             format!("ramping {start_vus}→{max_target} VUs over {total_dur:?}")
         }
-        ExecutorType::ConstantArrivalRate { rate, duration, pre_allocated_vus, .. } => {
+        ExecutorType::ConstantArrivalRate {
+            rate,
+            duration,
+            pre_allocated_vus,
+            ..
+        } => {
             format!("{rate} iters/s for {duration:?} ({pre_allocated_vus} pre-allocated VUs)")
         }
-        ExecutorType::RampingArrivalRate { start_rate, stages, pre_allocated_vus, .. } => {
+        ExecutorType::RampingArrivalRate {
+            start_rate,
+            stages,
+            pre_allocated_vus,
+            ..
+        } => {
             let max_target = stages.iter().map(|s| s.target).max().unwrap_or(0);
             let total_dur: std::time::Duration = stages.iter().map(|s| s.duration).sum();
-            format!("ramping {start_rate}→{max_target} iters/s over {total_dur:?} ({pre_allocated_vus} pre-allocated VUs)")
+            format!(
+                "ramping {start_rate}→{max_target} iters/s over {total_dur:?} ({pre_allocated_vus} pre-allocated VUs)"
+            )
         }
-        ExecutorType::PerVuIterations { vus, iterations, .. } => {
+        ExecutorType::PerVuIterations {
+            vus, iterations, ..
+        } => {
             format!("{vus} VUs × {iterations} iterations each")
         }
-        ExecutorType::SharedIterations { vus, iterations, .. } => {
+        ExecutorType::SharedIterations {
+            vus, iterations, ..
+        } => {
             format!("{iterations} iterations shared across {vus} VUs")
         }
-        ExecutorType::ExternallyControlled { vus, max_vus, duration } => {
+        ExecutorType::ExternallyControlled {
+            vus,
+            max_vus,
+            duration,
+        } => {
             if duration.is_zero() {
                 format!("externally controlled, {vus} initial VUs (max {max_vus}), API on :6565")
             } else {
-                format!("externally controlled, {vus} initial VUs (max {max_vus}), {duration:?}, API on :6565")
+                format!(
+                    "externally controlled, {vus} initial VUs (max {max_vus}), {duration:?}, API on :6565"
+                )
             }
         }
     }

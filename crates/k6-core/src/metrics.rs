@@ -326,10 +326,10 @@ pub struct TrendStats {
 /// one-time cost at snapshot time.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
-    pub counters: Vec<(String, u64, f64)>,    // name, value, rate_per_sec
+    pub counters: Vec<(String, u64, f64)>, // name, value, rate_per_sec
     pub gauges: Vec<(String, f64, f64, f64)>, // name, value, min, max
-    pub rates: Vec<(String, f64, u64, u64)>,  // name, rate, passes, total
-    pub trends: Vec<(String, TrendStats)>,     // name, stats
+    pub rates: Vec<(String, f64, u64, u64)>, // name, rate, passes, total
+    pub trends: Vec<(String, TrendStats)>, // name, stats
     pub trend_histograms: HashMap<String, hdrhistogram::Histogram<u64>>,
     /// First-class snapshot of the run's group tree (CG-2). Replaces the
     /// flat `checks_per` and `groups` fields that used to derive the tree
@@ -530,12 +530,7 @@ impl MetricsRegistry {
 
     /// Record a trend value with a full tag set (CG-3). Single write to
     /// the canonical-form key.
-    pub fn trend_add_with_tags(
-        &self,
-        name: &str,
-        value_ms: f64,
-        tags: &BTreeMap<String, String>,
-    ) {
+    pub fn trend_add_with_tags(&self, name: &str, value_ms: f64, tags: &BTreeMap<String, String>) {
         let key = MetricSelector {
             name: name.to_string(),
             tags: tags.clone(),
@@ -545,12 +540,7 @@ impl MetricsRegistry {
     }
 
     /// Record a rate value with a full tag set (CG-3).
-    pub fn rate_add_with_tags(
-        &self,
-        name: &str,
-        passed: bool,
-        tags: &BTreeMap<String, String>,
-    ) {
+    pub fn rate_add_with_tags(&self, name: &str, passed: bool, tags: &BTreeMap<String, String>) {
         let key = MetricSelector {
             name: name.to_string(),
             tags: tags.clone(),
@@ -560,12 +550,7 @@ impl MetricsRegistry {
     }
 
     /// Record a counter value with a full tag set (CG-3).
-    pub fn counter_add_with_tags(
-        &self,
-        name: &str,
-        value: u64,
-        tags: &BTreeMap<String, String>,
-    ) {
+    pub fn counter_add_with_tags(&self, name: &str, value: u64, tags: &BTreeMap<String, String>) {
         let key = MetricSelector {
             name: name.to_string(),
             tags: tags.clone(),
@@ -765,10 +750,12 @@ impl MetricsRegistry {
         cursor
             .checks
             .get(name)
-            .map(|r| (
-                r.passes.load(Ordering::Relaxed),
-                r.fails.load(Ordering::Relaxed),
-            ))
+            .map(|r| {
+                (
+                    r.passes.load(Ordering::Relaxed),
+                    r.fails.load(Ordering::Relaxed),
+                )
+            })
             .unwrap_or((0, 0))
     }
 
@@ -842,7 +829,11 @@ impl MetricsRegistry {
                 let val = f64::from_bits(g.value.load(Ordering::Relaxed));
                 let min = f64::from_bits(g.min.load(Ordering::Relaxed));
                 let max = f64::from_bits(g.max.load(Ordering::Relaxed));
-                let min = if min == f64::from_bits(u64::MAX) { val } else { min };
+                let min = if min == f64::from_bits(u64::MAX) {
+                    val
+                } else {
+                    min
+                };
                 (name.clone(), val, min, max)
             })
             .collect();
@@ -1029,14 +1020,22 @@ impl BuiltinMetrics {
         // `fails` = count of non-failed, `rate` = failed/total (the failure
         // rate). Reversing this (recording !failed) inverts the rate and swaps
         // the passes/fails fields in --summary-export, breaking parity.
-        self.registry.rate_add_tagged("http_req_failed", failed, tags);
-        self.registry.trend_add_tagged("http_req_duration", timings.duration, tags);
-        self.registry.trend_add_tagged("http_req_blocked", timings.blocked, tags);
-        self.registry.trend_add_tagged("http_req_connecting", timings.connecting, tags);
-        self.registry.trend_add_tagged("http_req_tls_handshaking", timings.tls_handshaking, tags);
-        self.registry.trend_add_tagged("http_req_sending", timings.sending, tags);
-        self.registry.trend_add_tagged("http_req_waiting", timings.waiting, tags);
-        self.registry.trend_add_tagged("http_req_receiving", timings.receiving, tags);
+        self.registry
+            .rate_add_tagged("http_req_failed", failed, tags);
+        self.registry
+            .trend_add_tagged("http_req_duration", timings.duration, tags);
+        self.registry
+            .trend_add_tagged("http_req_blocked", timings.blocked, tags);
+        self.registry
+            .trend_add_tagged("http_req_connecting", timings.connecting, tags);
+        self.registry
+            .trend_add_tagged("http_req_tls_handshaking", timings.tls_handshaking, tags);
+        self.registry
+            .trend_add_tagged("http_req_sending", timings.sending, tags);
+        self.registry
+            .trend_add_tagged("http_req_waiting", timings.waiting, tags);
+        self.registry
+            .trend_add_tagged("http_req_receiving", timings.receiving, tags);
     }
 
     // --- Network metrics ---
@@ -1072,8 +1071,7 @@ impl BuiltinMetrics {
     }
 
     pub fn record_ws_ping(&self, duration_ms: f64, tags: &[(String, String)]) {
-        self.registry
-            .trend_add_tagged("ws_ping", duration_ms, tags);
+        self.registry.trend_add_tagged("ws_ping", duration_ms, tags);
     }
 
     // --- gRPC metrics ---
@@ -1177,18 +1175,9 @@ mod tests {
         let p99 = super::snapshot_percentile_ms(&snap, "latency", 99.0).unwrap();
         let p999 = super::snapshot_percentile_ms(&snap, "latency", 99.9).unwrap();
 
-        assert!(
-            (p33 - 330.0).abs() < 5.0,
-            "p(33) ≈ 330, got {p33}"
-        );
-        assert!(
-            (p99 - 990.0).abs() < 5.0,
-            "p(99) ≈ 990, got {p99}"
-        );
-        assert!(
-            (p999 - 999.0).abs() < 5.0,
-            "p(99.9) ≈ 999, got {p999}"
-        );
+        assert!((p33 - 330.0).abs() < 5.0, "p(33) ≈ 330, got {p33}");
+        assert!((p99 - 990.0).abs() < 5.0, "p(99) ≈ 990, got {p99}");
+        assert!((p999 - 999.0).abs() < 5.0, "p(99.9) ≈ 999, got {p999}");
 
         // Sanity: querying an unknown metric returns None (caller can decide
         // how to handle missing trends — current threshold code falls back
@@ -1244,7 +1233,10 @@ mod tests {
 
         // Upstream-compatible: 1 failed out of 3 → failure rate = 1/3.
         let (fail_rate, passes, total) = m.registry.rate_get("http_req_failed");
-        assert!((fail_rate - 0.3333).abs() < 0.01, "fail rate should be 1/3, got {fail_rate}");
+        assert!(
+            (fail_rate - 0.3333).abs() < 0.01,
+            "fail rate should be 1/3, got {fail_rate}"
+        );
         assert_eq!(passes, 1, "passes = number of failed requests");
         assert_eq!(total, 3);
 
@@ -1307,7 +1299,10 @@ mod tests {
         let s = t.stats();
         assert_eq!(s.count, 100);
         assert!((s.avg - 10.0).abs() < 0.1, "avg = 1000/100 = 10ms");
-        assert!((s.med - 100.0).abs() < 2.0, "p50 over the 10 non-zero samples");
+        assert!(
+            (s.med - 100.0).abs() < 2.0,
+            "p50 over the 10 non-zero samples"
+        );
         assert!((s.p95 - 100.0).abs() < 2.0);
     }
 
@@ -1363,7 +1358,11 @@ mod tests {
         let reg = MetricsRegistry::new();
         reg.check_add("::api::v2", "post ok", true);
         let snap = reg.snapshot(1.0);
-        let api = snap.group_tree.children.get("api").expect("api node created");
+        let api = snap
+            .group_tree
+            .children
+            .get("api")
+            .expect("api node created");
         assert_eq!(api.path, "::api");
         assert!(api.checks.is_empty(), "api group has no direct check");
         let v2 = api.children.get("v2").expect("v2 child created");
@@ -1384,7 +1383,11 @@ mod tests {
         reg.group_register(""); // empty path → no-op, must not panic
 
         let snap = reg.snapshot(1.0);
-        let audit = snap.group_tree.children.get("audit").expect("audit present");
+        let audit = snap
+            .group_tree
+            .children
+            .get("audit")
+            .expect("audit present");
         assert_eq!(audit.path, "::audit");
         assert!(audit.checks.is_empty());
         let sub = audit.children.get("sub").expect("nested sub present");
@@ -1561,7 +1564,9 @@ mod tests {
         assert_eq!(stats.count, 2);
 
         // Tagged sub-metrics also have both
-        let tagged = reg.trend_stats("http_req_duration{scenario:light}").unwrap();
+        let tagged = reg
+            .trend_stats("http_req_duration{scenario:light}")
+            .unwrap();
         assert_eq!(tagged.count, 2);
 
         let method_tagged = reg.trend_stats("http_req_duration{method:GET}").unwrap();
@@ -1727,7 +1732,11 @@ mod tests {
         let reg = MetricsRegistry::new();
         reg.counter_add("name", 5);
         let snap = reg.snapshot(1.0);
-        let entries: Vec<_> = snap.counters.iter().filter(|(k, _, _)| k == "name").collect();
+        let entries: Vec<_> = snap
+            .counters
+            .iter()
+            .filter(|(k, _, _)| k == "name")
+            .collect();
         assert_eq!(entries.len(), 1, "exactly one `name` entry");
         assert_eq!(entries[0].1, 5, "untagged value, NOT doubled to 10");
     }

@@ -52,8 +52,7 @@ fn classify_error(err: &anyhow::Error) -> u32 {
     if msg.contains("blocked by") {
         return 1400;
     }
-    if msg.contains("dns") || msg.contains("resolve") || msg.contains("name or service not known")
-    {
+    if msg.contains("dns") || msg.contains("resolve") || msg.contains("name or service not known") {
         return 1010;
     }
     if msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") {
@@ -107,17 +106,23 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
             "__http_request",
             Function::new(
                 ctx.clone(),
-                move |method: String, url: String, body: rquickjs::Value<'_>, headers_json: String, timeout_ms: f64, tags_json: String| -> rquickjs::Result<JsHttpResponse> {
-                    let headers: Vec<(String, String)> = serde_json::from_str(&headers_json)
-                        .unwrap_or_default();
+                move |method: String,
+                      url: String,
+                      body: rquickjs::Value<'_>,
+                      headers_json: String,
+                      timeout_ms: f64,
+                      tags_json: String|
+                      -> rquickjs::Result<JsHttpResponse> {
+                    let headers: Vec<(String, String)> =
+                        serde_json::from_str(&headers_json).unwrap_or_default();
                     // CG-3: user-provided `tags: { k: v }` flows through to
                     // the metric sample tagging. Combined with the system
                     // tags below (status, method) the engine can store one
                     // submetric per unique full-tag combination, which
                     // makes thresholds like `http_req_duration{name:X,
                     // status:200}` work as users expect.
-                    let user_tags: Vec<(String, String)> = serde_json::from_str(&tags_json)
-                        .unwrap_or_default();
+                    let user_tags: Vec<(String, String)> =
+                        serde_json::from_str(&tags_json).unwrap_or_default();
                     let timeout = if timeout_ms > 0.0 {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     } else {
@@ -187,10 +192,8 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 let mut all_tags: Vec<(String, String)> = user_tags.clone();
                                 all_tags.push(("status".to_string(), resp.status.to_string()));
                                 all_tags.push(("method".to_string(), method.clone()));
-                                all_tags.push((
-                                    "expected_response".to_string(),
-                                    expected.to_string(),
-                                ));
+                                all_tags
+                                    .push(("expected_response".to_string(), expected.to_string()));
                                 m.record_http_request_tagged(&resp.timings, failed, &all_tags);
                                 // data_sent/data_received are computed in
                                 // http_client.rs as full HTTP message bytes
@@ -201,9 +204,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                             }
 
                             let body_str = match &resp.body {
-                                ResponseBody::Buffered(b) => {
-                                    String::from_utf8_lossy(b).to_string()
-                                }
+                                ResponseBody::Buffered(b) => String::from_utf8_lossy(b).to_string(),
                                 ResponseBody::Discarded => String::new(),
                             };
 
@@ -232,10 +233,8 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 // so expected_response is unconditionally
                                 // false. Matches upstream's default callback
                                 // returning false for status=0.
-                                all_tags.push((
-                                    "expected_response".to_string(),
-                                    "false".to_string(),
-                                ));
+                                all_tags
+                                    .push(("expected_response".to_string(), "false".to_string()));
                                 m.record_http_request_tagged(&timings, true, &all_tags);
                                 // Failed before the request hit the wire — no
                                 // bytes sent or received that we can measure
@@ -587,9 +586,7 @@ mod tests {
             ctx.with(|ctx| {
                 register(&ctx, handle, client, bp).unwrap();
 
-                let status: i32 = ctx
-                    .eval("http.get('http://example.com').status")
-                    .unwrap();
+                let status: i32 = ctx.eval("http.get('http://example.com').status").unwrap();
                 assert_eq!(status, 200);
             });
         })
@@ -609,9 +606,7 @@ mod tests {
             ctx.with(|ctx| {
                 register(&ctx, handle, client, bp).unwrap();
 
-                let body: String = ctx
-                    .eval("http.get('http://example.com').body")
-                    .unwrap();
+                let body: String = ctx.eval("http.get('http://example.com').body").unwrap();
                 assert_eq!(body, r#"{"message":"hello"}"#);
             });
         })
@@ -632,11 +627,13 @@ mod tests {
                 register(&ctx, handle, client, bp).unwrap();
 
                 let status: i32 = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         http.get('http://example.com', {
                             headers: { 'Authorization': 'Bearer token123' }
                         }).status
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert_eq!(status, 200);
             });
@@ -658,11 +655,13 @@ mod tests {
                 register(&ctx, handle, client, bp).unwrap();
 
                 let status: i32 = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         http.post('http://example.com/api', JSON.stringify({ name: 'test' }), {
                             headers: { 'Content-Type': 'application/json' }
                         }).status
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert_eq!(status, 201);
             });
@@ -707,13 +706,15 @@ mod tests {
                 crate::api::check::register(&ctx).unwrap();
 
                 let result: bool = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const res = http.get('http://example.com');
                         check(res, {
                             'status was 200': (r) => r.status === 200,
                             'has timings': (r) => r.timings.duration > 0,
                         })
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert!(result);
             });
@@ -728,7 +729,10 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let rt = runtime::create_runtime().unwrap();
             let ctx = runtime::create_context(&rt).unwrap();
-            let client = Arc::new(MockHttpClient::new(200, r#"{"user":{"name":"Alice","age":30}}"#));
+            let client = Arc::new(MockHttpClient::new(
+                200,
+                r#"{"user":{"name":"Alice","age":30}}"#,
+            ));
             let bp = Backpressure::new(10);
 
             ctx.with(|ctx| {
@@ -765,13 +769,15 @@ mod tests {
                 crate::api::check::register(&ctx).unwrap();
 
                 let result: bool = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const res = http.get('http://example.com');
                         check(res, {
                             'has items': (r) => r.json().items.length === 3,
                             'status ok': (r) => r.status === 200,
                         })
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert!(result);
             });
@@ -794,14 +800,16 @@ mod tests {
 
                 // Batch with array of URLs
                 let count: i32 = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const responses = http.batch([
                             'http://example.com/a',
                             'http://example.com/b',
                             'http://example.com/c',
                         ]);
                         responses.length
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert_eq!(count, 3);
 
@@ -827,14 +835,16 @@ mod tests {
                 register(&ctx, handle, client, bp).unwrap();
 
                 let status: i32 = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const responses = http.batch({
                             home: 'http://example.com/',
                             api: ['POST', 'http://example.com/api', '{"x":1}'],
                             health: { method: 'GET', url: 'http://example.com/health' },
                         });
                         responses.api.status
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert_eq!(status, 200);
             });
@@ -857,10 +867,12 @@ mod tests {
 
                 // Create expected statuses object
                 let has_specs: bool = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const es = http.expectedStatuses(200, 201, {min: 200, max: 299});
                         es.__expectedStatuses.length === 3
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert!(has_specs);
             });
@@ -887,10 +899,12 @@ mod tests {
 
                 // First request gets Set-Cookie headers
                 let has_cookies: bool = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         const res = http.get('http://mock.test/login');
                         res.cookies.session !== undefined && res.cookies.token !== undefined
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert!(has_cookies);
 
@@ -919,11 +933,13 @@ mod tests {
 
                 // Pass explicit cookies
                 let status: i32 = ctx
-                    .eval(r#"
+                    .eval(
+                        r#"
                         http.get('http://example.com', {
                             cookies: { session: 'test123' }
                         }).status
-                    "#)
+                    "#,
+                    )
                     .unwrap();
                 assert_eq!(status, 200);
             });
@@ -1101,12 +1117,12 @@ mod tests {
     async fn http_expected_response_band_boundaries() {
         // (status, expected_response_value, http_req_failed_value)
         let cases: &[(u16, bool, bool)] = &[
-            (101, false, true),  // 1xx: NOT in [200..=399] — the bug case
-            (199, false, true),  // just below lower band edge
-            (200, true, false),  // lower band edge
-            (399, true, false),  // upper band edge
-            (400, false, true),  // just above upper band edge
-            (500, false, true),  // 5xx
+            (101, false, true), // 1xx: NOT in [200..=399] — the bug case
+            (199, false, true), // just below lower band edge
+            (200, true, false), // lower band edge
+            (399, true, false), // upper band edge
+            (400, false, true), // just above upper band edge
+            (500, false, true), // 5xx
         ];
 
         for (status, want_expected, want_failed) in cases {
@@ -1129,21 +1145,15 @@ mod tests {
 
             // expected_response tag: assert exactly one of true/false present
             // matching the expected value.
-            let want_keys = stored_trend_keys_with_expected(
-                &metrics,
-                "http_req_duration",
-                *want_expected,
-            );
+            let want_keys =
+                stored_trend_keys_with_expected(&metrics, "http_req_duration", *want_expected);
             assert!(
                 !want_keys.is_empty(),
                 "status {status}: stored http_req_duration must carry \
                  expected_response:{want_expected} (unified band predicate)"
             );
-            let wrong_keys = stored_trend_keys_with_expected(
-                &metrics,
-                "http_req_duration",
-                !*want_expected,
-            );
+            let wrong_keys =
+                stored_trend_keys_with_expected(&metrics, "http_req_duration", !*want_expected);
             assert!(
                 wrong_keys.is_empty(),
                 "status {status}: no http_req_duration key should carry \
@@ -1194,9 +1204,7 @@ mod tests {
                 register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
                 // The script must not throw — http.get returns an error
                 // response object, not a JS exception.
-                let status: i32 = ctx
-                    .eval("http.get('http://example.com').status")
-                    .unwrap();
+                let status: i32 = ctx.eval("http.get('http://example.com').status").unwrap();
                 assert_eq!(status, 0, "transport error must surface status=0");
             });
         })

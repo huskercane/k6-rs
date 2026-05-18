@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 /// Top-level test configuration, parsed from k6 script `export const options`.
@@ -232,7 +232,8 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
     }
 
     if let Some(v) = obj.get("discardResponseBodies") {
-        config.discard_response_bodies = v.as_bool().context("discardResponseBodies must be bool")?;
+        config.discard_response_bodies =
+            v.as_bool().context("discardResponseBodies must be bool")?;
     }
 
     if let Some(v) = obj.get("maxRedirects") {
@@ -240,7 +241,11 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
     }
 
     if let Some(v) = obj.get("userAgent") {
-        config.user_agent = Some(v.as_str().context("userAgent must be a string")?.to_string());
+        config.user_agent = Some(
+            v.as_str()
+                .context("userAgent must be a string")?
+                .to_string(),
+        );
     }
 
     if let Some(v) = obj.get("noConnectionReuse") {
@@ -343,9 +348,7 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
 }
 
 fn parse_thresholds(value: &Value) -> Result<HashMap<String, Vec<crate::thresholds::Threshold>>> {
-    let obj = value
-        .as_object()
-        .context("thresholds must be an object")?;
+    let obj = value.as_object().context("thresholds must be an object")?;
 
     let mut thresholds = HashMap::new();
     for (name, val) in obj {
@@ -355,7 +358,9 @@ fn parse_thresholds(value: &Value) -> Result<HashMap<String, Vec<crate::threshol
                 .map(|v| parse_one_threshold(name, v))
                 .collect::<Result<Vec<_>>>()?,
             Value::String(s) => vec![crate::thresholds::Threshold::from_expression(s.clone())],
-            _ => bail!("threshold for {name} must be a string, array of strings, or array of objects"),
+            _ => bail!(
+                "threshold for {name} must be a string, array of strings, or array of objects"
+            ),
         };
         thresholds.insert(name.clone(), conditions);
     }
@@ -378,7 +383,9 @@ fn parse_one_threshold(metric_name: &str, v: &Value) -> Result<crate::thresholds
             .get("threshold")
             .and_then(Value::as_str)
             .with_context(|| {
-                format!("threshold object for {metric_name} missing required string field `threshold`")
+                format!(
+                    "threshold object for {metric_name} missing required string field `threshold`"
+                )
             })?
             .to_string();
         let abort_on_fail = obj
@@ -404,14 +411,11 @@ fn parse_one_threshold(metric_name: &str, v: &Value) -> Result<crate::thresholds
 }
 
 fn parse_scenarios(value: &Value) -> Result<HashMap<String, ScenarioConfig>> {
-    let obj = value
-        .as_object()
-        .context("scenarios must be an object")?;
+    let obj = value.as_object().context("scenarios must be an object")?;
 
     let mut scenarios = HashMap::new();
     for (name, val) in obj {
-        let scenario =
-            parse_scenario(val).with_context(|| format!("in scenario '{name}'"))?;
+        let scenario = parse_scenario(val).with_context(|| format!("in scenario '{name}'"))?;
         scenarios.insert(name.clone(), scenario);
     }
     Ok(scenarios)
@@ -518,11 +522,7 @@ fn get_duration(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Durat
     parse_duration(s)
 }
 
-fn get_duration_or(
-    obj: &serde_json::Map<String, Value>,
-    key: &str,
-    default: Duration,
-) -> Duration {
+fn get_duration_or(obj: &serde_json::Map<String, Value>, key: &str, default: Duration) -> Duration {
     obj.get(key)
         .and_then(|v| v.as_str())
         .and_then(|s| parse_duration(s).ok())
@@ -536,14 +536,8 @@ fn parse_tls_version(value: &Value) -> Result<TlsVersionConfig> {
             max: Some(s.clone()),
         }),
         Value::Object(obj) => Ok(TlsVersionConfig {
-            min: obj
-                .get("min")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            max: obj
-                .get("max")
-                .and_then(|v| v.as_str())
-                .map(String::from),
+            min: obj.get("min").and_then(|v| v.as_str()).map(String::from),
+            max: obj.get("max").and_then(|v| v.as_str()).map(String::from),
         }),
         _ => bail!("tlsVersion must be a string or object with min/max"),
     }
@@ -553,14 +547,8 @@ fn parse_dns_config(value: &Value) -> Result<DnsConfig> {
     let obj = value.as_object().context("dns must be an object")?;
     Ok(DnsConfig {
         ttl: obj.get("ttl").and_then(|v| v.as_str()).map(String::from),
-        select: obj
-            .get("select")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        policy: obj
-            .get("policy")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        select: obj.get("select").and_then(|v| v.as_str()).map(String::from),
+        policy: obj.get("policy").and_then(|v| v.as_str()).map(String::from),
     })
 }
 
@@ -603,10 +591,7 @@ mod tests {
 
     #[test]
     fn parse_duration_compound() {
-        assert_eq!(
-            parse_duration("1h30m").unwrap(),
-            Duration::from_secs(5400)
-        );
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
     }
 
     #[test]
@@ -747,7 +732,10 @@ mod tests {
         // Object form: full config.
         assert_eq!(xs[1].expression, "rate<0.02");
         assert!(xs[1].abort_on_fail);
-        assert_eq!(xs[1].delay_abort_eval, std::time::Duration::from_millis(500));
+        assert_eq!(
+            xs[1].delay_abort_eval,
+            std::time::Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -1002,7 +990,10 @@ mod tests {
         });
 
         let config = parse_options(&opts).unwrap();
-        assert_eq!(config.console_output, Some("/tmp/k6_console.log".to_string()));
+        assert_eq!(
+            config.console_output,
+            Some("/tmp/k6_console.log".to_string())
+        );
     }
 
     #[test]
@@ -1035,7 +1026,11 @@ mod tests {
         let config = parse_options(&opts).unwrap();
         let scenario = config.scenarios.get("ext").unwrap();
         match &scenario.executor {
-            ExecutorType::ExternallyControlled { vus, max_vus, duration } => {
+            ExecutorType::ExternallyControlled {
+                vus,
+                max_vus,
+                duration,
+            } => {
                 assert_eq!(*vus, 5);
                 assert_eq!(*max_vus, 20);
                 assert_eq!(*duration, Duration::from_secs(600));

@@ -35,7 +35,13 @@ impl MemoryMonitor {
 
     /// Call after each iteration with the current heap size.
     /// Returns a warning if growth is detected.
-    pub fn check(&mut self, iteration: u32, heap_bytes: usize, vu_id: u32, iters_per_sec: f64) -> Option<MemoryWarning> {
+    pub fn check(
+        &mut self,
+        iteration: u32,
+        heap_bytes: usize,
+        vu_id: u32,
+        iters_per_sec: f64,
+    ) -> Option<MemoryWarning> {
         // Only sample every N iterations
         if iteration % SAMPLE_INTERVAL != 0 {
             return None;
@@ -199,7 +205,9 @@ mod tests {
 
         // Add samples with exactly 2000 bytes growth per iteration
         for i in 0..10 {
-            monitor.samples.push((i * 50, 1_000_000 + i as usize * 100_000));
+            monitor
+                .samples
+                .push((i * 50, 1_000_000 + i as usize * 100_000));
         }
 
         let growth = monitor.estimate_growth();

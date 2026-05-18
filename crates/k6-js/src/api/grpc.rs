@@ -134,8 +134,15 @@ pub fn register(
                     let m = m.clone();
 
                     let result = h.block_on(async {
-                        grpc_invoke_impl(&conn_id, &method, &request_json, &metadata_json, conns, m.as_ref())
-                            .await
+                        grpc_invoke_impl(
+                            &conn_id,
+                            &method,
+                            &request_json,
+                            &metadata_json,
+                            conns,
+                            m.as_ref(),
+                        )
+                        .await
                     });
 
                     match result {
@@ -305,9 +312,7 @@ async fn grpc_invoke_impl(
     let mut req = tonic::Request::new(request_value);
     *req.metadata_mut() = meta;
 
-    let response = client
-        .unary(req, path, codec)
-        .await;
+    let response = client.unary(req, path, codec).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -326,13 +331,11 @@ async fn grpc_invoke_impl(
                 error: None,
             })
         }
-        Err(status) => {
-            Ok(JsGrpcResponse {
-                status: status.code() as i32,
-                message: None,
-                error: Some(status.message().to_string()),
-            })
-        }
+        Err(status) => Ok(JsGrpcResponse {
+            status: status.code() as i32,
+            message: None,
+            error: Some(status.message().to_string()),
+        }),
     }
 }
 

@@ -35,20 +35,14 @@ pub struct RunSummary {
 /// they don't know about JS or HTTP.
 pub trait Executor: Send + Sync {
     /// Run the executor until completion or cancellation.
-    fn run(
-        &self,
-        cancel: CancellationToken,
-    ) -> impl Future<Output = Result<RunSummary>> + Send;
+    fn run(&self, cancel: CancellationToken) -> impl Future<Output = Result<RunSummary>> + Send;
 }
 
 /// Abstraction over HTTP clients for testability.
 ///
 /// Production uses reqwest; tests use a mock that returns canned responses.
 pub trait HttpClient: Send + Sync {
-    fn send(
-        &self,
-        req: HttpRequest,
-    ) -> impl Future<Output = Result<HttpResponse>> + Send;
+    fn send(&self, req: HttpRequest) -> impl Future<Output = Result<HttpResponse>> + Send;
 }
 
 /// An HTTP request to be sent.

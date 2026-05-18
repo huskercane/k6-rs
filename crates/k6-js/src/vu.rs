@@ -38,9 +38,7 @@ impl QuickJsVu {
         ctx.with(|ctx| {
             // Set k6 globals
             let globals = ctx.globals();
-            globals
-                .set("__VU", vu_id)
-                .context("failed to set __VU")?;
+            globals.set("__VU", vu_id).context("failed to set __VU")?;
             globals
                 .set("__ITER", 0i32)
                 .context("failed to set __ITER")?;
@@ -81,21 +79,6 @@ impl QuickJsVu {
         // Run pending jobs
         runtime::drain_pending_jobs(&rt);
 
-        // Verify __k6_default exists
-        let has_default = ctx.with(|ctx| {
-            ctx.globals()
-                .get::<_, rquickjs::Value>("__k6_default")
-                .map(|v| v.is_function())
-                .unwrap_or(false)
-        });
-
-        if !has_default {
-            anyhow::bail!(
-                "script must export a default function. \
-                 Use: export default function() {{ ... }}"
-            );
-        }
-
         Ok(Self {
             ctx,
             rt,
@@ -131,7 +114,16 @@ impl QuickJsVu {
         backpressure: Backpressure,
         metrics: Option<BuiltinMetrics>,
     ) -> Result<Self> {
-        Self::new_full(vu_id, script, env, handle, client, backpressure, metrics, None)
+        Self::new_full(
+            vu_id,
+            script,
+            env,
+            handle,
+            client,
+            backpressure,
+            metrics,
+            None,
+        )
     }
 
     /// Create a new VU with full k6 API, metrics, and file system access.
@@ -178,7 +170,9 @@ impl QuickJsVu {
         ctx.with(|ctx| {
             let globals = ctx.globals();
             globals.set("__VU", vu_id).context("failed to set __VU")?;
-            globals.set("__ITER", 0i32).context("failed to set __ITER")?;
+            globals
+                .set("__ITER", 0i32)
+                .context("failed to set __ITER")?;
 
             let env_obj = rquickjs::Object::new(ctx.clone())?;
             for (key, val) in env {
@@ -247,20 +241,6 @@ impl QuickJsVu {
             let _ = ctx.globals().set("__open_init_only", false);
         });
 
-        let has_default = ctx.with(|ctx| {
-            ctx.globals()
-                .get::<_, rquickjs::Value>("__k6_default")
-                .map(|v| v.is_function())
-                .unwrap_or(false)
-        });
-
-        if !has_default {
-            anyhow::bail!(
-                "script must export a default function. \
-                 Use: export default function() {{ ... }}"
-            );
-        }
-
         Ok(Self {
             ctx,
             rt,
@@ -282,7 +262,8 @@ impl QuickJsVu {
     ) -> Result<()> {
         // Use JS wrapper that calls String() on each argument,
         // so we always receive strings in the Rust callback.
-        ctx.eval::<(), _>(r#"
+        ctx.eval::<(), _>(
+            r#"
             globalThis.console = {
                 log: function() {
                     let parts = [];
@@ -306,7 +287,8 @@ impl QuickJsVu {
                     __console_error(parts.join(' '));
                 },
             };
-        "#)?;
+        "#,
+        )?;
 
         let globals = ctx.globals();
 
@@ -377,20 +359,23 @@ impl QuickJsVu {
 
         globals.set(
             "__open_file",
-            Function::new(ctx.clone(), move |path: String| -> rquickjs::Result<String> {
-                let resolved = if Path::new(&path).is_absolute() {
-                    PathBuf::from(&path)
-                } else {
-                    script_dir.join(&path)
-                };
-                std::fs::read_to_string(&resolved).map_err(|e| {
-                    rquickjs::Error::new_from_js_message(
-                        "string",
-                        "string",
-                        &format!("open({path}): {e}"),
-                    )
-                })
-            })?,
+            Function::new(
+                ctx.clone(),
+                move |path: String| -> rquickjs::Result<String> {
+                    let resolved = if Path::new(&path).is_absolute() {
+                        PathBuf::from(&path)
+                    } else {
+                        script_dir.join(&path)
+                    };
+                    std::fs::read_to_string(&resolved).map_err(|e| {
+                        rquickjs::Error::new_from_js_message(
+                            "string",
+                            "string",
+                            &format!("open({path}): {e}"),
+                        )
+                    })
+                },
+            )?,
         )?;
 
         ctx.eval::<(), _>(
@@ -478,7 +463,10 @@ impl QuickJsVu {
 
             // Parse data and call handleSummary
             let data: rquickjs::Value = ctx
-                .eval::<rquickjs::Value, _>(format!("JSON.parse('{}')", data_json.replace('\\', "\\\\").replace('\'', "\\'")))
+                .eval::<rquickjs::Value, _>(format!(
+                    "JSON.parse('{}')",
+                    data_json.replace('\\', "\\\\").replace('\'', "\\'")
+                ))
                 .catch(&ctx)
                 .map_err(|e| anyhow::anyhow!("failed to parse summary data: {e:?}"))?;
 
@@ -619,9 +607,15 @@ impl VirtualUser for QuickJsVu {
                 Some(name) => name.as_str(),
                 None => "__k6_default",
             };
-            let func: Function = globals
-                .get(fn_name)
-                .with_context(|| format!("exec function '{fn_name}' not found"))?;
+            let func: Function = globals.get(fn_name).with_context(|| {
+                if self.exec_fn.is_none() {
+                    "script must export a default function. \
+                         Use: export default function() { ... }"
+                        .to_string()
+                } else {
+                    format!("exec function '{fn_name}' not found")
+                }
+            })?;
 
             let data: rquickjs::Value = ctx
                 .eval("typeof __k6_setup_data !== 'undefined' ? __k6_setup_data : undefined")
@@ -686,8 +680,7 @@ pub fn prepare_script_with_dir(source: &str, script_dir: Option<&Path>) -> Strin
                                     let parent = resolved.parent().unwrap_or(dir);
                                     output.push_str(&format!("// inlined: {path}\n"));
                                     // Recursively prepare the imported file
-                                    let prepared =
-                                        prepare_script_with_dir(&contents, Some(parent));
+                                    let prepared = prepare_script_with_dir(&contents, Some(parent));
                                     output.push_str(&prepared);
                                     output.push('\n');
                                     continue;
@@ -708,8 +701,7 @@ pub fn prepare_script_with_dir(source: &str, script_dir: Option<&Path>) -> Strin
                     if path.starts_with("k6/x/") {
                         let ext_name = &path[5..]; // strip "k6/x/"
                         let ext_file = dir.join("extensions").join(format!("{ext_name}.js"));
-                        let ext_file_index =
-                            dir.join("extensions").join(ext_name).join("index.js");
+                        let ext_file_index = dir.join("extensions").join(ext_name).join("index.js");
                         let resolved = if ext_file.exists() {
                             ext_file
                         } else {
@@ -721,8 +713,7 @@ pub fn prepare_script_with_dir(source: &str, script_dir: Option<&Path>) -> Strin
                                 Ok(contents) => {
                                     let parent = resolved.parent().unwrap_or(dir);
                                     output.push_str(&format!("// extension: {path}\n"));
-                                    let prepared =
-                                        prepare_script_with_dir(&contents, Some(parent));
+                                    let prepared = prepare_script_with_dir(&contents, Some(parent));
                                     output.push_str(&prepared);
                                     output.push('\n');
                                     continue;
@@ -779,7 +770,10 @@ pub fn prepare_script_with_dir(source: &str, script_dir: Option<&Path>) -> Strin
                 .or_else(|| trimmed.strip_prefix("export var "))
                 .unwrap();
             // Extract the variable name
-            if let Some(name) = rest.split(|c: char| !c.is_alphanumeric() && c != '_').next() {
+            if let Some(name) = rest
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+            {
                 let after_name = &rest[name.len()..];
                 output.push_str(&format!("globalThis.{name}"));
                 output.push_str(after_name);
@@ -825,11 +819,7 @@ fn extract_import_names(import_line: &str) -> Option<Vec<&str>> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 #[cfg(test)]
@@ -864,9 +854,7 @@ mod tests {
             };
         "#;
 
-        let env = vec![
-            ("BASE_URL".to_string(), "http://localhost:8080".to_string()),
-        ];
+        let env = vec![("BASE_URL".to_string(), "http://localhost:8080".to_string())];
         let mut vu = QuickJsVu::new(1, script, &env).unwrap();
         vu.run_iteration().unwrap();
     }
@@ -910,7 +898,8 @@ mod tests {
     #[test]
     fn vu_error_on_missing_default() {
         let script = "let x = 1;";
-        let result = QuickJsVu::new(1, script, &[]);
+        let mut vu = QuickJsVu::new(1, script, &[]).unwrap();
+        let result = vu.run_iteration();
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("default function"), "error was: {err}");
@@ -975,9 +964,7 @@ export function setup() {
             globalThis.__k6_default = function() {};
         "#;
 
-        let mut vu: Box<dyn VirtualUser> = Box::new(
-            QuickJsVu::new(1, script, &[]).unwrap(),
-        );
+        let mut vu: Box<dyn VirtualUser> = Box::new(QuickJsVu::new(1, script, &[]).unwrap());
 
         vu.run_iteration().unwrap();
         vu.reset();
@@ -1010,7 +997,8 @@ export default function() {
 
     #[test]
     fn setup_returns_data() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export function setup() {
     return { token: 'abc123', users: [1, 2, 3] };
 }
@@ -1019,7 +1007,8 @@ export default function(data) {
     if (data.token !== 'abc123') throw new Error('wrong token');
     globalThis.__data_ok = true;
 }
-"#);
+"#,
+        );
 
         let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
 
@@ -1040,7 +1029,8 @@ export default function(data) {
 
     #[test]
     fn setup_data_shared_across_vus() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export function setup() {
     return { count: 42 };
 }
@@ -1048,7 +1038,8 @@ export function setup() {
 export default function(data) {
     globalThis.__received_count = data.count;
 }
-"#);
+"#,
+        );
 
         // VU 1 runs setup
         let mut vu1 = QuickJsVu::new(1, &script, &[]).unwrap();
@@ -1067,7 +1058,8 @@ export default function(data) {
 
     #[test]
     fn teardown_receives_setup_data() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export function setup() {
     return { msg: 'hello' };
 }
@@ -1077,7 +1069,8 @@ export default function(data) {}
 export function teardown(data) {
     globalThis.__teardown_msg = data.msg;
 }
-"#);
+"#,
+        );
 
         let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
 
@@ -1096,11 +1089,13 @@ export function teardown(data) {
 
     #[test]
     fn no_setup_no_teardown() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export default function() {
     globalThis.__ran = true;
 }
-"#);
+"#,
+        );
 
         let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
         assert!(!vu.has_setup());
@@ -1116,7 +1111,8 @@ export default function() {
 
     #[test]
     fn exec_named_function() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export default function() {
     globalThis.__which = 'default';
 }
@@ -1124,7 +1120,8 @@ export default function() {
 export function myScenario() {
     globalThis.__which = 'myScenario';
 }
-"#);
+"#,
+        );
 
         // Default exec
         let mut vu1 = QuickJsVu::new(1, &script, &[]).unwrap();
@@ -1145,8 +1142,28 @@ export function myScenario() {
     }
 
     #[test]
+    fn exec_named_function_without_default() {
+        let script = prepare_script(
+            r#"
+export function myScenario() {
+    globalThis.__which = 'myScenario';
+}
+"#,
+        );
+
+        let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
+        vu.set_exec_fn("myScenario");
+        vu.run_iteration().unwrap();
+        vu.ctx.with(|ctx| {
+            let which: String = ctx.globals().get("__which").unwrap();
+            assert_eq!(which, "myScenario");
+        });
+    }
+
+    #[test]
     fn handle_summary_callback() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export default function() {}
 
 export function handleSummary(data) {
@@ -1154,7 +1171,8 @@ export function handleSummary(data) {
         stdout: JSON.stringify(data.metrics) + '\n',
     };
 }
-"#);
+"#,
+        );
 
         let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
         assert!(vu.has_handle_summary());
@@ -1169,21 +1187,25 @@ export function handleSummary(data) {
 
     #[test]
     fn no_handle_summary() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export default function() {}
-"#);
+"#,
+        );
         let vu = QuickJsVu::new(1, &script, &[]).unwrap();
         assert!(!vu.has_handle_summary());
     }
 
     #[test]
     fn fail_aborts_iteration() {
-        let script = prepare_script(r#"
+        let script = prepare_script(
+            r#"
 export default function() {
     fail('something went wrong');
     globalThis.__should_not_reach = true;
 }
-"#);
+"#,
+        );
         let mut vu = QuickJsVu::new(1, &script, &[]).unwrap();
         let result = vu.run_iteration();
         assert!(result.is_err());
@@ -1220,7 +1242,10 @@ export default function() {
         vu.run_iteration().unwrap();
         vu.ctx.with(|ctx| {
             let hash: String = ctx.globals().get("__hash").unwrap();
-            assert_eq!(hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+            assert_eq!(
+                hash,
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            );
         });
     }
 
@@ -1279,7 +1304,10 @@ export default function() {
         let output = prepare_script_with_dir(script, Some(&dir));
 
         // Local import should be inlined
-        assert!(output.contains("// inlined: ./helpers.js"), "output: {output}");
+        assert!(
+            output.contains("// inlined: ./helpers.js"),
+            "output: {output}"
+        );
         assert!(output.contains("globalThis.greet = function greet"));
 
         // k6 import should be commented out
@@ -1300,9 +1328,18 @@ export default function() {}
 "#;
 
         let output = prepare_script(script);
-        assert!(output.contains("globalThis.BASE_URL = 'http://localhost:8080'"), "output: {output}");
-        assert!(output.contains("globalThis.counter = 0"), "output: {output}");
-        assert!(output.contains("globalThis.name = 'test'"), "output: {output}");
+        assert!(
+            output.contains("globalThis.BASE_URL = 'http://localhost:8080'"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("globalThis.counter = 0"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("globalThis.name = 'test'"),
+            "output: {output}"
+        );
     }
 
     #[test]
@@ -1425,8 +1462,7 @@ export default function() {}
         let dir = std::env::temp_dir().join("k6rs_test_ext_missing");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let script =
-            "import { foo } from 'k6/x/nonexistent';\nexport default function() {}\n";
+        let script = "import { foo } from 'k6/x/nonexistent';\nexport default function() {}\n";
         let prepared = prepare_script_with_dir(script, Some(&dir));
         assert!(prepared.contains("// ERROR: extension k6/x/nonexistent not found"));
 

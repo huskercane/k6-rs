@@ -7,9 +7,7 @@
 pub mod counters;
 pub mod trends;
 
-use crate::canonical::{
-    CanonicalEventStream, CanonicalMetricKind, CanonicalRun,
-};
+use crate::canonical::{CanonicalEventStream, CanonicalMetricKind, CanonicalRun};
 use crate::expectations::{Expectations, Tolerance};
 
 #[derive(Debug, Clone)]
@@ -83,7 +81,10 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
         out.push(DiffFinding {
             kind: FindingKind::ExitCode,
             selector: "<run>".into(),
-            detail: format!("exit codes differ: {} vs {}", left.exit_code, right.exit_code),
+            detail: format!(
+                "exit codes differ: {} vs {}",
+                left.exit_code, right.exit_code
+            ),
         });
     }
 
@@ -111,8 +112,14 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
                 let tol = exp.tolerance_for(sel);
                 match (&l.kind, &r.kind) {
                     (
-                        CanonicalMetricKind::Counter { count: lc, rate: lr },
-                        CanonicalMetricKind::Counter { count: rc, rate: rr },
+                        CanonicalMetricKind::Counter {
+                            count: lc,
+                            rate: lr,
+                        },
+                        CanonicalMetricKind::Counter {
+                            count: rc,
+                            rate: rr,
+                        },
                     ) => out.extend(counters::diff(sel, (*lc, *lr), (*rc, *rr), &tol)),
                     (CanonicalMetricKind::Trend(lt), CanonicalMetricKind::Trend(rt)) => {
                         out.extend(trends::diff(sel, lt, rt, &tol))
@@ -134,8 +141,7 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
     // CG-1: per-check identity diff. Pass/fail counts are exact-match; any
     // identity present on only one side is a MissingCheck finding. Same
     // `known_drift` filter as metrics — the path string is the selector.
-    let mut check_keys: Vec<&String> =
-        left.checks.keys().chain(right.checks.keys()).collect();
+    let mut check_keys: Vec<&String> = left.checks.keys().chain(right.checks.keys()).collect();
     check_keys.sort();
     check_keys.dedup();
     for path in check_keys {
@@ -184,16 +190,13 @@ pub fn diff(left: &CanonicalRun, right: &CanonicalRun, exp: &Expectations) -> Ve
     // missing several upstream-default tags (name/url/proto/group/
     // scenario), so per-tag-bucket diff would fail every script until
     // those tag-emission gaps close (tracked separately).
-    if let (Some(l_stream), Some(r_stream)) =
-        (&left.event_stream, &right.event_stream)
-    {
+    if let (Some(l_stream), Some(r_stream)) = (&left.event_stream, &right.event_stream) {
         out.extend(diff_event_streams(l_stream, r_stream, exp));
     }
 
     // CG-2: per-group identity diff. Pass-through on the same `known_drift`
     // filter — paths can be acknowledged as architectural asymmetries.
-    let mut group_keys: Vec<&String> =
-        left.groups.keys().chain(right.groups.keys()).collect();
+    let mut group_keys: Vec<&String> = left.groups.keys().chain(right.groups.keys()).collect();
     group_keys.sort();
     group_keys.dedup();
     for path in group_keys {
@@ -247,10 +250,7 @@ pub(crate) fn diff_event_streams(
         if exp.is_known_drift(name) {
             continue;
         }
-        match (
-            left.metric_defs.get(name),
-            right.metric_defs.get(name),
-        ) {
+        match (left.metric_defs.get(name), right.metric_defs.get(name)) {
             (None, Some(_)) | (Some(_), None) => out.push(DiffFinding {
                 kind: FindingKind::MissingMetricDef,
                 selector: name.clone(),
@@ -261,21 +261,14 @@ pub(crate) fn diff_event_streams(
                     out.push(DiffFinding {
                         kind: FindingKind::MetricKindMismatch,
                         selector: name.clone(),
-                        detail: format!(
-                            "kind differs: {} vs {}",
-                            l.kind.as_str(),
-                            r.kind.as_str()
-                        ),
+                        detail: format!("kind differs: {} vs {}", l.kind.as_str(), r.kind.as_str()),
                     });
                 }
                 if l.contains != r.contains {
                     out.push(DiffFinding {
                         kind: FindingKind::MetricContainsMismatch,
                         selector: name.clone(),
-                        detail: format!(
-                            "contains differs: {:?} vs {:?}",
-                            l.contains, r.contains
-                        ),
+                        detail: format!("contains differs: {:?} vs {:?}", l.contains, r.contains),
                     });
                 }
             }
@@ -305,9 +298,7 @@ pub(crate) fn diff_event_streams(
         // from the script's expectations (matches the counter-metric
         // tolerance dimension; trends/rates would use different fields).
         let profile = exp.tolerance_for(name);
-        if let Some(detail) =
-            check_tolerance("sample_count", l as f64, r as f64, &profile.count)
-        {
+        if let Some(detail) = check_tolerance("sample_count", l as f64, r as f64, &profile.count) {
             out.push(DiffFinding {
                 kind: FindingKind::SampleCountMismatch,
                 selector: name.clone(),
@@ -330,12 +321,7 @@ pub(crate) fn relative_drift(a: f64, b: f64) -> f64 {
 }
 
 /// Check a numeric against its tolerance, return Some(detail) if breached.
-pub(crate) fn check_tolerance(
-    field: &str,
-    a: f64,
-    b: f64,
-    tol: &Tolerance,
-) -> Option<String> {
+pub(crate) fn check_tolerance(field: &str, a: f64, b: f64, tol: &Tolerance) -> Option<String> {
     match tol {
         Tolerance::Exact => {
             if (a - b).abs() > f64::EPSILON {
@@ -452,9 +438,11 @@ mod tests {
         assert!(f.detail.contains("aaaa"));
         assert!(f.detail.contains("bbbb"));
         // Counts agreed → no count finding.
-        assert!(!findings
-            .iter()
-            .any(|f| f.kind == FindingKind::CheckCountMismatch));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.kind == FindingKind::CheckCountMismatch)
+        );
     }
 
     #[test]
@@ -477,9 +465,11 @@ mod tests {
             fails: 0,
         });
         let findings = diff(&left, &right, &empty_exp());
-        assert!(!findings
-            .iter()
-            .any(|f| f.kind == FindingKind::CheckIdMismatch));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.kind == FindingKind::CheckIdMismatch)
+        );
     }
 
     #[test]

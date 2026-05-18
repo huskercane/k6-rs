@@ -61,9 +61,7 @@ pub fn lint_script(source: &str, max_vus: u32, discard_response_bodies: bool) ->
                 severity: Severity::Warning,
                 message: format!(
                     "Unbounded global {ds_type}{}",
-                    var_name
-                        .map(|n| format!(" ({n})"))
-                        .unwrap_or_default()
+                    var_name.map(|n| format!(" ({n})")).unwrap_or_default()
                 ),
                 suggestion: format!(
                     "This {ds_type} will grow every iteration and never shrink. \
@@ -99,9 +97,7 @@ pub fn lint_script(source: &str, max_vus: u32, discard_response_bodies: bool) ->
                         severity: Severity::Warning,
                         message: format!(
                             "Unbounded global array{}",
-                            var_name
-                                .map(|n| format!(" ({n})"))
-                                .unwrap_or_default()
+                            var_name.map(|n| format!(" ({n})")).unwrap_or_default()
                         ),
                         suggestion: format!(
                             "This array grows via push() every iteration and is never trimmed.\n\
@@ -120,9 +116,7 @@ pub fn lint_script(source: &str, max_vus: u32, discard_response_bodies: bool) ->
         warnings.push(LintWarning {
             line: 0,
             severity: Severity::Info,
-            message: format!(
-                "{max_vus} maxVUs with discardResponseBodies: false"
-            ),
+            message: format!("{max_vus} maxVUs with discardResponseBodies: false"),
             suggestion: format!(
                 "Each VU keeps HTTP response bodies in memory. With {max_vus} VUs, \
                  this can use significant memory.\n\
@@ -137,11 +131,10 @@ pub fn lint_script(source: &str, max_vus: u32, discard_response_bodies: bool) ->
             line: 0,
             severity: Severity::Info,
             message: "No sleep() in default function".to_string(),
-            suggestion:
-                "VUs will loop as fast as possible without think time. \
+            suggestion: "VUs will loop as fast as possible without think time. \
                  Add sleep(1) for realistic user simulation, or ignore \
                  this if you intentionally want max throughput."
-                    .to_string(),
+                .to_string(),
         });
     }
 

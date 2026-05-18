@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 

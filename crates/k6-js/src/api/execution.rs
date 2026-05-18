@@ -98,8 +98,7 @@ mod tests {
         let ctx = runtime::create_context(&rt).unwrap();
         ctx.with(|ctx| {
             // Set up minimal globals like a VU would have
-            ctx.eval::<(), _>("var __VU = 5; var __ITER = 3;")
-                .unwrap();
+            ctx.eval::<(), _>("var __VU = 5; var __ITER = 3;").unwrap();
             register(&ctx).unwrap();
             f(&ctx);
         });
@@ -151,9 +150,7 @@ mod tests {
     #[test]
     fn instance_defaults() {
         with_ctx(|ctx| {
-            let completed: i32 = ctx
-                .eval("execution.instance.iterationsCompleted")
-                .unwrap();
+            let completed: i32 = ctx.eval("execution.instance.iterationsCompleted").unwrap();
             assert_eq!(completed, 0);
         });
     }
@@ -161,8 +158,7 @@ mod tests {
     #[test]
     fn test_abort_throws() {
         with_ctx(|ctx| {
-            let result: Result<(), _> =
-                ctx.eval::<(), _>("execution.test.abort('test stopped')");
+            let result: Result<(), _> = ctx.eval::<(), _>("execution.test.abort('test stopped')");
             assert!(result.is_err());
         });
     }

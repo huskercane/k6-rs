@@ -138,10 +138,8 @@ pub fn build_summary_data(
         MetricSelector::parse("http_req_duration{expected_response:true}")
             .expect("hard-coded auto-include selector must parse"),
     );
-    let allowed_tagged: std::collections::HashSet<String> = threshold_selectors
-        .iter()
-        .map(|s| s.canonical())
-        .collect();
+    let allowed_tagged: std::collections::HashSet<String> =
+        threshold_selectors.iter().map(|s| s.canonical()).collect();
     let include_tagged = |name: &str| -> bool {
         if !name.contains('{') {
             return true; // untagged aggregates always shown
@@ -334,12 +332,20 @@ fn synthesize_subset_metric(
         values.insert("avg".to_string(), avg);
         values.insert(
             "min".to_string(),
-            if trend_min == f64::MAX { 0.0 } else { trend_min },
+            if trend_min == f64::MAX {
+                0.0
+            } else {
+                trend_min
+            },
         );
         values.insert("med".to_string(), med);
         values.insert(
             "max".to_string(),
-            if trend_max == f64::MIN { 0.0 } else { trend_max },
+            if trend_max == f64::MIN {
+                0.0
+            } else {
+                trend_max
+            },
         );
         values.insert("p(90)".to_string(), p90);
         values.insert("p(95)".to_string(), p95);
@@ -703,7 +709,9 @@ mod tests {
 
     #[test]
     fn summary_contains_key_metrics() {
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: GroupSnapshot::default(),
             counters: vec![
                 ("http_reqs".to_string(), 100, 10.0),
                 ("iterations".to_string(), 50, 5.0),
@@ -716,7 +724,8 @@ mod tests {
             ],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 150.0,
                     min: 10.0,
                     med: 120.0,
@@ -741,13 +750,16 @@ mod tests {
 
     #[test]
     fn summary_with_thresholds() {
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![("http_req_failed".to_string(), 0.02, 2, 100)],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 150.0,
                     min: 10.0,
                     med: 120.0,
@@ -823,7 +835,10 @@ mod tests {
             .expect("threshold-target submetric synthesized");
         assert_eq!(dur.metric_type, "trend");
         assert!((dur.values["count"] - 100.0).abs() < 0.01);
-        assert!(dur.values["p(95)"] > 0.0, "p(95) computed from merged histogram");
+        assert!(
+            dur.values["p(95)"] > 0.0,
+            "p(95) computed from merged histogram"
+        );
 
         let req = summary
             .metrics
@@ -848,7 +863,11 @@ mod tests {
 
         // No thresholds — only untagged aggregate is emitted.
         let thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
-        let summary = build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+        let summary = build_summary_data(
+            &reg.snapshot(1.0),
+            Duration::from_secs(1),
+            Some(&thresholds),
+        );
         assert!(summary.metrics.contains_key("http_reqs"));
         assert!(
             !summary.metrics.contains_key("http_reqs{status:200}"),
@@ -857,8 +876,15 @@ mod tests {
 
         // With a threshold targeting the tagged form, it shows up.
         let mut thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
-        thresholds.insert("http_reqs{status:200}".to_string(), vec![crate::thresholds::Threshold::from_expression("count>0")]);
-        let summary = build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+        thresholds.insert(
+            "http_reqs{status:200}".to_string(),
+            vec![crate::thresholds::Threshold::from_expression("count>0")],
+        );
+        let summary = build_summary_data(
+            &reg.snapshot(1.0),
+            Duration::from_secs(1),
+            Some(&thresholds),
+        );
         assert!(summary.metrics.contains_key("http_reqs{status:200}"));
     }
 
@@ -1060,7 +1086,11 @@ mod tests {
         assert!(inner.groups.is_empty());
 
         // Group with a check inside still works.
-        let api = summary.root_group.groups.get("api").expect("api group present");
+        let api = summary
+            .root_group
+            .groups
+            .get("api")
+            .expect("api group present");
         assert!(api.checks.contains_key("ok"));
     }
 
@@ -1092,15 +1122,16 @@ mod tests {
 
         // No user thresholds — auto-include must still fire.
         let thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
-        let summary =
-            build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+        let summary = build_summary_data(
+            &reg.snapshot(1.0),
+            Duration::from_secs(1),
+            Some(&thresholds),
+        );
 
         let entry = summary
             .metrics
             .get("http_req_duration{expected_response:true}")
-            .expect(
-                "auto-included submetric must appear without a user threshold targeting it",
-            );
+            .expect("auto-included submetric must appear without a user threshold targeting it");
         assert_eq!(entry.metric_type, "trend");
         assert!(
             (entry.values["count"] - 50.0).abs() < 0.01,
@@ -1134,8 +1165,11 @@ mod tests {
         }
 
         let thresholds: HashMap<String, Vec<crate::thresholds::Threshold>> = HashMap::new();
-        let summary =
-            build_summary_data(&reg.snapshot(1.0), Duration::from_secs(1), Some(&thresholds));
+        let summary = build_summary_data(
+            &reg.snapshot(1.0),
+            Duration::from_secs(1),
+            Some(&thresholds),
+        );
 
         assert!(
             summary
@@ -1153,13 +1187,16 @@ mod tests {
 
     #[test]
     fn summary_shows_custom_metrics() {
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: GroupSnapshot::default(),
             counters: vec![],
             gauges: vec![],
             rates: vec![("my_custom_rate".to_string(), 0.75, 75, 100)],
             trends: vec![(
                 "my_custom_trend".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 42.0,
                     min: 1.0,
                     med: 40.0,

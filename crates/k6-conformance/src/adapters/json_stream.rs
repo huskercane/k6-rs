@@ -58,11 +58,13 @@ pub fn read_event_stream(path: &Path) -> Result<CanonicalEventStream> {
                 // Only the FIRST definition wins. Subsequent dupes (shouldn't
                 // happen if both binaries respect "def-once" — but tolerate
                 // anyway) are ignored.
-                metric_defs.entry(name.clone()).or_insert(CanonicalMetricDef {
-                    name,
-                    kind,
-                    contains: data.contains.unwrap_or_default(),
-                });
+                metric_defs
+                    .entry(name.clone())
+                    .or_insert(CanonicalMetricDef {
+                        name,
+                        kind,
+                        contains: data.contains.unwrap_or_default(),
+                    });
             }
             "Point" => {
                 // Tally per-metric sample count. The metric name on the
@@ -117,7 +119,10 @@ fn read_sidecar_inner(stream_path: &Path) -> Result<SideReliability, String> {
     let mut p = stream_path.as_os_str().to_owned();
     p.push(".diagnostics.json");
     let content = std::fs::read_to_string(&p).map_err(|e| {
-        format!("reading sidecar {}: {e}", std::path::Path::new(&p).display())
+        format!(
+            "reading sidecar {}: {e}",
+            std::path::Path::new(&p).display()
+        )
     })?;
     let parsed: WireSidecar = serde_json::from_str(&content).map_err(|e| {
         format!(

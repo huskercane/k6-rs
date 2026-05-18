@@ -41,7 +41,9 @@ impl Tolerance {
             return Ok(Self::Exact);
         }
         if let Some(rest) = s.strip_prefix("relative:") {
-            let v: f64 = rest.parse().context("relative tolerance must be a number")?;
+            let v: f64 = rest
+                .parse()
+                .context("relative tolerance must be a number")?;
             return Ok(Self::Relative(v));
         }
         anyhow::bail!("invalid tolerance: {s}")
@@ -79,12 +81,17 @@ struct RawOverride {
 
 impl Expectations {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let parsed: RawExpectations = toml::from_str(&raw).context("parsing expectations.toml")?;
 
-        let default_counter =
-            Tolerance::parse(parsed.tolerances.default_counter.as_deref().unwrap_or("exact"))?;
+        let default_counter = Tolerance::parse(
+            parsed
+                .tolerances
+                .default_counter
+                .as_deref()
+                .unwrap_or("exact"),
+        )?;
         let default_trend = Tolerance::parse(
             parsed
                 .tolerances

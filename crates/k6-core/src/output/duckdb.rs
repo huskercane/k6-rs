@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use super::{snapshot_to_samples, MetricValue, Output};
+use super::{MetricValue, Output, snapshot_to_samples};
 use crate::metrics::MetricsSnapshot;
 
 /// DuckDB output — writes metrics as CSV files that can be loaded into DuckDB.
@@ -74,9 +74,11 @@ impl Output for DuckDbOutput {
                 MetricValue::Gauge { value, min, max } => {
                     (*value, *min, 0.0, *max, 0.0, 0.0, 0, 0.0)
                 }
-                MetricValue::Rate { rate, passes, total } => {
-                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *total, *rate)
-                }
+                MetricValue::Rate {
+                    rate,
+                    passes,
+                    total,
+                } => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *total, *rate),
                 MetricValue::Trend {
                     avg,
                     min,
@@ -165,13 +167,16 @@ mod tests {
         let mut output = DuckDbOutput::new(db_path.to_str().unwrap());
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,

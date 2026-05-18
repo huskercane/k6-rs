@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -146,7 +146,10 @@ impl RateLimiter {
 
     /// Start the token replenishment task. Must be called once before `acquire`.
     /// Adds `rps` tokens per second. Returns a handle to the background task.
-    pub fn start_replenish(&self, cancel: CancellationToken) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn start_replenish(
+        &self,
+        cancel: CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let inner = self.inner.as_ref()?;
         let sem = Arc::clone(&inner.semaphore);
         let max_permits = sem.available_permits() + 1; // initial capacity
@@ -210,11 +213,8 @@ mod tests {
 
         // Async acquire should block — verify with a timeout
         let bp_clone = bp.clone();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            bp_clone.acquire(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), bp_clone.acquire()).await;
 
         assert!(result.is_err(), "acquire should have timed out");
     }
@@ -324,12 +324,9 @@ mod tests {
 
         // Should be able to acquire 10 tokens immediately
         for _ in 0..10 {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                rl.acquire(),
-            )
-            .await
-            .expect("should acquire within budget");
+            tokio::time::timeout(std::time::Duration::from_millis(50), rl.acquire())
+                .await
+                .expect("should acquire within budget");
         }
 
         cancel.cancel();

@@ -1,4 +1,4 @@
-use super::{check_tolerance, DiffFinding, FindingKind};
+use super::{DiffFinding, FindingKind, check_tolerance};
 use crate::expectations::ToleranceProfile;
 
 pub fn diff(

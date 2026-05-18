@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -163,13 +163,20 @@ mod tests {
 
     #[test]
     fn interpolate_vus_linear() {
-        let timeline = vec![
-            (Duration::ZERO, Duration::from_secs(10), 0, 10),
-        ];
+        let timeline = vec![(Duration::ZERO, Duration::from_secs(10), 0, 10)];
 
-        assert_eq!(RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::ZERO), 0);
-        assert_eq!(RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(5)), 5);
-        assert_eq!(RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(10)), 0); // past stage
+        assert_eq!(
+            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::ZERO),
+            0
+        );
+        assert_eq!(
+            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(5)),
+            5
+        );
+        assert_eq!(
+            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(10)),
+            0
+        ); // past stage
     }
 
     #[tokio::test]
@@ -180,9 +187,18 @@ mod tests {
         let executor = RampingVusExecutor::new(
             pool.clone(),
             vec![
-                Stage { duration: Duration::from_millis(200), target: 5 },
-                Stage { duration: Duration::from_millis(200), target: 5 },
-                Stage { duration: Duration::from_millis(200), target: 0 },
+                Stage {
+                    duration: Duration::from_millis(200),
+                    target: 5,
+                },
+                Stage {
+                    duration: Duration::from_millis(200),
+                    target: 5,
+                },
+                Stage {
+                    duration: Duration::from_millis(200),
+                    target: 0,
+                },
             ],
             0,
         );
@@ -202,7 +218,10 @@ mod tests {
 
         let executor = RampingVusExecutor::new(
             pool.clone(),
-            vec![Stage { duration: Duration::from_secs(60), target: 5 }],
+            vec![Stage {
+                duration: Duration::from_secs(60),
+                target: 5,
+            }],
             0,
         );
 

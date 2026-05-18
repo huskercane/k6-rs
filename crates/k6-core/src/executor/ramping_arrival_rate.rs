@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -99,16 +99,15 @@ impl<V: VirtualUser + 'static> RampingArrivalRateExecutor<V> {
             match self.pool.try_acquire_owned() {
                 Some(mut guard) => {
                     let completed = Arc::clone(&iterations_completed);
-                    let handle = tokio::task::spawn_blocking(move || {
-                        match guard.vu_mut().run_iteration() {
+                    let handle =
+                        tokio::task::spawn_blocking(move || match guard.vu_mut().run_iteration() {
                             Ok(_) => {
                                 completed.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 eprintln!("VU iteration error: {e}");
                             }
-                        }
-                    });
+                        });
                     handles.push(handle);
                 }
                 None => {
@@ -179,16 +178,11 @@ mod tests {
 
     #[test]
     fn interpolate_rate_linear() {
-        let timeline = vec![
-            (Duration::ZERO, Duration::from_secs(10), 0.0, 100.0),
-        ];
+        let timeline = vec![(Duration::ZERO, Duration::from_secs(10), 0.0, 100.0)];
 
         // At 0s: rate = 0
-        let rate = RampingArrivalRateExecutor::<MockVu>::interpolate_rate(
-            &timeline,
-            Duration::ZERO,
-            1.0,
-        );
+        let rate =
+            RampingArrivalRateExecutor::<MockVu>::interpolate_rate(&timeline, Duration::ZERO, 1.0);
         assert!((rate - 0.0).abs() < 0.1);
 
         // At 5s (halfway): rate = 50
@@ -211,9 +205,14 @@ mod tests {
     #[test]
     fn interpolate_rate_multi_stage() {
         let timeline = vec![
-            (Duration::ZERO, Duration::from_secs(10), 0.0, 100.0),           // ramp up
-            (Duration::from_secs(10), Duration::from_secs(20), 100.0, 100.0), // sustain
-            (Duration::from_secs(20), Duration::from_secs(30), 100.0, 0.0),   // ramp down
+            (Duration::ZERO, Duration::from_secs(10), 0.0, 100.0), // ramp up
+            (
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                100.0,
+                100.0,
+            ), // sustain
+            (Duration::from_secs(20), Duration::from_secs(30), 100.0, 0.0), // ramp down
         ];
 
         // Ramp up at 5s → 50/s
@@ -244,9 +243,7 @@ mod tests {
     #[test]
     fn interpolate_rate_with_time_unit() {
         // Rate of 60 per minute = 1 per second
-        let timeline = vec![
-            (Duration::ZERO, Duration::from_secs(60), 60.0, 60.0),
-        ];
+        let timeline = vec![(Duration::ZERO, Duration::from_secs(60), 60.0, 60.0)];
 
         let rate = RampingArrivalRateExecutor::<MockVu>::interpolate_rate(
             &timeline,
@@ -266,12 +263,10 @@ mod tests {
         let pool = Arc::new(VuPool::new(vus));
         let executor = RampingArrivalRateExecutor::new(
             pool.clone(),
-            vec![
-                Stage {
-                    duration: Duration::from_millis(500),
-                    target: 20,
-                },
-            ],
+            vec![Stage {
+                duration: Duration::from_millis(500),
+                target: 20,
+            }],
             20.0,
             Duration::from_secs(1),
         );

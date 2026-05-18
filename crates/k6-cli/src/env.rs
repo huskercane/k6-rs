@@ -24,7 +24,18 @@ pub fn resolve_env_vars(
     dotenv_dir: &Path,
     out: &mut dyn Write,
 ) -> Result<Vec<(String, String)>> {
-    let mut env_map = load_dotenv_file(dotenv_dir, out);
+    resolve_env_vars_from_dirs(cli_envs, &[dotenv_dir], out)
+}
+
+pub fn resolve_env_vars_from_dirs(
+    cli_envs: &[String],
+    dotenv_dirs: &[&Path],
+    out: &mut dyn Write,
+) -> Result<Vec<(String, String)>> {
+    let mut env_map = HashMap::new();
+    for dir in dotenv_dirs.iter().rev() {
+        env_map.extend(load_dotenv_file(dir, out));
+    }
     apply_cli_envs(cli_envs, &mut env_map)?;
     resolve_commands(&mut env_map, &shell_exec, out)?;
     Ok(env_map.into_iter().collect())
@@ -238,6 +249,20 @@ mod tests {
     }
 
     #[test]
+    fn current_dotenv_overrides_fallback_dotenv() {
+        let fallback = setup_dotenv(Some("TOKEN=fallback\nBASE_URL=https://fallback\n"));
+        let current = setup_dotenv(Some("TOKEN=current\n"));
+        let mut out = Vec::new();
+
+        let result =
+            resolve_env_vars_from_dirs(&[], &[current.path(), fallback.path()], &mut out).unwrap();
+        let map: HashMap<String, String> = result.into_iter().collect();
+
+        assert_eq!(map.get("TOKEN").unwrap(), "current");
+        assert_eq!(map.get("BASE_URL").unwrap(), "https://fallback");
+    }
+
+    #[test]
     fn cli_env_works_without_dotenv() {
         let dir = setup_dotenv(None);
         let cli = vec!["A=1".to_string(), "B=2".to_string()];
@@ -256,10 +281,12 @@ mod tests {
         let mut out = Vec::new();
         let result = resolve_env_vars(&["NOEQUALS".to_string()], dir.path(), &mut out);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid --env format"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid --env format"),
+        );
     }
 
     #[test]
@@ -268,10 +295,12 @@ mod tests {
         let mut out = Vec::new();
         let result = resolve_env_vars(&["=value".to_string()], dir.path(), &mut out);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("empty variable name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("empty variable name")
+        );
     }
 
     #[test]
@@ -317,16 +346,16 @@ mod tests {
 
     #[test]
     fn cmd_prefix_error_includes_key_name() {
-        let mut env_map = HashMap::from([(
-            "BAD".to_string(),
-            "cmd:failing-command".to_string(),
-        )]);
+        let mut env_map = HashMap::from([("BAD".to_string(), "cmd:failing-command".to_string())]);
         let mut out = Vec::new();
 
         let err = resolve_commands(&mut env_map, &fake_executor, &mut out).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("BAD"), "error should name the variable");
-        assert!(msg.contains("authenticated"), "error should suggest checking auth");
+        assert!(
+            msg.contains("authenticated"),
+            "error should suggest checking auth"
+        );
     }
 
     #[test]
@@ -366,11 +395,7 @@ mod tests {
     #[test]
     fn cmd_prefix_via_cli_flag() {
         let mut env_map = HashMap::new();
-        apply_cli_envs(
-            &["TOKEN=cmd:echo hunter2".to_string()],
-            &mut env_map,
-        )
-        .unwrap();
+        apply_cli_envs(&["TOKEN=cmd:echo hunter2".to_string()], &mut env_map).unwrap();
         let mut out = Vec::new();
 
         resolve_commands(&mut env_map, &fake_executor, &mut out).unwrap();

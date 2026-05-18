@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -70,11 +70,7 @@ impl<V: VirtualUser> VuPool<V> {
         // Safety: we only hand out each index once (popped from queue),
         // and the slot is always Some when the index is in the queue.
         let vu = unsafe { (*self.vus[id].get()).take() };
-        Some(VuGuard {
-            vu,
-            id,
-            pool: self,
-        })
+        Some(VuGuard { vu, id, pool: self })
     }
 
     /// Record a dropped iteration (pool was exhausted).

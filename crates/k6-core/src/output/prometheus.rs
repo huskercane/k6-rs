@@ -3,7 +3,7 @@
 //! Usage: `--out prometheus=http://localhost:9090/api/v1/write`
 //! Converts k6 metrics to Prometheus time series and buffers for remote write.
 
-use super::{snapshot_to_samples, MetricValue, Output};
+use super::{MetricValue, Output, snapshot_to_samples};
 use crate::metrics::MetricsSnapshot;
 
 pub struct PrometheusOutput {
@@ -147,7 +147,9 @@ mod tests {
         let mut output = PrometheusOutput::new("http://localhost:9090/api/v1/write");
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![],
@@ -167,13 +169,16 @@ mod tests {
         let mut output = PrometheusOutput::new("http://localhost:9090/api/v1/write");
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![],
             gauges: vec![],
             rates: vec![],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,

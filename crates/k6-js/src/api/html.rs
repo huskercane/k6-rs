@@ -24,76 +24,82 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
     // __html_find(html, selector) -> JSON array of {html, text, attrs}
     globals.set(
         "__html_find",
-        Function::new(ctx.clone(), |html_str: String, selector: String| -> String {
-            let doc = Html::parse_document(&html_str);
-            let sel = match Selector::parse(&selector) {
-                Ok(s) => s,
-                Err(_) => return "[]".to_string(),
-            };
+        Function::new(
+            ctx.clone(),
+            |html_str: String, selector: String| -> String {
+                let doc = Html::parse_document(&html_str);
+                let sel = match Selector::parse(&selector) {
+                    Ok(s) => s,
+                    Err(_) => return "[]".to_string(),
+                };
 
-            let results: Vec<String> = doc
-                .select(&sel)
-                .map(|el| {
-                    let inner_html = el.inner_html();
-                    let text: String = el.text().collect();
-                    let outer_html = el.html();
+                let results: Vec<String> = doc
+                    .select(&sel)
+                    .map(|el| {
+                        let inner_html = el.inner_html();
+                        let text: String = el.text().collect();
+                        let outer_html = el.html();
 
-                    // Collect attributes
-                    let attrs: Vec<String> = el
-                        .value()
-                        .attrs()
-                        .map(|(k, v)| format!(r#""{}":{}"#, k, serde_json::json!(v)))
-                        .collect();
+                        // Collect attributes
+                        let attrs: Vec<String> = el
+                            .value()
+                            .attrs()
+                            .map(|(k, v)| format!(r#""{}":{}"#, k, serde_json::json!(v)))
+                            .collect();
 
-                    format!(
-                        r#"{{"html":{},"text":{},"outerHtml":{},"attrs":{{{}}}}}"#,
-                        serde_json::json!(inner_html),
-                        serde_json::json!(text),
-                        serde_json::json!(outer_html),
-                        attrs.join(",")
-                    )
-                })
-                .collect();
+                        format!(
+                            r#"{{"html":{},"text":{},"outerHtml":{},"attrs":{{{}}}}}"#,
+                            serde_json::json!(inner_html),
+                            serde_json::json!(text),
+                            serde_json::json!(outer_html),
+                            attrs.join(",")
+                        )
+                    })
+                    .collect();
 
-            format!("[{}]", results.join(","))
-        })?,
+                format!("[{}]", results.join(","))
+            },
+        )?,
     )?;
 
     // __html_find_in_fragment(html_fragment, selector) -> same as above but for fragments
     globals.set(
         "__html_find_in_fragment",
-        Function::new(ctx.clone(), |html_str: String, selector: String| -> String {
-            let doc = Html::parse_fragment(&html_str);
-            let sel = match Selector::parse(&selector) {
-                Ok(s) => s,
-                Err(_) => return "[]".to_string(),
-            };
+        Function::new(
+            ctx.clone(),
+            |html_str: String, selector: String| -> String {
+                let doc = Html::parse_fragment(&html_str);
+                let sel = match Selector::parse(&selector) {
+                    Ok(s) => s,
+                    Err(_) => return "[]".to_string(),
+                };
 
-            let results: Vec<String> = doc
-                .select(&sel)
-                .map(|el| {
-                    let inner_html = el.inner_html();
-                    let text: String = el.text().collect();
-                    let outer_html = el.html();
+                let results: Vec<String> = doc
+                    .select(&sel)
+                    .map(|el| {
+                        let inner_html = el.inner_html();
+                        let text: String = el.text().collect();
+                        let outer_html = el.html();
 
-                    let attrs: Vec<String> = el
-                        .value()
-                        .attrs()
-                        .map(|(k, v)| format!(r#""{}":{}"#, k, serde_json::json!(v)))
-                        .collect();
+                        let attrs: Vec<String> = el
+                            .value()
+                            .attrs()
+                            .map(|(k, v)| format!(r#""{}":{}"#, k, serde_json::json!(v)))
+                            .collect();
 
-                    format!(
-                        r#"{{"html":{},"text":{},"outerHtml":{},"attrs":{{{}}}}}"#,
-                        serde_json::json!(inner_html),
-                        serde_json::json!(text),
-                        serde_json::json!(outer_html),
-                        attrs.join(",")
-                    )
-                })
-                .collect();
+                        format!(
+                            r#"{{"html":{},"text":{},"outerHtml":{},"attrs":{{{}}}}}"#,
+                            serde_json::json!(inner_html),
+                            serde_json::json!(text),
+                            serde_json::json!(outer_html),
+                            attrs.join(",")
+                        )
+                    })
+                    .collect();
 
-            format!("[{}]", results.join(","))
-        })?,
+                format!("[{}]", results.join(","))
+            },
+        )?,
     )?;
 
     // __html_root_elements(html) -> JSON array of root body children

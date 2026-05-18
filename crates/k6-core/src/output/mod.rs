@@ -43,10 +43,29 @@ pub enum MetricType {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum MetricValue {
-    Counter { count: u64, rate: f64 },
-    Gauge { value: f64, min: f64, max: f64 },
-    Rate { rate: f64, passes: u64, total: u64 },
-    Trend { avg: f64, min: f64, med: f64, max: f64, p90: f64, p95: f64, count: u64 },
+    Counter {
+        count: u64,
+        rate: f64,
+    },
+    Gauge {
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+    Rate {
+        rate: f64,
+        passes: u64,
+        total: u64,
+    },
+    Trend {
+        avg: f64,
+        min: f64,
+        med: f64,
+        max: f64,
+        p90: f64,
+        p95: f64,
+        count: u64,
+    },
 }
 
 /// Trait for output plugins that receive periodic metric snapshots.
@@ -55,7 +74,8 @@ pub trait Output: Send {
     fn start(&mut self) -> anyhow::Result<()>;
 
     /// Called periodically (every ~1s) with a snapshot of all metrics.
-    fn add_snapshot(&mut self, snapshot: &MetricsSnapshot, elapsed_secs: f64) -> anyhow::Result<()>;
+    fn add_snapshot(&mut self, snapshot: &MetricsSnapshot, elapsed_secs: f64)
+    -> anyhow::Result<()>;
 
     /// Called once after the test ends. Flush buffers, close connections.
     fn stop(&mut self) -> anyhow::Result<()>;
@@ -75,9 +95,7 @@ pub trait Output: Send {
     /// CG-6 — companion to `event_sink`. Snapshot-only outputs return
     /// `None`. JsonOutput returns the writer-task handle on first call so
     /// the runner can await final flush + sidecar emit at process stop.
-    fn take_writer_handle(
-        &mut self,
-    ) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
+    fn take_writer_handle(&mut self) -> Option<tokio::task::JoinHandle<std::io::Result<()>>> {
         None
     }
 }
@@ -117,7 +135,9 @@ pub fn create_output_with_buffer_size(
         }
         "influxdb" => {
             let url = arg.ok_or_else(|| {
-                anyhow::anyhow!("influxdb output requires a URL: --out influxdb=http://host:8086/dbname")
+                anyhow::anyhow!(
+                    "influxdb output requires a URL: --out influxdb=http://host:8086/dbname"
+                )
             })?;
             Ok(Box::new(influxdb::InfluxDbOutput::new(url)?))
         }
@@ -133,7 +153,9 @@ pub fn create_output_with_buffer_size(
             let path = arg.unwrap_or("results.duckdb");
             Ok(Box::new(duckdb::DuckDbOutput::new(path)))
         }
-        _ => anyhow::bail!("unknown output plugin: {name}. Available: json, csv, influxdb, prometheus, duckdb"),
+        _ => anyhow::bail!(
+            "unknown output plugin: {name}. Available: json, csv, influxdb, prometheus, duckdb"
+        ),
     }
 }
 
@@ -148,7 +170,10 @@ pub fn snapshot_to_samples(snapshot: &MetricsSnapshot, elapsed_secs: f64) -> Vec
             metric,
             metric_type: MetricType::Counter,
             timestamp,
-            value: MetricValue::Counter { count: *count, rate: *rate },
+            value: MetricValue::Counter {
+                count: *count,
+                rate: *rate,
+            },
             tags,
         });
     }
@@ -159,7 +184,11 @@ pub fn snapshot_to_samples(snapshot: &MetricsSnapshot, elapsed_secs: f64) -> Vec
             metric,
             metric_type: MetricType::Gauge,
             timestamp,
-            value: MetricValue::Gauge { value: *value, min: *min, max: *max },
+            value: MetricValue::Gauge {
+                value: *value,
+                min: *min,
+                max: *max,
+            },
             tags,
         });
     }
@@ -170,7 +199,11 @@ pub fn snapshot_to_samples(snapshot: &MetricsSnapshot, elapsed_secs: f64) -> Vec
             metric,
             metric_type: MetricType::Rate,
             timestamp,
-            value: MetricValue::Rate { rate: *rate, passes: *passes, total: *total },
+            value: MetricValue::Rate {
+                rate: *rate,
+                passes: *passes,
+                total: *total,
+            },
             tags,
         });
     }
@@ -270,13 +303,16 @@ mod tests {
     fn snapshot_to_samples_converts() {
         use crate::metrics::{MetricsSnapshot, TrendStats};
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![("vus".to_string(), 5.0, 1.0, 10.0)],
             rates: vec![("checks".to_string(), 0.95, 95, 100)],
             trends: vec![(
                 "http_req_duration".to_string(),
-                TrendStats { p99: 0.0,
+                TrendStats {
+                    p99: 0.0,
                     avg: 100.0,
                     min: 10.0,
                     med: 90.0,

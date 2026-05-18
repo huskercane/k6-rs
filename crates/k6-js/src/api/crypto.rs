@@ -15,8 +15,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 macro_rules! hmac_hex {
     ($t:ty, $key:expr, $input:expr) => {{
-        let mut mac =
-            <Hmac<$t>>::new_from_slice($key).expect("HMAC accepts any key length");
+        let mut mac = <Hmac<$t>>::new_from_slice($key).expect("HMAC accepts any key length");
         mac.update($input);
         hex_encode(&mac.finalize().into_bytes())
     }};
@@ -252,9 +251,7 @@ mod tests {
     #[test]
     fn hmac_md5() {
         with_ctx(|ctx| {
-            let result: String = ctx
-                .eval("crypto.hmac('md5', 'key', 'message')")
-                .unwrap();
+            let result: String = ctx.eval("crypto.hmac('md5', 'key', 'message')").unwrap();
             // HMAC-MD5("key", "message")
             assert_eq!(result, "4e4748e62b463521f6775fbf921234b5");
         });

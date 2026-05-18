@@ -3,7 +3,7 @@
 //! Usage: `--out influxdb=http://localhost:8086/k6`
 //! URL format: `http://host:port/database`
 
-use super::{snapshot_to_samples, MetricValue, Output};
+use super::{MetricValue, Output, snapshot_to_samples};
 use crate::metrics::MetricsSnapshot;
 
 pub struct InfluxDbOutput {
@@ -17,10 +17,7 @@ impl InfluxDbOutput {
     pub fn new(url: &str) -> anyhow::Result<Self> {
         // Parse URL: http://host:port/database
         let parsed = url::Url::parse(url)?;
-        let database = parsed
-            .path()
-            .trim_start_matches('/')
-            .to_string();
+        let database = parsed.path().trim_start_matches('/').to_string();
 
         if database.is_empty() {
             anyhow::bail!("InfluxDB URL must include database name: http://host:port/dbname");
@@ -74,7 +71,11 @@ impl Output for InfluxDbOutput {
                 MetricValue::Gauge { value, min, max } => {
                     format!("value={value},min={min},max={max}")
                 }
-                MetricValue::Rate { rate, passes, total } => {
+                MetricValue::Rate {
+                    rate,
+                    passes,
+                    total,
+                } => {
                     format!("rate={rate},passes={passes}i,total={total}i")
                 }
                 MetricValue::Trend {
@@ -181,7 +182,9 @@ mod tests {
         let mut output = InfluxDbOutput::new("http://localhost:8086/k6").unwrap();
         output.start().unwrap();
 
-        let snapshot = MetricsSnapshot { trend_histograms: std::collections::HashMap::new(), group_tree: crate::metrics::GroupSnapshot::default(),
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
             counters: vec![("http_reqs".to_string(), 100, 10.0)],
             gauges: vec![],
             rates: vec![],

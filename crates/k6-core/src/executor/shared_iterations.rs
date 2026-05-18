@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -100,7 +100,9 @@ mod tests {
     impl VirtualUser for MockVu {
         fn run_iteration(&mut self) -> Result<IterationResult> {
             std::thread::sleep(Duration::from_millis(5));
-            Ok(IterationResult { duration: Duration::from_millis(5) })
+            Ok(IterationResult {
+                duration: Duration::from_millis(5),
+            })
         }
         fn reset(&mut self) {}
     }

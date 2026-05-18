@@ -159,9 +159,20 @@ pub struct CanonicalMetric {
 
 #[derive(Debug, Clone)]
 pub enum CanonicalMetricKind {
-    Counter { count: f64, rate: f64 },
-    Gauge { value: f64, min: f64, max: f64 },
-    Rate { rate: f64, passes: u64, fails: u64 },
+    Counter {
+        count: f64,
+        rate: f64,
+    },
+    Gauge {
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+    Rate {
+        rate: f64,
+        passes: u64,
+        fails: u64,
+    },
     /// Distribution stats. `p99` is `None` until CG-pre P0 (real percentiles) lands.
     Trend(CanonicalTrend),
 }

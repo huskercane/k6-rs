@@ -40,7 +40,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             "string",
                             "string",
                             &format!("unsupported digest algorithm: {algorithm}"),
-                        ))
+                        ));
                     }
                 };
                 Ok(result)
@@ -97,7 +97,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             "string",
                             "string",
                             &format!("unsupported HMAC hash: {hash_algo}"),
-                        ))
+                        ));
                     }
                 };
                 Ok(result)
@@ -148,7 +148,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             "string",
                             "string",
                             &format!("unsupported HMAC hash: {hash_algo}"),
-                        ))
+                        ));
                     }
                 };
                 Ok(result)
@@ -190,7 +190,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             "string",
                             "string",
                             &format!("unsupported PBKDF2 hash: {hash_algo}"),
-                        ))
+                        ));
                     }
                 }
                 Ok(hex_encode(&dk))
@@ -204,7 +204,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+                use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
                 let data = hex_decode(&data_hex);
@@ -235,7 +235,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+                use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
                 let data = hex_decode(&data_hex);
@@ -266,7 +266,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+                use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
                 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
@@ -292,7 +292,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+                use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
                 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
@@ -306,16 +306,15 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             &format!("AES-CBC key error: {e}"),
                         )
                     })?;
-                let plaintext =
-                    decryptor
-                        .decrypt_padded_vec_mut::<Pkcs7>(&mut data.clone())
-                        .map_err(|e| {
-                            rquickjs::Error::new_from_js_message(
-                                "string",
-                                "string",
-                                &format!("AES-CBC decrypt error: {e}"),
-                            )
-                        })?;
+                let plaintext = decryptor
+                    .decrypt_padded_vec_mut::<Pkcs7>(&mut data.clone())
+                    .map_err(|e| {
+                        rquickjs::Error::new_from_js_message(
+                            "string",
+                            "string",
+                            &format!("AES-CBC decrypt error: {e}"),
+                        )
+                    })?;
                 Ok(hex_encode(&plaintext))
             },
         )?,
@@ -326,10 +325,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         "__wc_aes_ctr_encrypt",
         Function::new(
             ctx.clone(),
-            |key_hex: String,
-             counter_hex: String,
-             data_hex: String|
-             -> rquickjs::Result<String> {
+            |key_hex: String, counter_hex: String, data_hex: String| -> rquickjs::Result<String> {
                 use aes::cipher::{KeyIvInit, StreamCipher};
                 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
@@ -355,10 +351,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         "__wc_aes_ctr_decrypt",
         Function::new(
             ctx.clone(),
-            |key_hex: String,
-             counter_hex: String,
-             data_hex: String|
-             -> rquickjs::Result<String> {
+            |key_hex: String, counter_hex: String, data_hex: String| -> rquickjs::Result<String> {
                 use aes::cipher::{KeyIvInit, StreamCipher};
                 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
@@ -414,9 +407,7 @@ mod tests {
     #[test]
     fn digest_sha1() {
         with_ctx(|ctx| {
-            let result: String = ctx
-                .eval("crypto.subtle.digest('SHA-1', 'hello')")
-                .unwrap();
+            let result: String = ctx.eval("crypto.subtle.digest('SHA-1', 'hello')").unwrap();
             assert_eq!(result, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
         });
     }

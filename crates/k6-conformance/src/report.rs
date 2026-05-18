@@ -66,10 +66,7 @@ pub struct ScriptReport {
 
 impl ScriptReport {
     pub fn result(&self) -> ScriptResult {
-        ScriptResult::from_findings_and_reliability(
-            &self.findings,
-            self.reliability.as_ref(),
-        )
+        ScriptResult::from_findings_and_reliability(&self.findings, self.reliability.as_ref())
     }
 }
 
@@ -111,7 +108,9 @@ fn print_reliability_block(prefix: &str, rel: &Reliability) {
 
 fn format_reliability_block(rel: &Reliability) -> Vec<String> {
     let mut out = Vec::new();
-    out.push("[reliability] sink overflow detected — run cannot be trusted as parity evidence".into());
+    out.push(
+        "[reliability] sink overflow detected — run cannot be trusted as parity evidence".into(),
+    );
     if rel.upstream.drops_total > 0 {
         out.push(format!(
             "  upstream  drops={} peak={}/{} metrics_affected={:?}",
@@ -285,10 +284,7 @@ mod tests {
     /// produce this.
     #[test]
     fn pass_when_no_findings_and_no_drops() {
-        let r = ScriptResult::from_findings_and_reliability(
-            &[],
-            Some(&rel_with_drops(0, 0)),
-        );
+        let r = ScriptResult::from_findings_and_reliability(&[], Some(&rel_with_drops(0, 0)));
         assert_eq!(r, ScriptResult::Pass);
     }
 
@@ -308,16 +304,10 @@ mod tests {
     #[test]
     fn unreliable_dominates_pass_when_drops_present() {
         // upstream-only drops
-        let r = ScriptResult::from_findings_and_reliability(
-            &[],
-            Some(&rel_with_drops(5, 0)),
-        );
+        let r = ScriptResult::from_findings_and_reliability(&[], Some(&rel_with_drops(5, 0)));
         assert_eq!(r, ScriptResult::Unreliable);
         // k6rs-only drops
-        let r = ScriptResult::from_findings_and_reliability(
-            &[],
-            Some(&rel_with_drops(0, 5)),
-        );
+        let r = ScriptResult::from_findings_and_reliability(&[], Some(&rel_with_drops(0, 5)));
         assert_eq!(r, ScriptResult::Unreliable);
     }
 
@@ -419,13 +409,17 @@ mod tests {
         let rel = Reliability {
             upstream: SideReliability::default(),
             k6rs: SideReliability {
-                error: Some("reading sidecar /tmp/x.json.diagnostics.json: No such file or directory".into()),
+                error: Some(
+                    "reading sidecar /tmp/x.json.diagnostics.json: No such file or directory"
+                        .into(),
+                ),
                 ..Default::default()
             },
         };
         let r = ScriptResult::from_findings_and_reliability(&[], Some(&rel));
         assert_eq!(
-            r, ScriptResult::Unreliable,
+            r,
+            ScriptResult::Unreliable,
             "k6-rs sidecar absence must flag UNRELIABLE — missing-sidecar = unknown reliability"
         );
     }

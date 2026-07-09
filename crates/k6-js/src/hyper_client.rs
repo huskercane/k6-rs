@@ -34,6 +34,7 @@
 //!     pool. Drain failures evict the conn rather than re-pooling it.
 
 use std::collections::HashMap;
+use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -111,12 +112,17 @@ pub(crate) enum Transport {
     // S7 adds Https.
 }
 
-/// Stub today — exists so [`RouteKey`]'s shape is frozen for S5..S10. S10
-/// will populate this with the proxy socket destination and any required
-/// auth identity.
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub(crate) struct ProxyRoute {
-    _unused: (),
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl ProxyRoute {
+    fn authority(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
 }
 
 enum ConnectTarget {
@@ -178,6 +184,10 @@ struct HyperConfig {
 
     // Phase 4 — source-IP round-robin binding.
     local_ips: Vec<IpAddr>,
+
+    // Phase 4 — plain HTTP proxy routing from HTTP_PROXY/http_proxy.
+    http_proxy: Option<ProxyRoute>,
+    no_proxy: Vec<String>,
 
     // Phase 1 — request/response logging to stderr.
     http_debug: Option<String>,
@@ -253,6 +263,8 @@ impl HyperHttpClient {
             hosts: config.hosts.clone(),
             max_redirects: config.max_redirects.unwrap_or(DEFAULT_MAX_REDIRECTS),
             local_ips,
+            http_proxy: proxy_from_env()?,
+            no_proxy: no_proxy_from_env(),
             http_debug: config.http_debug.clone(),
         };
 
@@ -493,7 +505,12 @@ async fn send_once(
     check_blocked_hostname(&client.config, &host)?;
     check_literal_ip_blacklist(&client.config, &host)?;
 
-    let (target_host, connect_target) = resolve_connect_target(&client.config, &host, port)?;
+    let proxy = proxy_for(&client.config, scheme, &host);
+    let (target_host, connect_target) = if let Some(proxy) = &proxy {
+        (host.clone(), ConnectTarget::Host(proxy.authority()))
+    } else {
+        resolve_connect_target(&client.config, &host, port)?
+    };
     let source_ip = client.next_source_ip();
 
     // RouteKey identifies the pool slot for this connection. In S0 every axis
@@ -506,7 +523,7 @@ async fn send_once(
         target_host: target_host.clone(),
         target_port: port,
         source_ip,
-        proxy: None,
+        proxy: proxy.clone(),
     };
 
     // Try the pool first. On a hit, `blocked` and `connecting` are 0 — the
@@ -533,17 +550,20 @@ async fn send_once(
     // and set Host explicitly so the request line matches the on-wire form.
     let method = hyper_method(&req.method);
     debug_request(&client.config, method.as_str(), &req.url, &req.headers);
-    let path_and_query = uri
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+    let request_uri = if proxy.is_some() {
+        req.url.clone()
+    } else {
+        uri.path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string())
+    };
     let has_user_agent = req
         .headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     let mut builder = Request::builder()
         .method(method)
-        .uri(path_and_query)
+        .uri(request_uri)
         .header(HOST, origin_authority.as_str());
     if !has_user_agent {
         builder = builder.header(USER_AGENT, user_agent);
@@ -700,6 +720,80 @@ fn connection_close_requested(headers: &[(String, String)]) -> bool {
                 .any(|part| part.trim().eq_ignore_ascii_case("close"))
         })
         .unwrap_or(false)
+}
+
+fn proxy_from_env() -> Result<Option<ProxyRoute>> {
+    let Some(raw) = env::var("HTTP_PROXY")
+        .ok()
+        .or_else(|| env::var("http_proxy").ok())
+    else {
+        return Ok(None);
+    };
+
+    parse_http_proxy(&raw).map(Some)
+}
+
+fn parse_http_proxy(raw: &str) -> Result<ProxyRoute> {
+    let proxy_url = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed =
+        url::Url::parse(&proxy_url).with_context(|| format!("invalid HTTP proxy URL {raw:?}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "http",
+        "unsupported proxy scheme {:?}; plain HTTP proxy support requires http://",
+        parsed.scheme()
+    );
+    let host = parsed
+        .host_str()
+        .context("HTTP proxy URL missing host")?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .context("HTTP proxy URL missing port")?;
+    Ok(ProxyRoute {
+        scheme: parsed.scheme().to_string(),
+        host,
+        port,
+    })
+}
+
+fn no_proxy_from_env() -> Vec<String> {
+    env::var("NO_PROXY")
+        .ok()
+        .or_else(|| env::var("no_proxy").ok())
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn proxy_for(config: &HyperConfig, scheme: &str, host: &str) -> Option<ProxyRoute> {
+    if scheme != "http" || no_proxy_matches(&config.no_proxy, host) {
+        return None;
+    }
+    config.http_proxy.clone()
+}
+
+fn no_proxy_matches(patterns: &[String], host: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        let p = pattern.trim();
+        if p == "*" {
+            return true;
+        }
+        let p = p
+            .strip_prefix("http://")
+            .or_else(|| p.strip_prefix("https://"))
+            .unwrap_or(p);
+        let p = p.split(':').next().unwrap_or(p).trim_start_matches('.');
+        host == p || host.ends_with(&format!(".{p}"))
+    })
 }
 
 fn resolve_connect_target(
@@ -1663,6 +1757,89 @@ mod tests {
         assert_eq!(p2, "127.0.0.2".parse::<IpAddr>().unwrap());
     }
 
+    #[test]
+    fn parses_http_proxy_url_variants() {
+        let explicit = parse_http_proxy("http://127.0.0.1:8080").unwrap();
+        assert_eq!(explicit.scheme, "http");
+        assert_eq!(explicit.host, "127.0.0.1");
+        assert_eq!(explicit.port, 8080);
+
+        let implicit = parse_http_proxy("proxy.local:3128").unwrap();
+        assert_eq!(implicit.scheme, "http");
+        assert_eq!(implicit.host, "proxy.local");
+        assert_eq!(implicit.port, 3128);
+    }
+
+    #[test]
+    fn no_proxy_patterns_bypass_proxy() {
+        let patterns = vec![
+            "localhost".to_string(),
+            ".internal.test".to_string(),
+            "api.example.com:8080".to_string(),
+        ];
+
+        assert!(no_proxy_matches(&patterns, "localhost"));
+        assert!(no_proxy_matches(&patterns, "svc.internal.test"));
+        assert!(no_proxy_matches(&patterns, "api.example.com"));
+        assert!(!no_proxy_matches(&patterns, "public.example.com"));
+    }
+
+    #[tokio::test]
+    async fn http_proxy_receives_absolute_form_request_and_origin_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+            tx.send(request_text).ok();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+            sock.shutdown().await.ok();
+        });
+
+        let mut client = HyperHttpClient::from_config(&TestConfig::default()).unwrap();
+        client.config.http_proxy = Some(ProxyRoute {
+            scheme: "http".to_string(),
+            host: proxy_addr.ip().to_string(),
+            port: proxy_addr.port(),
+        });
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: "http://origin.test/proxy-path?q=1".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        let request_text = rx.await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(
+            request_text.starts_with("GET http://origin.test/proxy-path?q=1 HTTP/1.1\r\n"),
+            "proxy request must use absolute-form URI; got:\n{request_text}"
+        );
+        assert!(
+            request_text
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("host: origin.test:80")),
+            "proxy request must preserve origin Host header; got:\n{request_text}"
+        );
+    }
+
     /// S0 — RouteKey shape is the load-bearing identity for the pool. Each
     /// axis (transport, host, port, source_ip, proxy) must independently
     /// distinguish two otherwise-identical keys, or pool reuse will leak
@@ -1699,7 +1876,11 @@ mod tests {
 
         // Different proxy → distinct (S10 lookahead).
         let mut other_proxy = base.clone();
-        other_proxy.proxy = Some(ProxyRoute { _unused: () });
+        other_proxy.proxy = Some(ProxyRoute {
+            scheme: "http".to_string(),
+            host: "proxy.local".to_string(),
+            port: 8080,
+        });
         assert_ne!(base, other_proxy);
 
         // HashSet keying must agree with Eq — store one of each variant

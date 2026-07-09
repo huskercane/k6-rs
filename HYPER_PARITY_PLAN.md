@@ -45,7 +45,8 @@ Status: completed in this branch.
 
 ## Phase 4: Network Feature Parity
 
-Status: in progress. `localIPs` source binding is completed in this branch.
+Status: in progress. `localIPs` source binding and plain HTTP proxy routing
+are completed in this branch.
 
 11. `localIPs`: build source-IP round-robin into `RouteKey.source_ip` and bind
     sockets before connect.

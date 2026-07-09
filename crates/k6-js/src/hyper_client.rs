@@ -24,8 +24,9 @@
 //!     `http_debug` are wired.
 //!   - `blockHostnames`, `blacklistIPs`, and static `hosts` mappings are
 //!     wired for plain HTTP.
-//!   - Redirects and `Connection: close` pooling behavior are wired.
-//!   - No local-IP source-bind (S9), no proxy (S10).
+//!   - Redirects, `Connection: close` pooling behavior, and `localIPs`
+//!     source binding are wired.
+//!   - No proxy (S10).
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -35,7 +36,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
@@ -48,7 +49,7 @@ use hyper::header::{CONNECTION, HOST, HeaderValue, LOCATION, USER_AGENT};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 
 use k6_core::config::TestConfig;
@@ -147,9 +148,10 @@ impl From<HttpRequest> for HyperRequest {
 ///
 /// Fields actively read today: `discard_response_bodies`,
 /// `max_response_body_size`, `request_timeout`, `no_connection_reuse`,
-/// `user_agent_override`, `blacklist_ips`, `block_hostnames`, `hosts`, and
-/// `http_debug`. Other fields are stored so later slices' edits are pure
-/// additions; each is annotated with the slice that will consume it.
+/// `user_agent_override`, `blacklist_ips`, `block_hostnames`, `hosts`,
+/// `local_ips`, and `http_debug`. Other fields are stored so later slices'
+/// edits are pure additions; each is annotated with the slice that will
+/// consume it.
 #[derive(Clone)]
 #[allow(dead_code)] // Future-phase fields stored intentionally; see comments.
 struct HyperConfig {
@@ -174,6 +176,9 @@ struct HyperConfig {
     // Phase 3 — maximum redirects to follow. `0` disables redirects.
     max_redirects: u32,
 
+    // Phase 4 — source-IP round-robin binding.
+    local_ips: Vec<IpAddr>,
+
     // Phase 1 — request/response logging to stderr.
     http_debug: Option<String>,
     // S7 fields (insecure_skip_tls_verify, tls_version min/max) enter
@@ -184,6 +189,7 @@ struct HyperConfig {
 pub struct HyperHttpClient {
     config: HyperConfig,
     user_agent: HeaderValue,
+    local_ip_index: AtomicUsize,
     /// Per-[`RouteKey`] pool of idle connections. A connection whose previous
     /// request **and** subsequent body drain both completed without error is
     /// returned here and reused by the next caller. Not size-bounded —
@@ -227,6 +233,15 @@ impl HyperHttpClient {
             None => None,
         };
 
+        let local_ips = config
+            .local_ips
+            .iter()
+            .map(|ip| {
+                ip.parse::<IpAddr>()
+                    .with_context(|| format!("invalid localIP '{ip}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let hcfg = HyperConfig {
             discard_response_bodies: config.discard_response_bodies,
             max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
@@ -237,6 +252,7 @@ impl HyperHttpClient {
             block_hostnames: config.block_hostnames.clone(),
             hosts: config.hosts.clone(),
             max_redirects: config.max_redirects.unwrap_or(DEFAULT_MAX_REDIRECTS),
+            local_ips,
             http_debug: config.http_debug.clone(),
         };
 
@@ -248,8 +264,17 @@ impl HyperHttpClient {
         Ok(Self {
             config: hcfg,
             user_agent,
+            local_ip_index: AtomicUsize::new(0),
             pool: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn next_source_ip(&self) -> Option<IpAddr> {
+        if self.config.local_ips.is_empty() {
+            return None;
+        }
+        let idx = self.local_ip_index.fetch_add(1, Ordering::Relaxed) % self.config.local_ips.len();
+        Some(self.config.local_ips[idx])
     }
 
     fn try_acquire(&self, key: &RouteKey) -> Option<PooledConn> {
@@ -469,6 +494,7 @@ async fn send_once(
     check_literal_ip_blacklist(&client.config, &host)?;
 
     let (target_host, connect_target) = resolve_connect_target(&client.config, &host, port)?;
+    let source_ip = client.next_source_ip();
 
     // RouteKey identifies the pool slot for this connection. In S0 every axis
     // except `transport`/`target_host`/`target_port` is fixed (no local-IP
@@ -479,7 +505,7 @@ async fn send_once(
         transport: Transport::Http,
         target_host: target_host.clone(),
         target_port: port,
-        source_ip: None,
+        source_ip,
         proxy: None,
     };
 
@@ -490,10 +516,10 @@ async fn send_once(
         if let Some(p) = client.try_acquire(&route_key) {
             (p, 0.0, 0.0)
         } else {
-            open_connection(&connect_target, &client.config).await?
+            open_connection(&connect_target, source_ip, &client.config).await?
         }
     } else {
-        open_connection(&connect_target, &client.config).await?
+        open_connection(&connect_target, source_ip, &client.config).await?
     };
 
     // Snapshot wire counters before this request so the byte counts come out
@@ -730,6 +756,7 @@ fn hostname_matches(host: &str, pattern: &str) -> bool {
 
 async fn open_connection(
     target: &ConnectTarget,
+    source_ip: Option<IpAddr>,
     config: &HyperConfig,
 ) -> Result<(PooledConn, f64, f64)> {
     let blocked_start = Instant::now();
@@ -748,9 +775,7 @@ async fn open_connection(
     let blocked_done = Instant::now();
 
     let connect_start = Instant::now();
-    let tcp = TcpStream::connect(addr)
-        .await
-        .context("TCP connect failed")?;
+    let tcp = connect_tcp(addr, source_ip).await?;
     let connect_done = Instant::now();
 
     let wire = WireMetrics::default();
@@ -783,6 +808,28 @@ async fn open_connection(
         blocked,
         connecting,
     ))
+}
+
+async fn connect_tcp(addr: SocketAddr, source_ip: Option<IpAddr>) -> Result<TcpStream> {
+    let Some(source_ip) = source_ip else {
+        return TcpStream::connect(addr).await.context("TCP connect failed");
+    };
+
+    if source_ip.is_ipv4() != addr.is_ipv4() {
+        anyhow::bail!("localIP {source_ip} address family does not match remote {addr}");
+    }
+
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }
+    .context("creating TCP socket")?;
+
+    socket
+        .bind(SocketAddr::new(source_ip, 0))
+        .with_context(|| format!("binding localIP {source_ip}"))?;
+    socket.connect(addr).await.context("TCP connect failed")
 }
 
 fn debug_request(config: &HyperConfig, method: &str, url: &str, headers: &[(String, String)]) {
@@ -1149,6 +1196,7 @@ mod tests {
             .insert("svc.local".to_string(), "127.0.0.1".to_string());
         config.http_debug = Some("full".to_string());
         config.max_redirects = Some(3);
+        config.local_ips = vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()];
 
         let client = HyperHttpClient::from_config(&config).unwrap();
         // S1 fields actively read in S0+S1
@@ -1178,7 +1226,23 @@ mod tests {
         );
         assert_eq!(client.config.hosts.get("svc.local").unwrap(), "127.0.0.1");
         assert_eq!(client.config.max_redirects, 3);
+        assert_eq!(client.config.local_ips.len(), 2);
         assert_eq!(client.config.http_debug.as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn from_config_invalid_local_ip_fails() {
+        let mut config = TestConfig::default();
+        config.local_ips = vec!["not-an-ip".to_string()];
+
+        let err = match HyperHttpClient::from_config(&config) {
+            Ok(_) => panic!("invalid localIP must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid localIP"),
+            "error should mention invalid localIP; got: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1375,6 +1439,7 @@ mod tests {
 
         let result = open_connection(
             &ConnectTarget::Host("127.0.0.1:9".to_string()),
+            None,
             &client.config,
         )
         .await;
@@ -1549,6 +1614,53 @@ mod tests {
             r2.timings.connecting > 0.0,
             "second request must open a new connection after Connection: close"
         );
+    }
+
+    #[tokio::test]
+    async fn local_ips_round_robin_source_binding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, peer) = listener.accept().await.unwrap();
+                tx.send(peer.ip()).await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                )
+                .await
+                .unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+
+        let mut config = TestConfig::default();
+        config.local_ips = vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()];
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let r1 = client.send(req()).await.unwrap();
+        let r2 = client.send(req()).await.unwrap();
+        let p1 = rx.recv().await.unwrap();
+        let p2 = rx.recv().await.unwrap();
+
+        assert_eq!(r1.status, 200);
+        assert_eq!(r2.status, 200);
+        assert_eq!(p1, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(p2, "127.0.0.2".parse::<IpAddr>().unwrap());
     }
 
     /// S0 — RouteKey shape is the load-bearing identity for the pool. Each

@@ -22,8 +22,9 @@
 //!     don't have to mutate pool identity.
 //!   - Request timeout, `no_connection_reuse`, user-agent override, and
 //!     `http_debug` are wired.
-//!   - No blacklist/blocklist/hosts (S5), no redirects (S8), no local-IP
-//!     source-bind (S9), no proxy (S10).
+//!   - `blockHostnames`, `blacklistIPs`, and static `hosts` mappings are
+//!     wired for plain HTTP.
+//!   - No redirects (S8), no local-IP source-bind (S9), no proxy (S10).
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -31,7 +32,7 @@
 //!     pool. Drain failures evict the conn rather than re-pooling it.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,16 +113,21 @@ pub(crate) struct ProxyRoute {
     _unused: (),
 }
 
+enum ConnectTarget {
+    Host(String),
+    Ip(SocketAddr),
+}
+
 /// Snapshot of every HTTP-shaping knob the hyper client cares about, captured
 /// at [`HyperHttpClient::from_config`] time.
 ///
 /// Fields actively read today: `discard_response_bodies`,
 /// `max_response_body_size`, `request_timeout`, `no_connection_reuse`,
-/// `user_agent_override`, and `http_debug`. Other fields are stored so later
-/// slices' edits are pure additions; each is annotated with the slice that
-/// will consume it.
+/// `user_agent_override`, `blacklist_ips`, `block_hostnames`, `hosts`, and
+/// `http_debug`. Other fields are stored so later slices' edits are pure
+/// additions; each is annotated with the slice that will consume it.
 #[derive(Clone)]
-#[allow(dead_code)] // S5 fields stored intentionally; see per-field comments.
+#[allow(dead_code)] // Future-phase fields stored intentionally; see comments.
 struct HyperConfig {
     // S1 — body buffer policy.
     discard_response_bodies: bool,
@@ -136,9 +142,7 @@ struct HyperConfig {
     // Phase 1 — replaces the hardcoded default user-agent if set.
     user_agent_override: Option<HeaderValue>,
 
-    // S5 — pre-send filters and static DNS override. Stored in the same
-    // shapes ReqwestHttpClient holds, so the port of `check_blocked` and the
-    // hosts lookup is mechanical.
+    // Phase 2 — pre-send filters and static DNS override.
     blacklist_ips: Vec<ipnet::IpNet>,
     block_hostnames: Vec<String>,
     hosts: HashMap<String, String>,
@@ -402,7 +406,12 @@ async fn send_inner(
     );
     let host = uri.host().context("URL missing host")?.to_string();
     let port = uri.port_u16().unwrap_or(80);
-    let authority = format!("{host}:{port}");
+    let origin_authority = format!("{host}:{port}");
+
+    check_blocked_hostname(&client.config, &host)?;
+    check_literal_ip_blacklist(&client.config, &host)?;
+
+    let (target_host, connect_target) = resolve_connect_target(&client.config, &host, port)?;
 
     // RouteKey identifies the pool slot for this connection. In S0 every axis
     // except `transport`/`target_host`/`target_port` is fixed (no local-IP
@@ -411,7 +420,7 @@ async fn send_inner(
     // the type's doc-comment.
     let route_key = RouteKey {
         transport: Transport::Http,
-        target_host: host.clone(),
+        target_host: target_host.clone(),
         target_port: port,
         source_ip: None,
         proxy: None,
@@ -424,10 +433,10 @@ async fn send_inner(
         if let Some(p) = client.try_acquire(&route_key) {
             (p, 0.0, 0.0)
         } else {
-            open_connection(authority.as_str()).await?
+            open_connection(&connect_target, &client.config).await?
         }
     } else {
-        open_connection(authority.as_str()).await?
+        open_connection(&connect_target, &client.config).await?
     };
 
     // Snapshot wire counters before this request so the byte counts come out
@@ -452,7 +461,7 @@ async fn send_inner(
     let mut builder = Request::builder()
         .method(method)
         .uri(path_and_query)
-        .header(HOST, authority.as_str());
+        .header(HOST, origin_authority.as_str());
     if !has_user_agent {
         builder = builder.header(USER_AGENT, user_agent);
     }
@@ -566,13 +575,75 @@ async fn send_inner(
     })
 }
 
-async fn open_connection(authority: &str) -> Result<(PooledConn, f64, f64)> {
+fn resolve_connect_target(
+    config: &HyperConfig,
+    host: &str,
+    port: u16,
+) -> Result<(String, ConnectTarget)> {
+    if let Some(mapped) = config.hosts.get(host) {
+        if let Ok(ip) = mapped.parse::<IpAddr>() {
+            check_ip_blacklist(config, ip)?;
+            return Ok((ip.to_string(), ConnectTarget::Ip(SocketAddr::new(ip, port))));
+        }
+    }
+
+    Ok((
+        host.to_string(),
+        ConnectTarget::Host(format!("{host}:{port}")),
+    ))
+}
+
+fn check_blocked_hostname(config: &HyperConfig, host: &str) -> Result<()> {
+    for pattern in &config.block_hostnames {
+        if hostname_matches(host, pattern) {
+            anyhow::bail!("hostname {host} is blocked by blockHostnames");
+        }
+    }
+    Ok(())
+}
+
+fn check_literal_ip_blacklist(config: &HyperConfig, host: &str) -> Result<()> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        check_ip_blacklist(config, ip)?;
+    }
+    Ok(())
+}
+
+fn check_ip_blacklist(config: &HyperConfig, ip: IpAddr) -> Result<()> {
+    for net in &config.blacklist_ips {
+        if net.contains(&ip) {
+            anyhow::bail!("IP {ip} is blocked by blacklistIPs");
+        }
+    }
+    Ok(())
+}
+
+fn hostname_matches(host: &str, pattern: &str) -> bool {
+    if pattern.starts_with("*.") {
+        let suffix = &pattern[1..];
+        host.ends_with(suffix) && host.len() > suffix.len()
+    } else {
+        host == pattern
+    }
+}
+
+async fn open_connection(
+    target: &ConnectTarget,
+    config: &HyperConfig,
+) -> Result<(PooledConn, f64, f64)> {
     let blocked_start = Instant::now();
-    let addr = tokio::net::lookup_host(authority)
-        .await
-        .with_context(|| format!("DNS lookup failed for {authority}"))?
-        .next()
-        .context("DNS returned no addresses")?;
+    let addr = match target {
+        ConnectTarget::Ip(addr) => *addr,
+        ConnectTarget::Host(authority) => {
+            let addr = tokio::net::lookup_host(authority)
+                .await
+                .with_context(|| format!("DNS lookup failed for {authority}"))?
+                .next()
+                .context("DNS returned no addresses")?;
+            check_ip_blacklist(config, addr.ip())?;
+            addr
+        }
+    };
     let blocked_done = Instant::now();
 
     let connect_start = Instant::now();
@@ -1135,6 +1206,115 @@ mod tests {
         let headers = vec![("X-Test".to_string(), "yes".to_string())];
         debug_request(&client.config, "GET", "http://example.test/", &headers);
         debug_response(&client.config, 200, "http://example.test/", &headers);
+    }
+
+    #[tokio::test]
+    async fn block_hostnames_rejects_before_connect() {
+        let mut config = TestConfig::default();
+        config.block_hostnames = vec!["*.internal.test".to_string()];
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let result = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: "http://api.internal.test/".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout: Some(Duration::from_millis(100)),
+            })
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("blocked hostname must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("blockHostnames"),
+            "error should mention blockHostnames; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blacklist_ips_rejects_literal_ip_before_connect() {
+        let mut config = TestConfig::default();
+        config.blacklist_ips = vec!["127.0.0.0/8".to_string()];
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let result = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: "http://127.0.0.1:9/".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout: Some(Duration::from_millis(100)),
+            })
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("blacklisted literal IP must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("blacklistIPs"),
+            "error should mention blacklistIPs, not connection failure; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blacklist_ips_rejects_dns_result() {
+        let mut config = TestConfig::default();
+        config.blacklist_ips = vec!["127.0.0.0/8".to_string()];
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let result = open_connection(
+            &ConnectTarget::Host("127.0.0.1:9".to_string()),
+            &client.config,
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("blacklisted resolved IP must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("blacklistIPs"),
+            "error should mention blacklistIPs; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosts_mapping_connects_to_ip_and_preserves_host_header() {
+        let base_url = start_app(Router::new().route(
+            "/host",
+            get(|headers: HeaderMap| async move {
+                headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+        ))
+        .await;
+        let port = base_url.rsplit_once(':').unwrap().1;
+
+        let mut config = TestConfig::default();
+        config
+            .hosts
+            .insert("mapped.test".to_string(), "127.0.0.1".to_string());
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("http://mapped.test:{port}/host"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(buffered_string(&resp), format!("mapped.test:{port}"));
     }
 
     /// S0 — RouteKey shape is the load-bearing identity for the pool. Each

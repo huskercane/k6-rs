@@ -25,6 +25,8 @@ Status: completed in this branch.
 
 ## Phase 2: Routing and Blocking
 
+Status: completed in this branch.
+
 5. `blockHostnames`: port the existing hostname matcher into hyper preflight.
 6. `blacklistIPs`: block literal IPs first, then resolved IPs after DNS lookup.
 7. `hosts`: implement static hostname to IP mapping while preserving the

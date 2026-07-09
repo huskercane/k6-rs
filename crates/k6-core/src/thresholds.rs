@@ -570,6 +570,7 @@ fn parse_condition(expr: &str) -> Option<ThresholdCondition> {
 fn parse_op(expr: &str) -> Option<(&str, ThresholdOp, &str)> {
     // Order matters: check two-char ops first
     for (pattern, op) in [
+        ("===", ThresholdOp::Eq),
         ("<=", ThresholdOp::Lte),
         (">=", ThresholdOp::Gte),
         ("!=", ThresholdOp::Neq),
@@ -681,6 +682,33 @@ mod tests {
         let cond = parse_condition("count>100").unwrap();
         assert!(matches!(cond.stat, ThresholdStat::Count));
         assert!(matches!(cond.op, ThresholdOp::Gt));
+    }
+
+    #[test]
+    fn parse_strict_equality_like_upstream() {
+        // Upstream accepts both `==` and `===` threshold equality operators.
+        // They are numerically equivalent here because threshold operands are
+        // already parsed as f64.
+        let cond = parse_condition("count===20").unwrap();
+        assert!(matches!(cond.stat, ThresholdStat::Count));
+        assert!(matches!(cond.op, ThresholdOp::Eq));
+        assert!((cond.value - 20.0).abs() < 0.01);
+
+        let cond = parse_condition("rate == 0.5").unwrap();
+        assert!(matches!(cond.stat, ThresholdStat::Rate));
+        assert!(matches!(cond.op, ThresholdOp::Eq));
+        assert!((cond.value - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_invalid_threshold_expressions_fail() {
+        // Port of upstream thresholds_parser invalid syntax cases.
+        assert!(parse_condition("count!20").is_none());
+        assert!(parse_condition("foo>20").is_none());
+        assert!(parse_condition("count>abc").is_none());
+        assert!(parse_condition("p() < 10").is_none());
+        assert!(parse_condition("p(foo)<10").is_none());
+        assert!(parse_condition("p(99<10").is_none());
     }
 
     #[test]

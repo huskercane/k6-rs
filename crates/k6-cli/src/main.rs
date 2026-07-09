@@ -655,10 +655,12 @@ async fn run_test(
             summary.iterations_completed, summary.duration
         );
         if summary.iterations_dropped > 0 {
-            eprintln!(
-                "    dropped: {} (VU pool exhausted)",
-                summary.iterations_dropped
-            );
+            // Emit the dropped_iterations metric (parity with upstream, which
+            // emits one sample per scenario). The cause differs by executor —
+            // maxDuration cutoff for shared/per-vu, VU-pool saturation for
+            // arrival-rate — so the console line stays cause-neutral.
+            metrics.record_dropped_iterations(summary.iterations_dropped);
+            eprintln!("    dropped: {} iterations", summary.iterations_dropped);
         }
 
         // Push snapshot to output plugins after each scenario. The snapshot's
@@ -1149,6 +1151,82 @@ mod tests {
             Some("smoke")
         );
     }
+
+    #[test]
+    fn dns_flag_validates_upstream_enums_and_ttl() {
+        let dns = parse_dns_flag("ttl=1.5s,select=roundRobin,policy=any").unwrap();
+        assert_eq!(dns.ttl.as_deref(), Some("1.5s"));
+        assert_eq!(dns.select.as_deref(), Some("roundRobin"));
+        assert_eq!(dns.policy.as_deref(), Some("any"));
+
+        assert!(parse_dns_flag("select=middle").is_err());
+        assert!(parse_dns_flag("policy=ipv5").is_err());
+        assert!(parse_dns_flag("ttl=sometimes").is_err());
+    }
+
+    #[test]
+    fn config_consolidation_precedence_preserves_scenario_metadata() {
+        let file_options = serde_json::json!({
+            "vus": 2,
+            "duration": "20s",
+            "scenarios": {
+                "default": {
+                    "executor": "constant-vus",
+                    "vus": 2,
+                    "duration": "20s",
+                    "exec": "fromFile",
+                    "startTime": "3s",
+                    "gracefulStop": "7s",
+                    "env": { "SOURCE": "file" },
+                    "tags": { "suite": "file" }
+                }
+            }
+        });
+        let script_options = serde_json::json!({
+            "vus": 4,
+            "duration": "40s",
+            "scenarios": {
+                "default": {
+                    "executor": "constant-vus",
+                    "vus": 4,
+                    "duration": "40s",
+                    "exec": "fromScript",
+                    "startTime": "5s",
+                    "gracefulStop": "11s",
+                    "env": { "SOURCE": "script" },
+                    "tags": { "suite": "script" }
+                }
+            }
+        });
+
+        let merged = merge_json(file_options, script_options);
+        let mut config = config::parse_options(&merged).unwrap();
+        let mut cli = empty_overrides();
+        cli.duration = Some("1.5s".to_string());
+        apply_cli_overrides(&mut config, &cli, &HashMap::new()).unwrap();
+
+        assert_eq!(config.vus, 4);
+        assert_eq!(config.duration, std::time::Duration::from_millis(1500));
+        let scenario = config.scenarios.get("default").unwrap();
+        assert_eq!(scenario.exec.as_deref(), Some("fromScript"));
+        assert_eq!(scenario.start_time, std::time::Duration::from_secs(5));
+        assert_eq!(scenario.graceful_stop, std::time::Duration::from_secs(11));
+        assert_eq!(
+            scenario.env.get("SOURCE").map(String::as_str),
+            Some("script")
+        );
+        assert_eq!(
+            scenario.tags.get("suite").map(String::as_str),
+            Some("script")
+        );
+        match &scenario.executor {
+            ExecutorType::ConstantVus { vus, duration } => {
+                assert_eq!(*vus, 4);
+                assert_eq!(*duration, std::time::Duration::from_millis(1500));
+            }
+            other => panic!("expected constant-vus, got {other:?}"),
+        }
+    }
 }
 
 /// Parse --dns flag format: "ttl=5m,select=random,policy=preferIPv4"
@@ -1169,6 +1247,7 @@ fn parse_dns_flag(s: &str) -> Result<config::DnsConfig> {
             }
         }
     }
+    dns.validate()?;
     Ok(dns)
 }
 

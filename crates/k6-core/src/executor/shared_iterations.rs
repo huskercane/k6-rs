@@ -65,12 +65,16 @@ impl<V: VirtualUser + 'static> SharedIterationsExecutor<V> {
                         break;
                     }
 
-                    match vu.run_iteration() {
-                        Ok(_) => {
-                            completed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => eprintln!("VU iteration error: {e}"),
+                    // Count ATTEMPTED iterations, not just successful ones.
+                    // Upstream's `dropped = totalIters - attemptedIters` treats
+                    // an iteration whose script threw as attempted (it ran and
+                    // still counts toward `iterations`); only iterations that
+                    // never started are dropped. Incrementing on both arms keeps
+                    // `completed + dropped == total` and matches that semantic.
+                    if let Err(e) = vu.run_iteration() {
+                        eprintln!("VU iteration error: {e}");
                     }
+                    completed.fetch_add(1, Ordering::Relaxed);
                     vu.reset();
                 }
             });
@@ -82,9 +86,11 @@ impl<V: VirtualUser + 'static> SharedIterationsExecutor<V> {
             let _ = handle.await;
         }
 
+        let iterations_completed = completed.load(Ordering::Relaxed);
+
         Ok(RunSummary {
-            iterations_completed: completed.load(Ordering::Relaxed),
-            iterations_dropped: 0,
+            iterations_completed,
+            iterations_dropped: (self.total_iterations as u64).saturating_sub(iterations_completed),
             duration: start.elapsed(),
         })
     }
@@ -125,5 +131,51 @@ mod tests {
 
         assert!(summary.iterations_completed < 10000);
         assert!(summary.iterations_completed > 0);
+        assert_eq!(
+            summary.iterations_completed + summary.iterations_dropped,
+            10000
+        );
+        assert!(
+            summary.iterations_dropped > 0,
+            "max_duration should report unstarted shared iterations as dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_duration_drops_all_iterations() {
+        // Port of upstream TestSharedIterationsEmitDroppedIterations at the
+        // summary boundary: if maxDuration prevents any work from starting,
+        // every planned shared iteration is reported as dropped.
+        let vus: Vec<MockVu> = (0..5).map(|_| MockVu).collect();
+        let executor = SharedIterationsExecutor::new(vus, 100, Duration::ZERO);
+        let summary = executor.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_dropped, 100);
+    }
+
+    struct AlwaysErrsVu;
+    impl VirtualUser for AlwaysErrsVu {
+        fn run_iteration(&mut self) -> Result<IterationResult> {
+            anyhow::bail!("intentional iteration error")
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn errored_iterations_count_as_attempted_not_dropped() {
+        // Upstream counts a thrown iteration as attempted (dropped = total -
+        // attempted), so a run where every iteration errors but all start
+        // must report ZERO dropped, not `total` dropped. Locks the fix that
+        // an errored iteration is not misclassified as never-started.
+        let vus: Vec<AlwaysErrsVu> = (0..4).map(|_| AlwaysErrsVu).collect();
+        let executor = SharedIterationsExecutor::new(vus, 20, Duration::from_secs(30));
+        let summary = executor.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(summary.iterations_completed, 20, "all 20 were attempted");
+        assert_eq!(
+            summary.iterations_dropped, 0,
+            "errored-but-started iterations are not dropped"
+        );
     }
 }

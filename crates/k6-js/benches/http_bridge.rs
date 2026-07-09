@@ -88,9 +88,7 @@ fn bench_http_bridge(c: &mut Criterion) {
         // Warm the connection pool so we measure steady-state reuse, not the
         // first-request DNS/TCP handshake.
         hyper_vu.run_iteration().unwrap();
-        group.bench_function("hyper", |b| {
-            b.iter(|| hyper_vu.run_iteration().unwrap())
-        });
+        group.bench_function("hyper", |b| b.iter(|| hyper_vu.run_iteration().unwrap()));
     }
 
     {

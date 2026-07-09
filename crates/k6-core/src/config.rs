@@ -93,6 +93,29 @@ impl Default for TestConfig {
     }
 }
 
+impl DnsConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(select) = &self.select {
+            match select.as_str() {
+                "first" | "random" | "roundRobin" => {}
+                _ => bail!("invalid dns.select: {select}"),
+            }
+        }
+        if let Some(policy) = &self.policy {
+            match policy.as_str() {
+                "preferIPv4" | "preferIPv6" | "onlyIPv4" | "onlyIPv6" | "any" => {}
+                _ => bail!("invalid dns.policy: {policy}"),
+            }
+        }
+        if let Some(ttl) = &self.ttl {
+            if ttl != "inf" {
+                parse_duration(ttl).with_context(|| format!("invalid dns.ttl: {ttl}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for a single scenario/executor.
 #[derive(Debug, Clone)]
 pub struct ScenarioConfig {
@@ -159,52 +182,81 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         bail!("empty duration string");
     }
 
-    let mut total_ms: u64 = 0;
-    let mut num_start = 0;
+    if s.starts_with('-') {
+        bail!("duration must be non-negative: {s}");
+    }
 
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            i += 1;
-            continue;
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        let num: u64 = s.parse()?;
+        return Ok(Duration::from_millis(num));
+    }
+    if s.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && s.chars().filter(|&c| c == '.').count() == 1
+    {
+        let millis: f64 = s
+            .parse()
+            .with_context(|| format!("invalid number in duration: {s}"))?;
+        if millis.is_finite() && millis >= 0.0 {
+            return Ok(Duration::from_nanos((millis * 1_000_000.0).round() as u64));
         }
+    }
 
-        let num: u64 = s[num_start..i]
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut total_nanos = 0.0f64;
+
+    while i < bytes.len() {
+        let number_start = i;
+        let mut saw_digit = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            saw_digit = true;
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                saw_digit = true;
+                i += 1;
+            }
+        }
+        if !saw_digit {
+            bail!("invalid number in duration: {s}");
+        }
+        let number: f64 = s[number_start..i]
             .parse()
             .with_context(|| format!("invalid number in duration: {s}"))?;
 
-        // Collect unit suffix
         let unit_start = i;
-        while i < chars.len() && chars[i].is_ascii_alphabetic() {
-            i += 1;
+        while i < bytes.len() {
+            let c = s[i..].chars().next().unwrap();
+            if c.is_ascii_alphabetic() || c == 'µ' {
+                i += c.len_utf8();
+            } else {
+                break;
+            }
         }
         let unit = &s[unit_start..i];
+        if unit.is_empty() {
+            bail!("missing duration unit in: {s}");
+        }
 
-        total_ms += match unit {
-            "ms" => num,
-            "s" => num * 1000,
-            "m" => num * 60 * 1000,
-            "h" => num * 3600 * 1000,
+        let nanos = match unit {
+            "ns" => number,
+            "us" | "µs" => number * 1_000.0,
+            "ms" => number * 1_000_000.0,
+            "s" => number * 1_000_000_000.0,
+            "m" => number * 60.0 * 1_000_000_000.0,
+            "h" => number * 60.0 * 60.0 * 1_000_000_000.0,
+            "d" => number * 24.0 * 60.0 * 60.0 * 1_000_000_000.0,
             _ => bail!("unknown duration unit: {unit}"),
         };
-
-        num_start = i;
+        total_nanos += nanos;
     }
 
-    // Handle bare number (treat as milliseconds if very large, seconds otherwise)
-    if num_start == 0 && i == chars.len() && chars.iter().all(|c| c.is_ascii_digit()) {
-        let num: u64 = s.parse()?;
-        // k6 treats bare numbers as milliseconds in some contexts
-        return Ok(Duration::from_millis(num));
+    if !total_nanos.is_finite() || total_nanos < 0.0 {
+        bail!("duration out of range: {s}");
     }
-
-    if total_ms == 0 && !s.chars().all(|c| c == '0' || !c.is_ascii_digit()) {
-        bail!("could not parse duration: {s}");
-    }
-
-    Ok(Duration::from_millis(total_ms))
+    Ok(Duration::from_nanos(total_nanos.round() as u64))
 }
 
 /// Parse a `TestConfig` from a k6 options JSON object.
@@ -545,11 +597,13 @@ fn parse_tls_version(value: &Value) -> Result<TlsVersionConfig> {
 
 fn parse_dns_config(value: &Value) -> Result<DnsConfig> {
     let obj = value.as_object().context("dns must be an object")?;
-    Ok(DnsConfig {
+    let config = DnsConfig {
         ttl: obj.get("ttl").and_then(|v| v.as_str()).map(String::from),
         select: obj.get("select").and_then(|v| v.as_str()).map(String::from),
         policy: obj.get("policy").and_then(|v| v.as_str()).map(String::from),
-    })
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn parse_string_array(value: &Value) -> Result<Vec<String>> {
@@ -600,13 +654,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_upstream_extended_units() {
+        assert_eq!(
+            parse_duration("1.12s").unwrap(),
+            Duration::from_millis(1120)
+        );
+        assert_eq!(
+            parse_duration("1d24h15m").unwrap(),
+            Duration::from_secs(48 * 3600 + 15 * 60)
+        );
+        assert_eq!(
+            parse_duration("2d1ns").unwrap(),
+            Duration::from_secs(48 * 3600) + Duration::from_nanos(1)
+        );
+        assert_eq!(
+            parse_duration("1000.001").unwrap(),
+            Duration::from_micros(1_000_001)
+        );
+    }
+
+    #[test]
     fn parse_duration_empty_fails() {
         assert!(parse_duration("").is_err());
     }
 
     #[test]
     fn parse_duration_unknown_unit_fails() {
-        assert!(parse_duration("5d").is_err());
+        assert!(parse_duration("5fortnights").is_err());
+        assert!(parse_duration("-1d2h").is_err());
     }
 
     #[test]
@@ -979,6 +1054,29 @@ mod tests {
         assert_eq!(dns.ttl, Some("5m".to_string()));
         assert_eq!(dns.select, Some("random".to_string()));
         assert_eq!(dns.policy, Some("preferIPv4".to_string()));
+    }
+
+    #[test]
+    fn parse_dns_config_rejects_invalid_enums_and_ttl() {
+        let bad_select = json!({
+            "dns": { "select": "middle" }
+        });
+        assert!(parse_options(&bad_select).is_err());
+
+        let bad_policy = json!({
+            "dns": { "policy": "ipv5" }
+        });
+        assert!(parse_options(&bad_policy).is_err());
+
+        let bad_ttl = json!({
+            "dns": { "ttl": "sometimes" }
+        });
+        assert!(parse_options(&bad_ttl).is_err());
+
+        let infinite_ttl = json!({
+            "dns": { "ttl": "inf", "select": "roundRobin", "policy": "any" }
+        });
+        assert!(parse_options(&infinite_ttl).is_ok());
     }
 
     #[test]

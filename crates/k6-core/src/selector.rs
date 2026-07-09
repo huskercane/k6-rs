@@ -20,12 +20,10 @@
 //!   tag_list := tag ( "," tag )*
 //!   tag      := key ":" value
 //!   name, key := UTF-8 bytes excluding any of `{}:,` (no quoting)
-//!   value     := UTF-8 bytes excluding `{`, `}`, `,` (CG-3: real-world tag
-//!                values can contain `:`, e.g. WebSocket URLs `ws://host`;
-//!                only the FIRST `:` in a tag pair is the key/value separator).
-//!
-//! If a future input requires `,` or `{`/`}` inside a value, widen the
-//! grammar then; do not pre-emptively add quoting.
+//!   value     := UTF-8 bytes excluding `,` (CG-3: real-world tag values can
+//!                contain `:` and braces, e.g. URLs like `ssh://host:path` or
+//!                names like `http://${}.com`; only the FIRST `:` in a tag pair
+//!                is the key/value separator).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -81,10 +79,10 @@ fn contains_reserved(s: &str) -> bool {
 
 /// Reserved characters in tag `value`. CG-3: `:` is permitted (only the
 /// first `:` in a pair is the key/value separator; values like
-/// `ws://localhost` are common in real k6 tags). `{`, `}`, `,` remain
-/// structural and disallowed.
+/// `ws://localhost` are common in real k6 tags). Upstream also accepts
+/// literal braces inside values, so only `,` remains structural here.
 fn contains_reserved_value(s: &str) -> bool {
-    s.bytes().any(|b| matches!(b, b'{' | b'}' | b','))
+    s.bytes().any(|b| matches!(b, b','))
 }
 
 impl MetricSelector {
@@ -132,14 +130,22 @@ impl MetricSelector {
                 if contains_reserved(name) {
                     return Err(SelectorParseError::InvalidName(name.to_string()));
                 }
-                let Some(close_rel) = s[open + 1..].find('}') else {
+                // Close at the LAST `}`, not the first, so tag values may
+                // themselves contain braces (upstream accepts names like
+                // `http://${}.com`). Trade-off: because values now permit
+                // `{`/`}`, an accidentally concatenated `a{..}{..}` no longer
+                // reliably errors here — the inner `}` is treated as part of a
+                // value. Only trailing garbage AFTER the final `}` is still
+                // caught. This matches upstream metrics.ParseMetricName, which
+                // also scans to the last `}`.
+                let Some(close) = s.rfind('}') else {
                     return Err(SelectorParseError::UnbalancedBraces);
                 };
-                let close = open + 1 + close_rel;
-                // Trailing garbage check: anything after the closing brace
-                // (other than whitespace) is an error. Catches bugs where
-                // the caller accidentally concatenated multiple selectors
-                // or appended a stat name.
+                if close < open {
+                    return Err(SelectorParseError::UnbalancedBraces);
+                }
+                // Trailing garbage check: anything after the final `}` (other
+                // than whitespace) is an error — e.g. an appended stat name.
                 if !s[close + 1..].trim().is_empty() {
                     return Err(SelectorParseError::UnbalancedBraces);
                 }
@@ -172,9 +178,10 @@ impl MetricSelector {
                         }
                         // Reserved chars per the grammar: keys reject the
                         // full set (`{}:,`) so `{a:b:c}` can't be reread as
-                        // a key of `a:b`. Values reject the structural
-                        // chars (`{}` and `,`) but permit `:` — real-world
-                        // tag values include things like `ws://localhost`.
+                        // a key of `a:b`. Values reject only `,` but permit
+                        // `:` and literal braces — real-world tag values
+                        // include URLs and upstream accepts names like
+                        // `http://${}.com`.
                         if contains_reserved(key) || contains_reserved_value(value) {
                             return Err(SelectorParseError::MalformedTagPair(
                                 pair_trim.to_string(),
@@ -433,6 +440,24 @@ mod tests {
         assert_eq!(s.tags["url"], "ws://localhost:8080/path");
         // Round-trips losslessly.
         assert_eq!(MetricSelector::parse(&s.canonical()).unwrap(), s);
+    }
+
+    #[test]
+    fn parse_allows_braces_in_tag_value() {
+        // Port of upstream metrics.ParseMetricName edge cases: tag values can
+        // contain literal braces and additional colons, typically in URL-like
+        // names. The outer tag block ends at the final `}`.
+        let s = MetricSelector::parse("http_req_duration{name:http://${}.com}").unwrap();
+        assert_eq!(s.name, "http_req_duration");
+        assert_eq!(s.tags["name"], "http://${}.com");
+        assert_eq!(s.canonical(), "http_req_duration{name:http://${}.com}");
+
+        let s = MetricSelector::parse(
+            "http_req_duration{name:http://${}.com,url:ssh://github.com:grafana/k6}",
+        )
+        .unwrap();
+        assert_eq!(s.tags["name"], "http://${}.com");
+        assert_eq!(s.tags["url"], "ssh://github.com:grafana/k6");
     }
 
     #[test]

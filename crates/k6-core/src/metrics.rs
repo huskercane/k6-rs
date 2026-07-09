@@ -1,4 +1,4 @@
-    use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -972,6 +972,17 @@ impl BuiltinMetrics {
         self.registry.counter_add("dropped_iterations", 1);
     }
 
+    /// Emit `count` dropped iterations in one sample. Upstream emits a single
+    /// `dropped_iterations` metric sample per scenario carrying the total that
+    /// never started (shared/per-vu maxDuration cutoff) or could not be
+    /// allocated a VU (arrival-rate saturation). We mirror that: the executor
+    /// computes the count, the caller emits it here.
+    pub fn record_dropped_iterations(&self, count: u64) {
+        if count > 0 {
+            self.registry.counter_add("dropped_iterations", count);
+        }
+    }
+
     // --- Check metrics ---
 
     /// Record a single check evaluation. Updates both the per-check registry
@@ -1014,14 +1025,25 @@ impl BuiltinMetrics {
         failed: bool,
         tags: &[(String, String)],
     ) {
+        self.record_http_request_tagged_with_failure(timings, Some(failed), tags);
+    }
+
+    pub fn record_http_request_tagged_with_failure(
+        &self,
+        timings: &crate::traits::Timings,
+        failed: Option<bool>,
+        tags: &[(String, String)],
+    ) {
         self.registry.counter_add_tagged("http_reqs", 1, tags);
         // Upstream k6 semantic for http_req_failed: record the failure bool
         // directly. `passes` in the summary then = count of failed requests,
         // `fails` = count of non-failed, `rate` = failed/total (the failure
         // rate). Reversing this (recording !failed) inverts the rate and swaps
         // the passes/fails fields in --summary-export, breaking parity.
-        self.registry
-            .rate_add_tagged("http_req_failed", failed, tags);
+        if let Some(failed) = failed {
+            self.registry
+                .rate_add_tagged("http_req_failed", failed, tags);
+        }
         self.registry
             .trend_add_tagged("http_req_duration", timings.duration, tags);
         self.registry
@@ -1691,6 +1713,48 @@ mod tests {
         // And with the original write order — canonical normalization
         // routes both to the same storage entry.
         assert_eq!(reg.counter_get("name{b:2,a:1}"), 5);
+    }
+
+    #[test]
+    fn dropped_iterations_metric_accumulates_bulk_count() {
+        // The dropped_iterations metric must actually be emittable in bulk —
+        // upstream emits the per-scenario total as one sample. Before the fix
+        // record_dropped_iterations had no production path and the metric was
+        // never emitted at all.
+        let m = BuiltinMetrics::new();
+        m.record_dropped_iterations(7);
+        m.record_dropped_iterations(0); // no-op, must not add a phantom sample
+        m.record_dropped_iterations(3);
+        assert_eq!(m.registry.counter_get("dropped_iterations"), 10);
+    }
+
+    #[test]
+    fn tagged_metrics_support_url_like_tag_values() {
+        // Port of upstream ParseMetricName URL-ish tag value cases through the
+        // actual registry path. Thresholds and summaries rely on these
+        // selectors matching after canonicalization, not just parsing.
+        let reg = MetricsRegistry::new();
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("name".to_string(), "http://${}.com".to_string());
+        tags.insert("url".to_string(), "ssh://github.com:grafana/k6".to_string());
+
+        reg.counter_add_with_tags("http_reqs", 3, &tags);
+
+        assert_eq!(
+            reg.counter_get("http_reqs{name:http://${}.com}"),
+            3,
+            "subset query with literal braces in tag value should match"
+        );
+        assert_eq!(
+            reg.counter_get("http_reqs{url:ssh://github.com:grafana/k6}"),
+            3,
+            "subset query with additional colons in tag value should match"
+        );
+        assert_eq!(
+            reg.counter_get("http_reqs{name:http://${}.com,url:ssh://github.com:grafana/k6}"),
+            3,
+            "full URL-like tag combination should match"
+        );
     }
 
     #[test]

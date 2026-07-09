@@ -592,8 +592,8 @@ impl QuickJsVu {
 
 impl VirtualUser for QuickJsVu {
     fn run_iteration(&mut self) -> Result<IterationResult> {
-        self.iteration += 1;
         let iteration = self.iteration;
+        self.iteration += 1;
 
         let start = Instant::now();
 
@@ -871,6 +871,46 @@ mod tests {
             vu.run_iteration().unwrap();
             assert_eq!(vu.iteration(), i);
         }
+    }
+
+    #[test]
+    fn vu_exposes_zero_based_iteration_indexes_to_js() {
+        // Upstream k6 exposes __ITER and execution.vu.iterationInInstance as
+        // zero-based indexes during the iteration. QuickJsVu::iteration()
+        // still reports the number of completed/started iterations to Rust.
+        let script = r#"
+            globalThis.__seen = [];
+            globalThis.__k6_default = function() {
+                __seen.push({
+                    iter: __ITER,
+                    vuIter: execution.vu.iterationInInstance,
+                    scenarioIter: execution.scenario.iterationInInstance,
+                    testIter: execution.scenario.iterationInTest,
+                });
+            };
+        "#;
+
+        let mut vu = QuickJsVu::new(1, script, &[]).unwrap();
+        vu.run_iteration().unwrap();
+        vu.run_iteration().unwrap();
+
+        vu.ctx.with(|ctx| {
+            let first_iter: i32 = ctx.eval("__seen[0].iter").unwrap();
+            let first_vu_iter: i32 = ctx.eval("__seen[0].vuIter").unwrap();
+            let first_scenario_iter: i32 = ctx.eval("__seen[0].scenarioIter").unwrap();
+            let first_test_iter: i32 = ctx.eval("__seen[0].testIter").unwrap();
+            assert_eq!(first_iter, 0);
+            assert_eq!(first_vu_iter, 0);
+            assert_eq!(first_scenario_iter, 0);
+            assert_eq!(first_test_iter, 0);
+
+            let second_iter: i32 = ctx.eval("__seen[1].iter").unwrap();
+            let second_vu_iter: i32 = ctx.eval("__seen[1].vuIter").unwrap();
+            assert_eq!(second_iter, 1);
+            assert_eq!(second_vu_iter, 1);
+        });
+
+        assert_eq!(vu.iteration(), 2);
     }
 
     #[test]

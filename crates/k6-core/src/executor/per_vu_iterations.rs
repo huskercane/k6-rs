@@ -30,6 +30,7 @@ impl<V: VirtualUser + 'static> PerVuIterationsExecutor<V> {
         let start = Instant::now();
         let deadline = start + self.max_duration;
         let total_iterations = Arc::new(AtomicU64::new(0));
+        let vu_count = self.vus.len() as u64;
 
         let mut handles = Vec::with_capacity(self.vus.len());
 
@@ -43,12 +44,13 @@ impl<V: VirtualUser + 'static> PerVuIterationsExecutor<V> {
                     if Instant::now() >= deadline || cancel.is_cancelled() {
                         break;
                     }
-                    match vu.run_iteration() {
-                        Ok(_) => {
-                            iterations.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => eprintln!("VU iteration error: {e}"),
+                    // Count ATTEMPTED iterations (see shared_iterations for the
+                    // rationale): a thrown script still ran, so dropped is only
+                    // the per-VU allocations that never started.
+                    if let Err(e) = vu.run_iteration() {
+                        eprintln!("VU iteration error: {e}");
                     }
+                    iterations.fetch_add(1, Ordering::Relaxed);
                     vu.reset();
                 }
             });
@@ -60,9 +62,12 @@ impl<V: VirtualUser + 'static> PerVuIterationsExecutor<V> {
             let _ = handle.await;
         }
 
+        let iterations_completed = total_iterations.load(Ordering::Relaxed);
+        let planned_iterations = self.iterations_per_vu as u64 * vu_count;
+
         Ok(RunSummary {
-            iterations_completed: total_iterations.load(Ordering::Relaxed),
-            iterations_dropped: 0,
+            iterations_completed,
+            iterations_dropped: planned_iterations.saturating_sub(iterations_completed),
             duration: start.elapsed(),
         })
     }
@@ -104,5 +109,26 @@ mod tests {
 
         assert!(summary.iterations_completed < 1000);
         assert!(summary.iterations_completed > 0);
+        assert_eq!(
+            summary.iterations_completed + summary.iterations_dropped,
+            2000
+        );
+        assert!(
+            summary.iterations_dropped > 0,
+            "max_duration should report unstarted per-VU iterations as dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_duration_drops_all_iterations() {
+        // Port of upstream TestPerVuIterationsEmitDroppedIterations at the
+        // summary boundary: each VU has a fixed allocation, so unstarted
+        // allocations are dropped when maxDuration expires immediately.
+        let vus: Vec<MockVu> = (0..5).map(|_| MockVu).collect();
+        let executor = PerVuIterationsExecutor::new(vus, 20, Duration::ZERO);
+        let summary = executor.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_dropped, 100);
     }
 }

@@ -307,7 +307,10 @@ mod tests {
             Duration::from_secs(1),
             1.0,
         );
-        assert!((n - 50.0).abs() < 1e-9, "flat 50/s for 1s should be 50, got {n}");
+        assert!(
+            (n - 50.0).abs() < 1e-9,
+            "flat 50/s for 1s should be 50, got {n}"
+        );
 
         // Linear ramp 0→100/s over 2s → area of a triangle = 0.5*2*100 = 100.
         // The OLD instantaneous-interval scheme under-counted exactly this shape.
@@ -317,7 +320,10 @@ mod tests {
             Duration::from_secs(2),
             1.0,
         );
-        assert!((n - 100.0).abs() < 1e-9, "ramp 0→100 over 2s should be 100, got {n}");
+        assert!(
+            (n - 100.0).abs() < 1e-9,
+            "ramp 0→100 over 2s should be 100, got {n}"
+        );
 
         // Halfway up that ramp (1s): rate is 50/s, area = 0.5*1*50 = 25.
         let half = RampingArrivalRateExecutor::<MockVu>::expected_arrivals(
@@ -325,7 +331,10 @@ mod tests {
             Duration::from_secs(1),
             1.0,
         );
-        assert!((half - 25.0).abs() < 1e-9, "halfway should be 25, got {half}");
+        assert!(
+            (half - 25.0).abs() < 1e-9,
+            "halfway should be 25, got {half}"
+        );
 
         // Multi-stage 0→50→50→0 (2s,1s,2s) mirrors conformance script 13:
         // triangle(50) + rectangle(50) + triangle(50) = 150.
@@ -339,7 +348,10 @@ mod tests {
             Duration::from_secs(5),
             1.0,
         );
-        assert!((total - 150.0).abs() < 1e-9, "0→50→0 ramp should total 150, got {total}");
+        assert!(
+            (total - 150.0).abs() < 1e-9,
+            "0→50→0 ramp should total 150, got {total}"
+        );
     }
 
     #[tokio::test]

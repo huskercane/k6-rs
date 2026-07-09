@@ -8,6 +8,7 @@ use rquickjs::Ctx;
 ///
 /// The objects read from globals set by the executor:
 /// - __VU, __ITER (already set)
+/// - __EXEC_VU_ID_IN_TEST, __EXEC_VU_ITERATION_IN_SCENARIO
 /// - __EXEC_SCENARIO_NAME, __EXEC_SCENARIO_EXECUTOR, __EXEC_SCENARIO_START_TIME
 /// - __EXEC_SCENARIO_PROGRESS, __EXEC_SCENARIO_ITERATION_IN_INSTANCE
 /// - __EXEC_SCENARIO_ITERATION_IN_TEST
@@ -38,9 +39,13 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
             },
             vu: {
                 get idInInstance() { return __VU; },
-                get idInTest() { return __VU; },
+                get idInTest() {
+                    return typeof __EXEC_VU_ID_IN_TEST !== 'undefined' ? __EXEC_VU_ID_IN_TEST : __VU;
+                },
                 get iterationInInstance() { return __ITER; },
-                get iterationInScenario() { return __ITER; },
+                get iterationInScenario() {
+                    return typeof __EXEC_VU_ITERATION_IN_SCENARIO !== 'undefined' ? __EXEC_VU_ITERATION_IN_SCENARIO : __ITER;
+                },
                 get tags() {
                     return typeof __EXEC_VU_TAGS !== 'undefined' ? __EXEC_VU_TAGS : {};
                 },
@@ -121,6 +126,28 @@ mod tests {
     }
 
     #[test]
+    fn vu_explicit_test_id_and_scenario_iteration_override_fallbacks() {
+        // Port of the k6/internal/execution execution-info contract: VU IDs
+        // and per-scenario VU iterations can differ from local __VU/__ITER
+        // once multiple scenarios or distributed execution are involved.
+        with_ctx(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__EXEC_VU_ID_IN_TEST = 17;
+                globalThis.__EXEC_VU_ITERATION_IN_SCENARIO = 9;
+                "#,
+            )
+            .unwrap();
+
+            let id: i32 = ctx.eval("execution.vu.idInTest").unwrap();
+            assert_eq!(id, 17);
+
+            let iter: i32 = ctx.eval("execution.vu.iterationInScenario").unwrap();
+            assert_eq!(iter, 9);
+        });
+    }
+
+    #[test]
     fn scenario_defaults() {
         with_ctx(|ctx| {
             let name: String = ctx.eval("execution.scenario.name").unwrap();
@@ -144,6 +171,57 @@ mod tests {
 
             let executor: String = ctx.eval("execution.scenario.executor").unwrap();
             assert_eq!(executor, "ramping-vus");
+        });
+    }
+
+    #[test]
+    fn scenario_iteration_globals_are_distinct_from_vu_iteration() {
+        // Mirrors upstream TestExecutionInfoScenarioIter /
+        // TestSharedIterationsStable at the API boundary: scenario iteration
+        // counters are scheduler-assigned global counters, not aliases for the
+        // VU-local __ITER when the scheduler supplies explicit values.
+        with_ctx(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__EXEC_SCENARIO_ITERATION_IN_INSTANCE = 21;
+                globalThis.__EXEC_SCENARIO_ITERATION_IN_TEST = 34;
+                "#,
+            )
+            .unwrap();
+
+            let vu_iter: i32 = ctx.eval("execution.vu.iterationInInstance").unwrap();
+            assert_eq!(vu_iter, 3);
+
+            let instance_iter: i32 = ctx.eval("execution.scenario.iterationInInstance").unwrap();
+            assert_eq!(instance_iter, 21);
+
+            let test_iter: i32 = ctx.eval("execution.scenario.iterationInTest").unwrap();
+            assert_eq!(test_iter, 34);
+        });
+    }
+
+    #[test]
+    fn execution_info_all_top_level_objects_are_readable() {
+        // Port of upstream TestExecutionInfoAll's smoke assertion. The exact
+        // time-based fields are intentionally not asserted here; this catches
+        // broken getters or missing top-level execution objects.
+        with_ctx(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__EXEC_SCENARIO_EXECUTOR = 'constant-vus';
+                globalThis.__EXEC_INSTANCE_VUS_ACTIVE = 1;
+                "#,
+            )
+            .unwrap();
+
+            let executor: String = ctx.eval("execution.scenario.executor").unwrap();
+            assert_eq!(executor, "constant-vus");
+
+            let active: i32 = ctx.eval("execution.instance.vusActive").unwrap();
+            assert_eq!(active, 1);
+
+            let vu_id: i32 = ctx.eval("execution.vu.idInTest").unwrap();
+            assert_eq!(vu_id, 5);
         });
     }
 

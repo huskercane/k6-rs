@@ -7,6 +7,26 @@ use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, ResponseBody, Timings};
 
+enum ResponseCallback {
+    Default,
+    Disabled,
+    ExpectedStatuses(Vec<(u16, u16)>),
+}
+
+impl ResponseCallback {
+    fn expected(&self, status: u16) -> Option<bool> {
+        match self {
+            Self::Disabled => None,
+            Self::Default => Some((200..=399).contains(&status)),
+            Self::ExpectedStatuses(specs) => Some(
+                specs
+                    .iter()
+                    .any(|(min, max)| status >= *min && status <= *max),
+            ),
+        }
+    }
+}
+
 /// HTTP response data that converts directly into a native JS object via `IntoJs`,
 /// bypassing JSON serialization/parsing on the hot path.
 struct JsHttpResponse {
@@ -111,7 +131,8 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                       body: rquickjs::Value<'_>,
                       headers_val: rquickjs::Value<'_>,
                       timeout_ms: f64,
-                      tags_val: rquickjs::Value<'_>|
+                      tags_val: rquickjs::Value<'_>,
+                      response_callback_val: rquickjs::Value<'_>|
                       -> rquickjs::Result<JsHttpResponse> {
                     // Headers and tags arrive as native JS objects and are
                     // iterated directly, avoiding a per-request
@@ -126,6 +147,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                     // makes thresholds like `http_req_duration{name:X,
                     // status:200}` work as users expect.
                     let user_tags = object_entries_to_pairs(&tags_val);
+                    let response_callback = parse_response_callback(&response_callback_val);
                     let timeout = if timeout_ms > 0.0 {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     } else {
@@ -167,23 +189,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                     match result {
                         Ok(mut resp) => {
                             if let Some(ref m) = metrics {
-                                // Default expected-statuses semantics: status
-                                // is "expected" iff it falls in upstream's
-                                // `defaultExpectedStatuses` band of
-                                // [200..=399]. Both `expected_response` and
-                                // `http_req_failed` derive from this single
-                                // predicate so they cannot disagree at the
-                                // boundaries (e.g. a 1xx status that
-                                // `status >= 400` would have miscategorized
-                                // as "expected" but upstream's callback
-                                // treats as not-expected). Future
-                                // setResponseCallback / per-request
-                                // `responseCallback` support replaces this
-                                // band check with a callback lookup (and
-                                // gates http_req_failed emission on
-                                // `responseCallback != null`).
-                                let expected = (200..=399).contains(&resp.status);
-                                let failed = !expected;
+                                let expected = response_callback.expected(resp.status);
                                 // CG-3: combine system tags (status, method)
                                 // with user tags into one full-tag set. Order
                                 // doesn't matter — storage canonicalizes via
@@ -195,9 +201,17 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 let mut all_tags: Vec<(String, String)> = user_tags.clone();
                                 all_tags.push(("status".to_string(), resp.status.to_string()));
                                 all_tags.push(("method".to_string(), method.clone()));
-                                all_tags
-                                    .push(("expected_response".to_string(), expected.to_string()));
-                                m.record_http_request_tagged(&resp.timings, failed, &all_tags);
+                                if let Some(expected) = expected {
+                                    all_tags.push((
+                                        "expected_response".to_string(),
+                                        expected.to_string(),
+                                    ));
+                                }
+                                m.record_http_request_tagged_with_failure(
+                                    &resp.timings,
+                                    expected.map(|ok| !ok),
+                                    &all_tags,
+                                );
                                 // data_sent/data_received are computed in
                                 // http_client.rs as full HTTP message bytes
                                 // (request/status line + headers + body),
@@ -233,6 +247,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                         Err(e) => {
                             if let Some(ref m) = metrics {
                                 let timings = Timings::default();
+                                let expected = response_callback.expected(0);
                                 // CG-3: on transport failure we still know
                                 // method + the user tags. status is "0"
                                 // (sentinel for no response received) so
@@ -241,13 +256,17 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 let mut all_tags: Vec<(String, String)> = user_tags.clone();
                                 all_tags.push(("status".to_string(), "0".to_string()));
                                 all_tags.push(("method".to_string(), method.clone()));
-                                // Transport error never falls in [200..=399],
-                                // so expected_response is unconditionally
-                                // false. Matches upstream's default callback
-                                // returning false for status=0.
-                                all_tags
-                                    .push(("expected_response".to_string(), "false".to_string()));
-                                m.record_http_request_tagged(&timings, true, &all_tags);
+                                if let Some(expected) = expected {
+                                    all_tags.push((
+                                        "expected_response".to_string(),
+                                        expected.to_string(),
+                                    ));
+                                }
+                                m.record_http_request_tagged_with_failure(
+                                    &timings,
+                                    expected.map(|ok| !ok),
+                                    &all_tags,
+                                );
                                 // Failed before the request hit the wire — no
                                 // bytes sent or received that we can measure
                                 // from reqwest's high-level error.
@@ -364,7 +383,63 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                             (allHeaders['Cookie'] ? '; ' : '') + parts.join('; ');
                     }
                 }
-                const bodyArg = (typeof body === 'object' && body !== null) ? JSON.stringify(body) : (body || null);
+                let bodyArg = body || null;
+                if (body && typeof body === 'object' && !(body instanceof ArrayBuffer)) {
+                    // Upstream object-body semantics (js/modules/k6/http/request.go):
+                    // an object with any http.file() value is sent as
+                    // multipart/form-data; otherwise it is form-encoded as
+                    // application/x-www-form-urlencoded. Neither path is JSON —
+                    // JSON requires an explicit JSON.stringify() by the caller.
+                    const setContentType = function(v) {
+                        delete allHeaders['Content-Type'];
+                        delete allHeaders['content-type'];
+                        allHeaders['Content-Type'] = v;
+                    };
+                    let hasFile = false;
+                    for (const key in body) {
+                        const v = body[key];
+                        if (v && typeof v === 'object' && v.__isFileData) { hasFile = true; break; }
+                    }
+                    if (hasFile) {
+                        const boundary = '----k6rsFormBoundary'
+                            + Date.now().toString(16)
+                            + Math.floor(Math.random() * 0x100000000).toString(16);
+                        const esc = function(s) {
+                            return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                        };
+                        let parts = '';
+                        for (const key in body) {
+                            const v = body[key];
+                            parts += '--' + boundary + '\r\n';
+                            if (v && typeof v === 'object' && v.__isFileData) {
+                                parts += 'Content-Disposition: form-data; name="' + esc(key)
+                                    + '"; filename="' + esc(v.filename) + '"\r\n';
+                                parts += 'Content-Type: ' + v.content_type + '\r\n\r\n';
+                                parts += v.data + '\r\n';
+                            } else {
+                                parts += 'Content-Disposition: form-data; name="' + esc(key) + '"\r\n\r\n';
+                                parts += String(v) + '\r\n';
+                            }
+                        }
+                        parts += '--' + boundary + '--\r\n';
+                        bodyArg = parts;
+                        setContentType('multipart/form-data; boundary=' + boundary);
+                    } else {
+                        const kv = [];
+                        for (const key in body) {
+                            const v = body[key];
+                            if (Array.isArray(v)) {
+                                for (let i = 0; i < v.length; i++) {
+                                    kv.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(v[i])));
+                                }
+                            } else {
+                                kv.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(v)));
+                            }
+                        }
+                        bodyArg = kv.join('&');
+                        setContentType('application/x-www-form-urlencoded');
+                    }
+                }
                 const timeoutMs = (params && params.timeout) ? Number(params.timeout) : 0;
                 // CG-3: forward user-provided `tags: { k: v }` so the engine
                 // can attach them to http metric samples and store the full
@@ -374,7 +449,13 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                 const tagsArg = (params && params.tags && typeof params.tags === 'object')
                     ? params.tags
                     : null;
-                const responseObj = __http_request(method, url, bodyArg, allHeaders, timeoutMs, tagsArg);
+                let responseCallbackArg = (typeof globalThis.__http_response_callback !== 'undefined')
+                    ? globalThis.__http_response_callback
+                    : undefined;
+                if (params && Object.prototype.hasOwnProperty.call(params, 'responseCallback')) {
+                    responseCallbackArg = params.responseCallback;
+                }
+                const responseObj = __http_request(method, url, bodyArg, allHeaders, timeoutMs, tagsArg, responseCallbackArg);
                 return __wrap_response(responseObj);
             },
             get: function(url, params) {
@@ -432,20 +513,49 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                 throw new Error('Invalid batch request format');
             },
             expectedStatuses: function() {
-                // Collect all valid status specs
+                if (arguments.length === 0) {
+                    throw new Error('no arguments');
+                }
                 const specs = [];
                 for (let i = 0; i < arguments.length; i++) {
                     const arg = arguments[i];
-                    if (typeof arg === 'number') {
+                    if (typeof arg === 'number' && Number.isInteger(arg)) {
                         specs.push({ min: arg, max: arg });
                     } else if (typeof arg === 'object' && arg !== null) {
-                        specs.push({ min: arg.min || 0, max: arg.max || 999 });
+                        const min = arg.min;
+                        const max = arg.max;
+                        if (!Number.isInteger(min) || !Number.isInteger(max)) {
+                            throw new Error('both min and max need to be integers for argument number ' + (i + 1));
+                        }
+                        specs.push({ min: min, max: max });
+                    } else {
+                        throw new Error('argument number ' + (i + 1) + ' to expectedStatuses was neither an integer nor an object like {min:100, max:329}');
                     }
                 }
                 return { __expectedStatuses: specs };
             },
             setResponseCallback: function(callback) {
                 globalThis.__http_response_callback = callback;
+            },
+            asyncRequest: function(method, url, body, params) {
+                return Promise.resolve().then(function() {
+                    return __http.request(method, url, body || null, params);
+                });
+            },
+            file: function(data, filename, contentType) {
+                if (typeof data !== 'string') {
+                    throw new Error('invalid type ' + (typeof data) + ', expected string or ArrayBuffer');
+                }
+                // Marker + fields mirror upstream FileData. `__isFileData` lets
+                // the request builder detect a file value inside a form object
+                // and switch that request to multipart/form-data. Default
+                // filename is a unique-ish token like upstream's UnixNano.
+                return {
+                    __isFileData: true,
+                    data: data,
+                    filename: filename || String(Date.now()),
+                    content_type: contentType || 'application/octet-stream',
+                };
             },
             cookieJar: function() {
                 return __cookieJar;
@@ -455,6 +565,45 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
     "##)?;
 
     Ok(())
+}
+
+fn parse_response_callback(value: &Value<'_>) -> ResponseCallback {
+    if value.is_null() {
+        return ResponseCallback::Disabled;
+    }
+
+    let Some(obj) = value.as_object() else {
+        return ResponseCallback::Default;
+    };
+    let Ok(specs_value) = obj.get::<_, Value>("__expectedStatuses") else {
+        return ResponseCallback::Default;
+    };
+    let Some(specs_array) = specs_value.into_array() else {
+        return ResponseCallback::Default;
+    };
+
+    let mut specs = Vec::new();
+    for i in 0..specs_array.len() {
+        let Ok(spec) = specs_array.get::<Value>(i) else {
+            continue;
+        };
+        let Some(spec_obj) = spec.as_object() else {
+            continue;
+        };
+        let Ok(min) = spec_obj.get::<_, u16>("min") else {
+            continue;
+        };
+        let Ok(max) = spec_obj.get::<_, u16>("max") else {
+            continue;
+        };
+        specs.push((min, max));
+    }
+
+    if specs.is_empty() {
+        ResponseCallback::Default
+    } else {
+        ResponseCallback::ExpectedStatuses(specs)
+    }
 }
 
 /// Collect a JS object's own enumerable string-valued entries into pairs,
@@ -606,6 +755,26 @@ mod tests {
     /// object-passing path (no JSON round-trip).
     struct MockHttpClientCapture {
         last_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        last_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl MockHttpClientCapture {
+        fn new() -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<(String, String)>>>,
+            Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        ) {
+            let headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let body = Arc::new(std::sync::Mutex::new(None));
+            (
+                Self {
+                    last_headers: Arc::clone(&headers),
+                    last_body: Arc::clone(&body),
+                },
+                headers,
+                body,
+            )
+        }
     }
 
     impl HttpClient for MockHttpClientCapture {
@@ -614,6 +783,7 @@ mod tests {
             req: HttpRequest,
         ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
             *self.last_headers.lock().unwrap() = req.headers.clone();
+            *self.last_body.lock().unwrap() = req.body.clone();
             let resp = HttpResponse {
                 status: 200,
                 headers: vec![],
@@ -708,10 +878,8 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let rt = runtime::create_runtime().unwrap();
             let ctx = runtime::create_context(&rt).unwrap();
-            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let client = Arc::new(MockHttpClientCapture {
-                last_headers: captured.clone(),
-            });
+            let (client, captured, _body) = MockHttpClientCapture::new();
+            let client = Arc::new(client);
             let bp = Backpressure::new(10);
 
             ctx.with(|ctx| {
@@ -755,7 +923,10 @@ mod tests {
             let obj: Value = ctx.eval("({a:'1', b:'2'})").unwrap();
             assert_eq!(
                 object_entries_to_pairs(&obj),
-                vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+                vec![
+                    ("a".to_string(), "1".to_string()),
+                    ("b".to_string(), "2".to_string())
+                ]
             );
 
             let null_val: Value = ctx.eval("null").unwrap();
@@ -1079,6 +1250,155 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn http_async_request_resolves_response() {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(201, r#"{"ok":true}"#));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                ctx.eval::<(), _>(
+                    r#"
+                    (async function() {
+                        const res = await http.asyncRequest('POST', 'http://example.com/api', { a: 'a', b: 2 }, {
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' }
+                        });
+                        globalThis.__async_status = res.status;
+                        globalThis.__async_body_ok = res.json().ok;
+                    })();
+                    "#,
+                )
+                .unwrap();
+            });
+            runtime::drain_pending_jobs(&rt);
+            ctx.with(|ctx| {
+                let status: i32 = ctx.globals().get("__async_status").unwrap();
+                let ok: bool = ctx.globals().get("__async_body_ok").unwrap();
+                assert_eq!(status, 201);
+                assert!(ok);
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_file_returns_data_for_request_body() {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(200, ""));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let ok: bool = ctx
+                    .eval(
+                        r#"
+                        const f = http.file('hello', 'test.txt', 'text/plain');
+                        f.data === 'hello' &&
+                            f.filename === 'test.txt' &&
+                            f.content_type === 'text/plain' &&
+                            http.post('http://example.com/upload', f.data).status === 200
+                        "#,
+                    )
+                    .unwrap();
+                assert!(ok);
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_object_body_defaults_to_form_urlencoded() {
+        // Upstream: an object body with no file is sent as
+        // application/x-www-form-urlencoded, NOT JSON. Locks that k6-rs no
+        // longer JSON.stringify's object bodies by default.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let (client, headers, body) = MockHttpClientCapture::new();
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register(&ctx, handle, Arc::new(client), bp).unwrap();
+                let _: i32 = ctx
+                    .eval("http.post('http://example.com/f', { a: 'x y', b: 2 }).status")
+                    .unwrap();
+            });
+
+            let sent = String::from_utf8(body.lock().unwrap().clone().unwrap_or_default()).unwrap();
+            assert_eq!(sent, "a=x%20y&b=2", "object body must be form-urlencoded");
+            let hs = headers.lock().unwrap().clone();
+            assert!(
+                hs.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type")
+                    && v == "application/x-www-form-urlencoded"),
+                "content-type must be set to form-urlencoded, got {hs:?}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_object_body_with_file_becomes_multipart() {
+        // Upstream: a form object containing an http.file() value is encoded as
+        // multipart/form-data with a boundary; the file becomes a part with a
+        // filename + its content-type, and plain fields become form fields.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let (client, headers, body) = MockHttpClientCapture::new();
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register(&ctx, handle, Arc::new(client), bp).unwrap();
+                let _: i32 = ctx
+                    .eval(
+                        r#"
+                        http.post('http://example.com/upload', {
+                            field: 'value',
+                            document: http.file('FILEDATA', 'report.csv', 'text/csv'),
+                        }).status
+                        "#,
+                    )
+                    .unwrap();
+            });
+
+            let hs = headers.lock().unwrap().clone();
+            let ct = hs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone())
+                .expect("content-type header present");
+            assert!(
+                ct.starts_with("multipart/form-data; boundary="),
+                "expected multipart content-type, got {ct}"
+            );
+            let boundary = ct.rsplit("boundary=").next().unwrap();
+
+            let sent = String::from_utf8(body.lock().unwrap().clone().unwrap_or_default()).unwrap();
+            // Boundary in the body must match the one advertised in the header.
+            assert!(sent.contains(&format!("--{boundary}\r\n")));
+            assert!(sent.trim_end().ends_with(&format!("--{boundary}--")));
+            // Plain field part.
+            assert!(sent.contains("Content-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n"));
+            // File part carries filename + its content-type + the data.
+            assert!(sent.contains(
+                "Content-Disposition: form-data; name=\"document\"; filename=\"report.csv\""
+            ));
+            assert!(sent.contains("Content-Type: text/csv\r\n\r\nFILEDATA\r\n"));
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn classify_error_dns() {
         let err = anyhow::anyhow!("dns resolution failed for example.com");
@@ -1315,6 +1635,113 @@ mod tests {
                 *want_failed as u64,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn http_expected_statuses_validates_arguments() {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(200, ""));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let valid: bool = ctx
+                    .eval(
+                        r#"
+                        const es = http.expectedStatuses(200, 300, { min: 200, max: 399 });
+                        es.__expectedStatuses.length === 3
+                        "#,
+                    )
+                    .unwrap();
+                assert!(valid);
+
+                assert!(ctx.eval::<(), _>("http.expectedStatuses()").is_err());
+                assert!(
+                    ctx.eval::<(), _>("http.expectedStatuses(200, '300')")
+                        .is_err()
+                );
+                assert!(ctx.eval::<(), _>("http.expectedStatuses(200.5)").is_err());
+                assert!(
+                    ctx.eval::<(), _>("http.expectedStatuses({ min: 200, max: 300.5 })")
+                        .is_err()
+                );
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_response_callback_overrides_expected_statuses() {
+        let handle = tokio::runtime::Handle::current();
+        let metrics = BuiltinMetrics::new();
+        let mh = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(302, ""));
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                let _: i32 = ctx
+                    .eval(
+                        r#"
+                        http.setResponseCallback(http.expectedStatuses(200));
+                        http.get('http://example.com/redirect').status
+                        "#,
+                    )
+                    .unwrap();
+            });
+        })
+        .await
+        .unwrap();
+
+        let falses = stored_trend_keys_with_expected(&metrics, "http_req_duration", false);
+        assert!(
+            !falses.is_empty(),
+            "status 302 should be unexpected when callback only allows 200"
+        );
+        let (_, passes, total) = metrics.registry.rate_get("http_req_failed");
+        assert_eq!(total, 1);
+        assert_eq!(passes, 1, "unexpected response should count as failed");
+    }
+
+    #[tokio::test]
+    async fn http_response_callback_null_disables_failed_metric() {
+        let handle = tokio::runtime::Handle::current();
+        let metrics = BuiltinMetrics::new();
+        let mh = metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(500, ""));
+            let bp = Backpressure::new(10);
+            ctx.with(|ctx| {
+                register_with_metrics(&ctx, handle, client, bp, Some(mh)).unwrap();
+                let _: i32 = ctx
+                    .eval(
+                        r#"
+                        http.setResponseCallback(null);
+                        http.get('http://example.com/fail').status
+                        "#,
+                    )
+                    .unwrap();
+            });
+        })
+        .await
+        .unwrap();
+
+        assert!(stored_trend_keys_with_expected(&metrics, "http_req_duration", true).is_empty());
+        assert!(stored_trend_keys_with_expected(&metrics, "http_req_duration", false).is_empty());
+        let (_, _passes, total) = metrics.registry.rate_get("http_req_failed");
+        assert_eq!(
+            total, 0,
+            "responseCallback:null should skip http_req_failed emission"
+        );
+        assert_eq!(metrics.registry.counter_get("http_reqs"), 1);
     }
 
     /// Transport error → expected_response:false. Status is "0" (sentinel)

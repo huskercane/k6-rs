@@ -655,10 +655,12 @@ async fn run_test(
             summary.iterations_completed, summary.duration
         );
         if summary.iterations_dropped > 0 {
-            eprintln!(
-                "    dropped: {} (VU pool exhausted)",
-                summary.iterations_dropped
-            );
+            // Emit the dropped_iterations metric (parity with upstream, which
+            // emits one sample per scenario). The cause differs by executor —
+            // maxDuration cutoff for shared/per-vu, VU-pool saturation for
+            // arrival-rate — so the console line stays cause-neutral.
+            metrics.record_dropped_iterations(summary.iterations_dropped);
+            eprintln!("    dropped: {} iterations", summary.iterations_dropped);
         }
 
         // Push snapshot to output plugins after each scenario. The snapshot's

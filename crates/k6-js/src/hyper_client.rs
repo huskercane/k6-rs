@@ -14,15 +14,16 @@
 //! present on [`HyperConfig`] but not yet read are marked with the slice that
 //! will consume them, so subsequent slices are purely additive.
 //!
-//! Scope at S0+S1:
+//! Scope at S0+S1+Phase 1:
 //!   - Plain HTTP only. HTTPS, TLS handshake timing, and HTTP/2 are out (S7).
 //!   - Pooling by [`RouteKey`] — same as the spike's per-authority pool, but
 //!     keyed on a type whose shape is frozen now (transport + origin host +
 //!     port + source-IP bind + proxy route) so HTTPS/local_ips/proxy slices
 //!     don't have to mutate pool identity.
-//!   - No timeout (S2), no `no_connection_reuse` bypass (S3), no user-agent
-//!     override (S4), no blacklist/blocklist/hosts (S5), no http_debug (S6),
-//!     no redirects (S8), no local-IP source-bind (S9), no proxy (S10).
+//!   - Request timeout, `no_connection_reuse`, user-agent override, and
+//!     `http_debug` are wired.
+//!   - No blacklist/blocklist/hosts (S5), no redirects (S8), no local-IP
+//!     source-bind (S9), no proxy (S10).
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -63,8 +64,8 @@ use crate::http_client::ReqwestHttpClient;
 const DEFAULT_USER_AGENT: &str = concat!("k6-rs/", env!("CARGO_PKG_VERSION"));
 
 /// Default per-request timeout, matching reqwest's `from_config` default.
-/// Applied in S2 — stored in [`HyperConfig`] today, not yet wrapped around
-/// `send_request().await`.
+/// Applied around the full send path: DNS, TCP connect, request write, response
+/// headers, and body drain.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default response-body buffer cap, matching reqwest's hardcoded 10 MiB.
@@ -114,23 +115,25 @@ pub(crate) struct ProxyRoute {
 /// Snapshot of every HTTP-shaping knob the hyper client cares about, captured
 /// at [`HyperHttpClient::from_config`] time.
 ///
-/// Fields actively read in S0+S1: `discard_response_bodies`,
-/// `max_response_body_size`. Other fields are stored so later slices' edits
-/// are pure additions; each is annotated with the slice that will consume it.
+/// Fields actively read today: `discard_response_bodies`,
+/// `max_response_body_size`, `request_timeout`, `no_connection_reuse`,
+/// `user_agent_override`, and `http_debug`. Other fields are stored so later
+/// slices' edits are pure additions; each is annotated with the slice that
+/// will consume it.
 #[derive(Clone)]
-#[allow(dead_code)] // S2..S6 fields stored intentionally; see per-field comments.
+#[allow(dead_code)] // S5 fields stored intentionally; see per-field comments.
 struct HyperConfig {
     // S1 — body buffer policy.
     discard_response_bodies: bool,
     max_response_body_size: usize,
 
-    // S2 — per-request timeout wrapper.
+    // Phase 1 — per-request timeout wrapper.
     request_timeout: Duration,
 
-    // S3 — when true, bypass pool acquire/release entirely.
+    // Phase 1 — when true, bypass pool acquire/release entirely.
     no_connection_reuse: bool,
 
-    // S4 — replaces the hardcoded default user-agent if set.
+    // Phase 1 — replaces the hardcoded default user-agent if set.
     user_agent_override: Option<HeaderValue>,
 
     // S5 — pre-send filters and static DNS override. Stored in the same
@@ -140,7 +143,7 @@ struct HyperConfig {
     block_hostnames: Vec<String>,
     hosts: HashMap<String, String>,
 
-    // S6 — request/response logging to stderr.
+    // Phase 1 — request/response logging to stderr.
     http_debug: Option<String>,
     // S7 fields (insecure_skip_tls_verify, tls_version min/max) enter
     // HyperConfig when HTTPS lands.
@@ -205,9 +208,14 @@ impl HyperHttpClient {
             http_debug: config.http_debug.clone(),
         };
 
+        let user_agent = hcfg
+            .user_agent_override
+            .clone()
+            .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_USER_AGENT));
+
         Ok(Self {
             config: hcfg,
-            user_agent: HeaderValue::from_static(DEFAULT_USER_AGENT),
+            user_agent,
             pool: Mutex::new(HashMap::new()),
         })
     }
@@ -365,7 +373,16 @@ impl HttpClient for HyperHttpClient {
         // pool through `&self` reborrow inside an async block scoped to one
         // request.
         let ua = self.user_agent.clone();
-        async move { send_inner(self, req, ua).await }
+        let request_timeout = req.timeout.unwrap_or(self.config.request_timeout);
+        async move {
+            match tokio::time::timeout(request_timeout, send_inner(self, req, ua)).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "request timed out after {:?}",
+                    request_timeout
+                )),
+            }
+        }
     }
 }
 
@@ -403,52 +420,14 @@ async fn send_inner(
     // Try the pool first. On a hit, `blocked` and `connecting` are 0 — the
     // request reuses an existing TCP connection. On a miss, do the DNS+TCP
     // dance and record real timings for those phases.
-    let (mut pooled, blocked_ms, connecting_ms) = if let Some(p) = client.try_acquire(&route_key) {
-        (p, 0.0, 0.0)
+    let (mut pooled, blocked_ms, connecting_ms) = if !client.config.no_connection_reuse {
+        if let Some(p) = client.try_acquire(&route_key) {
+            (p, 0.0, 0.0)
+        } else {
+            open_connection(authority.as_str()).await?
+        }
     } else {
-        let blocked_start = Instant::now();
-        let addr = tokio::net::lookup_host(authority.as_str())
-            .await
-            .with_context(|| format!("DNS lookup failed for {authority}"))?
-            .next()
-            .context("DNS returned no addresses")?;
-        let blocked_done = Instant::now();
-
-        let connect_start = Instant::now();
-        let tcp = TcpStream::connect(addr)
-            .await
-            .context("TCP connect failed")?;
-        let connect_done = Instant::now();
-
-        let wire = WireMetrics::default();
-        let stream = CountingStream {
-            inner: tcp,
-            metrics: wire.clone(),
-        };
-        let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-            .await
-            .context("hyper http1 handshake failed")?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let blocked = blocked_done
-            .saturating_duration_since(blocked_start)
-            .as_secs_f64()
-            * 1000.0;
-        let connecting = connect_done
-            .saturating_duration_since(connect_start)
-            .as_secs_f64()
-            * 1000.0;
-        (
-            PooledConn {
-                sender,
-                wire,
-                conn_task,
-            },
-            blocked,
-            connecting,
-        )
+        open_connection(authority.as_str()).await?
     };
 
     // Snapshot wire counters before this request so the byte counts come out
@@ -460,16 +439,23 @@ async fn send_inner(
 
     // Build the hyper Request. We construct the absolute-form path + query
     // and set Host explicitly so the request line matches the on-wire form.
-    let method = hyper_method(req.method);
+    let method = hyper_method(&req.method);
+    debug_request(&client.config, method.as_str(), &req.url, &req.headers);
     let path_and_query = uri
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    let has_user_agent = req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
     let mut builder = Request::builder()
         .method(method)
         .uri(path_and_query)
-        .header(HOST, authority.as_str())
-        .header(USER_AGENT, user_agent);
+        .header(HOST, authority.as_str());
+    if !has_user_agent {
+        builder = builder.header(USER_AGENT, user_agent);
+    }
     for (k, v) in &req.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
@@ -500,6 +486,7 @@ async fn send_inner(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+    debug_response(&client.config, status, &req.url, &headers);
 
     // Read the response body with the cap + drain rule. CRUCIAL: even when
     // we are not buffering bytes (discard mode, or post-cap in buffered mode)
@@ -562,7 +549,11 @@ async fn send_inner(
     // HTTP/1.1 keep-alive. If the server actually sent `Connection: close`,
     // the next caller's send_request will fail and trigger the drop-on-err
     // path above; the pool self-heals one mistake at a time.
-    client.release(route_key, pooled);
+    if client.config.no_connection_reuse {
+        drop(pooled);
+    } else {
+        client.release(route_key, pooled);
+    }
 
     Ok(HttpResponse {
         status,
@@ -573,6 +564,75 @@ async fn send_inner(
         data_sent: bytes_sent,
         data_received: bytes_received,
     })
+}
+
+async fn open_connection(authority: &str) -> Result<(PooledConn, f64, f64)> {
+    let blocked_start = Instant::now();
+    let addr = tokio::net::lookup_host(authority)
+        .await
+        .with_context(|| format!("DNS lookup failed for {authority}"))?
+        .next()
+        .context("DNS returned no addresses")?;
+    let blocked_done = Instant::now();
+
+    let connect_start = Instant::now();
+    let tcp = TcpStream::connect(addr)
+        .await
+        .context("TCP connect failed")?;
+    let connect_done = Instant::now();
+
+    let wire = WireMetrics::default();
+    let stream = CountingStream {
+        inner: tcp,
+        metrics: wire.clone(),
+    };
+    let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+        .await
+        .context("hyper http1 handshake failed")?;
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let blocked = blocked_done
+        .saturating_duration_since(blocked_start)
+        .as_secs_f64()
+        * 1000.0;
+    let connecting = connect_done
+        .saturating_duration_since(connect_start)
+        .as_secs_f64()
+        * 1000.0;
+
+    Ok((
+        PooledConn {
+            sender,
+            wire,
+            conn_task,
+        },
+        blocked,
+        connecting,
+    ))
+}
+
+fn debug_request(config: &HyperConfig, method: &str, url: &str, headers: &[(String, String)]) {
+    if let Some(ref mode) = config.http_debug {
+        eprintln!("HTTP DEBUG > {method} {url}");
+        if mode == "full" {
+            for (k, v) in headers {
+                eprintln!("HTTP DEBUG >   {k}: {v}");
+            }
+        }
+    }
+}
+
+fn debug_response(config: &HyperConfig, status: u16, url: &str, headers: &[(String, String)]) {
+    if let Some(ref mode) = config.http_debug {
+        eprintln!("HTTP DEBUG < {status} {url}");
+        if mode == "full" {
+            for (k, v) in headers {
+                eprintln!("HTTP DEBUG <   {k}: {v}");
+            }
+        }
+    }
 }
 
 /// Read the response body to end-of-stream while applying the cap-buffer or
@@ -622,7 +682,7 @@ async fn read_body_with_cap_and_drain(
     Ok(ResponseBody::Buffered(buffer))
 }
 
-fn hyper_method(m: HttpMethod) -> Method {
+fn hyper_method(m: &HttpMethod) -> Method {
     match m {
         HttpMethod::Get => Method::GET,
         HttpMethod::Post => Method::POST,
@@ -638,8 +698,49 @@ fn hyper_method(m: HttpMethod) -> Method {
 mod tests {
     use super::*;
     use axum::Router;
+    use axum::http::HeaderMap;
     use axum::routing::{get, post};
     use tokio::net::TcpListener;
+
+    fn buffered_string(resp: &HttpResponse) -> String {
+        match &resp.body {
+            ResponseBody::Buffered(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+            ResponseBody::Discarded => panic!("buffered response expected"),
+        }
+    }
+
+    async fn start_app(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    #[tokio::test]
+    async fn reqwest_and_hyper_basic_http_match_status_body_and_url() {
+        let base_url = start_app(Router::new().route("/get", get(|| async { "parity-ok" }))).await;
+        let url = format!("{base_url}/get");
+
+        let make_req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let reqwest = ReqwestHttpClient::new(false).unwrap();
+        let hyper = HyperHttpClient::new();
+        let reqwest_resp = reqwest.send(make_req()).await.unwrap();
+        let hyper_resp = hyper.send(make_req()).await.unwrap();
+
+        assert_eq!(reqwest_resp.status, hyper_resp.status);
+        assert_eq!(buffered_string(&reqwest_resp), buffered_string(&hyper_resp));
+        assert_eq!(reqwest_resp.url, hyper_resp.url);
+    }
 
     /// The (b) spike's acceptance criterion in test form: a single HTTP call
     /// against a local fixture must produce non-zero phase timings that we
@@ -900,6 +1001,140 @@ mod tests {
         );
         assert_eq!(client.config.hosts.get("svc.local").unwrap(), "127.0.0.1");
         assert_eq!(client.config.http_debug.as_deref(), Some("full"));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_wraps_full_send_path() {
+        let base_url = start_app(Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                "late"
+            }),
+        ))
+        .await;
+
+        let client = HyperHttpClient::new();
+        let result = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/slow"),
+                headers: Vec::new(),
+                body: None,
+                timeout: Some(Duration::from_millis(20)),
+            })
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("slow request must time out"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "timeout error should be explicit; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_connection_reuse_bypasses_pool() {
+        let base_url = start_app(Router::new().route("/get", get(|| async { "ok" }))).await;
+        let mut config = TestConfig::default();
+        config.no_connection_reuse = true;
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let url = format!("{base_url}/get");
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let r1 = client.send(req()).await.unwrap();
+        let r2 = client.send(req()).await.unwrap();
+
+        assert!(r1.timings.connecting > 0.0, "first request must connect");
+        assert!(
+            r2.timings.connecting > 0.0,
+            "second request must open a fresh connection when reuse is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_user_agent_is_sent() {
+        let base_url = start_app(Router::new().route(
+            "/ua",
+            get(|headers: HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+        ))
+        .await;
+
+        let mut config = TestConfig::default();
+        config.user_agent = Some("custom-hyper-agent/1.0".to_string());
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/ua"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(buffered_string(&resp), "custom-hyper-agent/1.0");
+    }
+
+    #[tokio::test]
+    async fn explicit_user_agent_header_overrides_configured_default() {
+        let base_url = start_app(Router::new().route(
+            "/ua",
+            get(|headers: HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+        ))
+        .await;
+
+        let mut config = TestConfig::default();
+        config.user_agent = Some("configured-agent/1.0".to_string());
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/ua"),
+                headers: vec![("User-Agent".to_string(), "explicit-agent/2.0".to_string())],
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(buffered_string(&resp), "explicit-agent/2.0");
+    }
+
+    #[test]
+    fn http_debug_helpers_accept_summary_and_full_modes() {
+        let mut config = TestConfig::default();
+        config.http_debug = Some("summary".to_string());
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        debug_request(&client.config, "GET", "http://example.test/", &[]);
+        debug_response(&client.config, 200, "http://example.test/", &[]);
+
+        config.http_debug = Some("full".to_string());
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let headers = vec![("X-Test".to_string(), "yes".to_string())];
+        debug_request(&client.config, "GET", "http://example.test/", &headers);
+        debug_response(&client.config, 200, "http://example.test/", &headers);
     }
 
     /// S0 — RouteKey shape is the load-bearing identity for the pool. Each

@@ -45,17 +45,16 @@ Status: completed in this branch.
 
 ## Phase 4: Network Feature Parity
 
-Status: in progress. `localIPs` source binding, plain HTTP proxy routing, and
-direct HTTPS/TLS are completed in this branch.
+Status: completed in this branch.
 
 11. `localIPs`: build source-IP round-robin into `RouteKey.source_ip` and bind
     sockets before connect.
-12. Proxy support: support `HTTP_PROXY` parity for plain HTTP. Remaining:
+12. Proxy support: support `HTTP_PROXY` parity for plain HTTP and
     `HTTPS_PROXY` / CONNECT for HTTPS.
 13. HTTPS/TLS: add rustls client connections, `insecureSkipTLSVerify`, TLS
-    min/max config, SNI, and `tls_handshaking` timings. Completed for direct
-    HTTPS; remaining TLS work is CONNECT-through-proxy behavior.
-14. HTTP/2: add after HTTPS is stable, since reqwest may negotiate it.
+    min/max config, SNI, and `tls_handshaking` timings.
+14. HTTP/2: negotiate over HTTPS with ALPN and use hyper's HTTP/2 client
+    connection when the server selects `h2`.
 
 ## Phase 5: Default Switch
 

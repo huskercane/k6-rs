@@ -14,8 +14,8 @@
 //! present on [`HyperConfig`] but not yet read are marked with the slice that
 //! will consume them, so subsequent slices are purely additive.
 //!
-//! Scope at S0+S1+Phase 1:
-//!   - HTTP/1.1 only. Direct HTTPS is wired; HTTP/2 is a follow-up.
+//! Scope through Phase 4:
+//!   - HTTP/1.1 plus HTTPS HTTP/2 via ALPN.
 //!   - Pooling by [`RouteKey`] — same as the spike's per-authority pool, but
 //!     keyed on a type whose shape is frozen now (transport + origin host +
 //!     port + source-IP bind + proxy route) so HTTPS/local_ips/proxy slices
@@ -26,7 +26,7 @@
 //!     wired.
 //!   - Redirects, `Connection: close` pooling behavior, and `localIPs`
 //!     source binding are wired.
-//!   - Plain HTTP proxy routing is wired; HTTPS CONNECT remains a follow-up.
+//!   - Plain HTTP proxy routing and HTTPS CONNECT tunneling are wired.
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -44,14 +44,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::client::conn::http1::{self, SendRequest};
+use hyper::body::{Bytes, Incoming};
+use hyper::client::conn::{http1, http2};
 use hyper::header::{CONNECTION, HOST, HeaderValue, LOCATION, USER_AGENT};
-use hyper::{Method, Request, Uri};
-use hyper_util::rt::TokioIo;
+use hyper::{Method, Request, Response, Uri};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
@@ -187,8 +187,10 @@ struct HyperConfig {
     // Phase 4 — source-IP round-robin binding.
     local_ips: Vec<IpAddr>,
 
-    // Phase 4 — plain HTTP proxy routing from HTTP_PROXY/http_proxy.
+    // Phase 4 — proxy routing from HTTP_PROXY/http_proxy and
+    // HTTPS_PROXY/https_proxy. HTTPS proxies use HTTP CONNECT.
     http_proxy: Option<ProxyRoute>,
+    https_proxy: Option<ProxyRoute>,
     no_proxy: Vec<String>,
 
     // Phase 4 — direct HTTPS/TLS.
@@ -268,7 +270,8 @@ impl HyperHttpClient {
             hosts: config.hosts.clone(),
             max_redirects: config.max_redirects.unwrap_or(DEFAULT_MAX_REDIRECTS),
             local_ips,
-            http_proxy: proxy_from_env()?,
+            http_proxy: proxy_from_env("HTTP_PROXY", "http_proxy")?,
+            https_proxy: proxy_from_env("HTTPS_PROXY", "https_proxy")?,
             no_proxy: no_proxy_from_env(),
             insecure_skip_tls_verify: config.insecure_skip_tls_verify,
             tls_version: config.tls_version.clone(),
@@ -308,11 +311,11 @@ impl HyperHttpClient {
     }
 }
 
-/// One pooled HTTP/1.1 connection: a hyper SendRequest paired with the IO-level
+/// One pooled HTTP connection: a hyper SendRequest paired with the IO-level
 /// metrics for that physical TCP stream, plus the task driving the connection
 /// future. Dropping this aborts the conn task so the FD is released promptly.
 struct PooledConn {
-    sender: SendRequest<Full<Bytes>>,
+    sender: PooledSender,
     wire: WireMetrics,
     conn_task: JoinHandle<()>,
 }
@@ -323,6 +326,36 @@ impl Drop for PooledConn {
         // FD release when the client/pool itself is dropped.
         self.conn_task.abort();
     }
+}
+
+enum PooledSender {
+    Http1(http1::SendRequest<Full<Bytes>>),
+    Http2(http2::SendRequest<Full<Bytes>>),
+}
+
+impl PooledSender {
+    fn protocol(&self) -> ConnectionProtocol {
+        match self {
+            Self::Http1(_) => ConnectionProtocol::Http1,
+            Self::Http2(_) => ConnectionProtocol::Http2,
+        }
+    }
+
+    async fn send_request(
+        &mut self,
+        request: Request<Full<Bytes>>,
+    ) -> hyper::Result<Response<Incoming>> {
+        match self {
+            Self::Http1(sender) => sender.send_request(request).await,
+            Self::Http2(sender) => sender.send_request(request).await,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionProtocol {
+    Http1,
+    Http2,
 }
 
 /// Runtime-selectable HTTP client. Wraps either the production reqwest path
@@ -547,11 +580,32 @@ async fn send_once(
             if let Some(p) = client.try_acquire(&route_key) {
                 (p, 0.0, 0.0, 0.0)
             } else {
-                open_connection(&connect_target, source_ip, transport, &host, &client.config)
-                    .await?
+                open_connection(
+                    &connect_target,
+                    source_ip,
+                    transport,
+                    &host,
+                    proxy
+                        .as_ref()
+                        .filter(|_| transport == Transport::Https)
+                        .map(|_| origin_authority.as_str()),
+                    &client.config,
+                )
+                .await?
             }
         } else {
-            open_connection(&connect_target, source_ip, transport, &host, &client.config).await?
+            open_connection(
+                &connect_target,
+                source_ip,
+                transport,
+                &host,
+                proxy
+                    .as_ref()
+                    .filter(|_| transport == Transport::Https)
+                    .map(|_| origin_authority.as_str()),
+                &client.config,
+            )
+            .await?
         };
 
     // Snapshot wire counters before this request so the byte counts come out
@@ -565,7 +619,9 @@ async fn send_once(
     // and set Host explicitly so the request line matches the on-wire form.
     let method = hyper_method(&req.method);
     debug_request(&client.config, method.as_str(), &req.url, &req.headers);
-    let request_uri = if proxy.is_some() {
+    let request_uri = if pooled.sender.protocol() == ConnectionProtocol::Http2 {
+        req.url.clone()
+    } else if proxy.is_some() {
         req.url.clone()
     } else {
         uri.path_and_query()
@@ -737,11 +793,8 @@ fn connection_close_requested(headers: &[(String, String)]) -> bool {
         .unwrap_or(false)
 }
 
-fn proxy_from_env() -> Result<Option<ProxyRoute>> {
-    let Some(raw) = env::var("HTTP_PROXY")
-        .ok()
-        .or_else(|| env::var("http_proxy").ok())
-    else {
+fn proxy_from_env(upper: &str, lower: &str) -> Result<Option<ProxyRoute>> {
+    let Some(raw) = env::var(upper).ok().or_else(|| env::var(lower).ok()) else {
         return Ok(None);
     };
 
@@ -790,10 +843,14 @@ fn no_proxy_from_env() -> Vec<String> {
 }
 
 fn proxy_for(config: &HyperConfig, scheme: &str, host: &str) -> Option<ProxyRoute> {
-    if scheme != "http" || no_proxy_matches(&config.no_proxy, host) {
+    if no_proxy_matches(&config.no_proxy, host) {
         return None;
     }
-    config.http_proxy.clone()
+    match scheme {
+        "http" => config.http_proxy.clone(),
+        "https" => config.https_proxy.clone(),
+        _ => None,
+    }
 }
 
 fn transport_for_scheme(scheme: &str) -> Result<Transport> {
@@ -876,6 +933,7 @@ async fn open_connection(
     source_ip: Option<IpAddr>,
     transport: Transport,
     tls_server_name: &str,
+    proxy_connect_authority: Option<&str>,
     config: &HyperConfig,
 ) -> Result<(PooledConn, f64, f64, f64)> {
     let blocked_start = Instant::now();
@@ -898,10 +956,13 @@ async fn open_connection(
     let connect_done = Instant::now();
 
     let wire = WireMetrics::default();
-    let stream = CountingStream {
+    let mut stream = CountingStream {
         inner: tcp,
         metrics: wire.clone(),
     };
+    if let Some(authority) = proxy_connect_authority {
+        establish_connect_tunnel(&mut stream, authority).await?;
+    }
     let (sender, conn_task, tls_handshaking) = match transport {
         Transport::Http => {
             let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
@@ -910,7 +971,7 @@ async fn open_connection(
             let conn_task = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            (sender, conn_task, 0.0)
+            (PooledSender::Http1(sender), conn_task, 0.0)
         }
         Transport::Https => {
             let tls_start = Instant::now();
@@ -921,13 +982,30 @@ async fn open_connection(
                 .await
                 .context("TLS handshake failed")?;
             let tls_handshaking = tls_start.elapsed().as_secs_f64() * 1000.0;
-            let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(tls_stream))
-                .await
-                .context("hyper http1 handshake failed")?;
-            let conn_task = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            (sender, conn_task, tls_handshaking)
+            let is_h2 = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .is_some_and(|protocol| protocol == b"h2");
+            if is_h2 {
+                let (sender, connection) = http2::Builder::new(TokioExecutor::new())
+                    .handshake::<_, Full<Bytes>>(TokioIo::new(tls_stream))
+                    .await
+                    .context("hyper http2 handshake failed")?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                (PooledSender::Http2(sender), conn_task, tls_handshaking)
+            } else {
+                let (sender, connection) =
+                    http1::handshake::<_, Full<Bytes>>(TokioIo::new(tls_stream))
+                        .await
+                        .context("hyper http1 handshake failed")?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                (PooledSender::Http1(sender), conn_task, tls_handshaking)
+            }
         }
     };
 
@@ -952,6 +1030,49 @@ async fn open_connection(
     ))
 }
 
+async fn establish_connect_tunnel<S>(stream: &mut S, authority: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .context("writing CONNECT request to proxy")?;
+    stream
+        .flush()
+        .await
+        .context("flushing CONNECT request to proxy")?;
+
+    let mut response = Vec::new();
+    let mut buf = [0_u8; 512];
+    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .context("reading CONNECT response from proxy")?;
+        anyhow::ensure!(n != 0, "proxy closed connection before CONNECT response");
+        response.extend_from_slice(&buf[..n]);
+        anyhow::ensure!(
+            response.len() <= 8192,
+            "proxy CONNECT response exceeded 8192 bytes"
+        );
+    }
+
+    let first_line_end = response
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .context("proxy CONNECT response missing status line")?;
+    let first_line = String::from_utf8_lossy(&response[..first_line_end]);
+    anyhow::ensure!(
+        first_line.starts_with("HTTP/1.1 200") || first_line.starts_with("HTTP/1.0 200"),
+        "proxy CONNECT failed: {first_line}"
+    );
+    Ok(())
+}
+
 fn build_tls_client_config(config: &TestConfig) -> Result<Arc<rustls::ClientConfig>> {
     let versions = tls_protocol_versions(config.tls_version.as_ref())?;
     let version_slice = versions.as_deref().unwrap_or(rustls::DEFAULT_VERSIONS);
@@ -959,7 +1080,7 @@ fn build_tls_client_config(config: &TestConfig) -> Result<Arc<rustls::ClientConf
         .with_protocol_versions(version_slice)
         .context("building TLS client protocol versions")?;
 
-    let client_config = if config.insecure_skip_tls_verify {
+    let mut client_config = if config.insecure_skip_tls_verify {
         builder
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -969,6 +1090,7 @@ fn build_tls_client_config(config: &TestConfig) -> Result<Arc<rustls::ClientConf
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         builder.with_root_certificates(roots).with_no_client_auth()
     };
+    client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(client_config))
 }
@@ -1180,10 +1302,14 @@ fn hyper_method(m: &HttpMethod) -> Method {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+
     use axum::Router;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{get, post};
     use base64::Engine as _;
+    use hyper::Version;
+    use hyper::service::service_fn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
@@ -1208,7 +1334,7 @@ mod tests {
         format!("http://127.0.0.1:{}", addr.port())
     }
 
-    async fn start_tls_fixture() -> String {
+    fn test_tls_server_config(alpn_protocols: Vec<Vec<u8>>) -> rustls::ServerConfig {
         let cert = CertificateDer::from(
             base64::engine::general_purpose::STANDARD
                 .decode(TEST_TLS_CERT_DER_B64)
@@ -1220,12 +1346,18 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let server_config = rustls::ServerConfig::builder_with_provider(rustls_provider())
+        let mut server_config = rustls::ServerConfig::builder_with_provider(rustls_provider())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
             .unwrap();
+        server_config.alpn_protocols = alpn_protocols;
+        server_config
+    }
+
+    async fn start_tls_fixture() -> String {
+        let server_config = test_tls_server_config(Vec::new());
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1253,6 +1385,98 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         format!("https://127.0.0.1:{}", addr.port())
+    }
+
+    async fn start_h2_tls_fixture() -> String {
+        let server_config = test_tls_server_config(vec![b"h2".to_vec()]);
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(|req: Request<Incoming>| async move {
+                        assert_eq!(req.version(), Version::HTTP_2);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                            b"h2-good",
+                        ))))
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("https://127.0.0.1:{}", addr.port())
+    }
+
+    async fn start_connect_proxy() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 512];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = inbound.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+                    let first_line_end = request
+                        .windows(2)
+                        .position(|w| w == b"\r\n")
+                        .unwrap_or(request.len());
+                    let first_line = String::from_utf8_lossy(&request[..first_line_end]);
+                    let Some(authority) = first_line
+                        .strip_prefix("CONNECT ")
+                        .and_then(|rest| rest.split_whitespace().next())
+                    else {
+                        let _ = inbound
+                            .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    };
+
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(authority).await else {
+                        let _ = inbound
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    };
+                    if inbound
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_ok()
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
+                    }
+                });
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("http://127.0.0.1:{}", addr.port())
     }
 
     #[tokio::test]
@@ -1523,6 +1747,57 @@ mod tests {
             resp.data_received > "tls-good".len() as u64,
             "TLS response must count encrypted response bytes plus headers"
         );
+    }
+
+    #[tokio::test]
+    async fn https_proxy_connect_tunnels_tls_to_origin() {
+        let base_url = start_tls_fixture().await;
+        let proxy_url = start_connect_proxy().await;
+        let mut config = TestConfig::default();
+        config.insecure_skip_tls_verify = true;
+        let mut client = HyperHttpClient::from_config(&config).unwrap();
+        client.config.https_proxy = Some(parse_http_proxy(&proxy_url).unwrap());
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/secure"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(buffered_string(&resp), "tls-good");
+        assert!(
+            resp.timings.tls_handshaking > 0.0,
+            "proxied HTTPS must still measure origin TLS handshaking"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_negotiates_http2_when_server_selects_h2() {
+        let base_url = start_h2_tls_fixture().await;
+        let mut config = TestConfig::default();
+        config.insecure_skip_tls_verify = true;
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/h2"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(buffered_string(&resp), "h2-good");
+        assert!(resp.timings.tls_handshaking > 0.0);
     }
 
     // ── S0+S1 regression tests ─────────────────────────────────────────────
@@ -1832,6 +2107,7 @@ mod tests {
             None,
             Transport::Http,
             "127.0.0.1",
+            None,
             &client.config,
         )
         .await;

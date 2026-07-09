@@ -42,7 +42,7 @@ futures-util = "0.3"
 tonic = "0.13"
 prost = "0.13"
 prost-types = "0.13"
-hyper = { version = "1", features = ["server", "http1", "client"] }
+hyper = { version = "1", features = ["server", "http1", "http2", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 webpki-roots = "1"

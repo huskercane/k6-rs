@@ -12,8 +12,8 @@
 //! duration = "10s"
 //!
 //! [tolerances]
-//! default_counter = "exact"      # or "relative:0.02"
-//! default_trend   = "relative:0.05"
+//! default_counter = "exact"      # or "relative:0.02" or "ignore"
+//! default_trend   = "relative:0.05" # or "ignore"
 //!
 //! [tolerances.overrides]
 //! "http_reqs"             = { count = "exact", rate = "relative:0.05" }
@@ -33,12 +33,16 @@ use serde::Deserialize;
 pub enum Tolerance {
     Exact,
     Relative(f64),
+    Ignore,
 }
 
 impl Tolerance {
     fn parse(s: &str) -> Result<Self> {
         if s == "exact" {
             return Ok(Self::Exact);
+        }
+        if s == "ignore" {
+            return Ok(Self::Ignore);
         }
         if let Some(rest) = s.strip_prefix("relative:") {
             let v: f64 = rest
@@ -191,7 +195,7 @@ mod tests {
 
             [tolerances]
             default_counter = "exact"
-            default_trend = "relative:0.05"
+            default_trend = "ignore"
 
             [tolerances.overrides]
             "http_reqs" = { count = "exact", rate = "relative:0.10" }
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(exp.vus, None);
         assert_eq!(exp.iterations, None);
         assert!(exp.is_known_drift("summary.tag_breakdown"));
+        assert!(matches!(exp.default_trend, Tolerance::Ignore));
         let tol = exp.tolerance_for("http_reqs");
         assert!(matches!(tol.count, Tolerance::Exact));
         assert!(matches!(tol.rate, Tolerance::Relative(v) if (v - 0.10).abs() < 1e-9));

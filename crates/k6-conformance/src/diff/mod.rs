@@ -342,6 +342,7 @@ pub(crate) fn check_tolerance(field: &str, a: f64, b: f64, tol: &Tolerance) -> O
                 None
             }
         }
+        Tolerance::Ignore => None,
     }
 }
 

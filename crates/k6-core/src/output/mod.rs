@@ -15,6 +15,7 @@ pub mod json;
 pub mod prometheus;
 
 use crate::metrics::MetricsSnapshot;
+use crate::selector::MetricSelector;
 
 /// A metric sample emitted during test execution.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -232,19 +233,23 @@ pub fn snapshot_to_samples(snapshot: &MetricsSnapshot, elapsed_secs: f64) -> Vec
 
 /// Parse tagged metric names like `http_req_duration{scenario:light}` into (name, tags).
 fn parse_metric_name(name: &str) -> (String, std::collections::HashMap<String, String>) {
-    let mut tags = std::collections::HashMap::new();
-
-    if let Some(brace_start) = name.find('{') {
-        let metric = name[..brace_start].to_string();
-        let tag_str = &name[brace_start + 1..name.len() - 1];
-        for pair in tag_str.split(',') {
-            if let Some(colon) = pair.find(':') {
-                tags.insert(pair[..colon].to_string(), pair[colon + 1..].to_string());
+    match MetricSelector::parse(name) {
+        Ok(selector) => (selector.name, selector.tags.into_iter().collect()),
+        Err(_) => {
+            let mut tags = std::collections::HashMap::new();
+            if let Some(brace_start) = name.find('{') {
+                let metric = name[..brace_start].to_string();
+                let tag_str = &name[brace_start + 1..name.len().saturating_sub(1)];
+                for pair in tag_str.split(',') {
+                    if let Some(colon) = pair.find(':') {
+                        tags.insert(pair[..colon].to_string(), pair[colon + 1..].to_string());
+                    }
+                }
+                (metric, tags)
+            } else {
+                (name.to_string(), tags)
             }
         }
-        (metric, tags)
-    } else {
-        (name.to_string(), tags)
     }
 }
 
@@ -278,6 +283,16 @@ mod tests {
         let (name, tags) = parse_metric_name("http_req_duration{scenario:light}");
         assert_eq!(name, "http_req_duration");
         assert_eq!(tags.get("scenario").unwrap(), "light");
+    }
+
+    #[test]
+    fn parse_metric_name_uses_selector_for_url_like_tags() {
+        let (name, tags) = parse_metric_name(
+            "http_req_duration{name:http://${}.com,url:ssh://github.com:grafana/k6}",
+        );
+        assert_eq!(name, "http_req_duration");
+        assert_eq!(tags.get("name").unwrap(), "http://${}.com");
+        assert_eq!(tags.get("url").unwrap(), "ssh://github.com:grafana/k6");
     }
 
     #[test]

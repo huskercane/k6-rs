@@ -78,7 +78,11 @@ impl Output for CsvOutput {
             writeln!(
                 writer,
                 "{},{:.3},{:?},{},{}",
-                sample.metric, sample.timestamp, sample.metric_type, value_str, tags_str
+                csv_field(&sample.metric),
+                sample.timestamp,
+                sample.metric_type,
+                csv_field(&value_str),
+                csv_field(&tags_str)
             )?;
         }
         writer.flush()?;
@@ -95,6 +99,14 @@ impl Output for CsvOutput {
 
     fn description(&self) -> String {
         format!("csv ({})", self.path)
+    }
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
@@ -143,6 +155,50 @@ mod tests {
             "metric_name,timestamp,metric_type,metric_value,tags"
         );
         assert_eq!(lines.len(), 4); // header + 3 metrics
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csv_output_quotes_commas_quotes_and_tag_payloads() {
+        let dir = std::env::temp_dir().join("k6rs_csv_escape_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.csv");
+
+        let mut output = CsvOutput::new(path.to_str().unwrap());
+        output.start().unwrap();
+
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
+            counters: vec![(
+                "custom_metric{name:a\"b,url:http://${}.com}".to_string(),
+                1,
+                1.0,
+            )],
+            gauges: vec![],
+            rates: vec![],
+            trends: vec![],
+        };
+
+        output.add_snapshot(&snapshot, 1.0).unwrap();
+        output.stop().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "metric_name,timestamp,metric_type,metric_value,tags"
+        );
+        let row = lines.next().unwrap();
+        assert!(
+            row.starts_with("custom_metric,1000.000,Counter,\"1,1.000000\","),
+            "row: {row}"
+        );
+        assert!(
+            row.contains("\""),
+            "tag payload with quote should be quoted: {row}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

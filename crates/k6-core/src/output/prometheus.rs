@@ -44,27 +44,17 @@ impl Output for PrometheusOutput {
         let timestamp_ms = (elapsed_secs * 1000.0) as i64;
 
         for sample in &samples {
-            let labels: Vec<(String, String)> = sample
-                .tags
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let labels = prometheus_labels(&sample.tags);
 
             // Sanitize metric name for Prometheus (replace dots/dashes with underscores)
             let prom_name = sample.metric.replace(['.', '-'], "_");
 
             match &sample.value {
-                MetricValue::Counter { count, rate } => {
+                MetricValue::Counter { count, .. } => {
                     self.buffer.push(TimeSeries {
                         name: format!("k6_{prom_name}_total"),
                         labels: labels.clone(),
                         value: *count as f64,
-                        timestamp_ms,
-                    });
-                    self.buffer.push(TimeSeries {
-                        name: format!("k6_{prom_name}_rate"),
-                        labels: labels.clone(),
-                        value: *rate,
                         timestamp_ms,
                     });
                 }
@@ -78,7 +68,7 @@ impl Output for PrometheusOutput {
                 }
                 MetricValue::Rate { rate, .. } => {
                     self.buffer.push(TimeSeries {
-                        name: format!("k6_{prom_name}"),
+                        name: format!("k6_{prom_name}_rate"),
                         labels: labels.clone(),
                         value: *rate,
                         timestamp_ms,
@@ -93,7 +83,6 @@ impl Output for PrometheusOutput {
                     p95,
                     count,
                 } => {
-                    // Emit as histogram-style summary
                     for (suffix, value) in [
                         ("avg", *avg),
                         ("min", *min),
@@ -101,22 +90,15 @@ impl Output for PrometheusOutput {
                         ("max", *max),
                         ("p90", *p90),
                         ("p95", *p95),
+                        ("count", *count as f64),
                     ] {
-                        let mut ts_labels = labels.clone();
-                        ts_labels.push(("stat".to_string(), suffix.to_string()));
                         self.buffer.push(TimeSeries {
-                            name: format!("k6_{prom_name}"),
-                            labels: ts_labels,
+                            name: format!("k6_{prom_name}_{suffix}"),
+                            labels: labels.clone(),
                             value,
                             timestamp_ms,
                         });
                     }
-                    self.buffer.push(TimeSeries {
-                        name: format!("k6_{prom_name}_count"),
-                        labels: labels.clone(),
-                        value: *count as f64,
-                        timestamp_ms,
-                    });
                 }
             }
         }
@@ -135,6 +117,16 @@ impl Output for PrometheusOutput {
     fn description(&self) -> String {
         format!("Prometheus ({})", self.url)
     }
+}
+
+fn prometheus_labels(tags: &std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut labels: Vec<(String, String)> = tags
+        .iter()
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    labels.sort_by(|a, b| a.0.cmp(&b.0));
+    labels
 }
 
 #[cfg(test)]
@@ -158,10 +150,9 @@ mod tests {
 
         output.add_snapshot(&snapshot, 5.0).unwrap();
 
-        // Counter generates _total and _rate
-        assert_eq!(output.buffer.len(), 2);
+        // Upstream remote write maps counters to cumulative _total series.
+        assert_eq!(output.buffer.len(), 1);
         assert_eq!(output.buffer[0].name, "k6_http_reqs_total");
-        assert_eq!(output.buffer[1].name, "k6_http_reqs_rate");
     }
 
     #[test]
@@ -192,7 +183,54 @@ mod tests {
 
         output.add_snapshot(&snapshot, 5.0).unwrap();
 
-        // Trend: 6 stat samples + 1 count = 7
+        assert_eq!(
+            output
+                .buffer
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "k6_http_req_duration_avg",
+                "k6_http_req_duration_min",
+                "k6_http_req_duration_med",
+                "k6_http_req_duration_max",
+                "k6_http_req_duration_p90",
+                "k6_http_req_duration_p95",
+                "k6_http_req_duration_count",
+            ]
+        );
         assert_eq!(output.buffer.len(), 7);
+    }
+
+    #[test]
+    fn prometheus_rate_uses_rate_suffix_and_sorted_nonempty_labels() {
+        let mut output = PrometheusOutput::new("http://localhost:9090/api/v1/write");
+        output.start().unwrap();
+
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
+            counters: vec![],
+            gauges: vec![],
+            rates: vec![(
+                "checks{tagk1:tagv1,b1:v1,tagEmptyValue:}".to_string(),
+                0.75,
+                3,
+                4,
+            )],
+            trends: vec![],
+        };
+
+        output.add_snapshot(&snapshot, 5.0).unwrap();
+
+        assert_eq!(output.buffer.len(), 1);
+        assert_eq!(output.buffer[0].name, "k6_checks_rate");
+        assert_eq!(
+            output.buffer[0].labels,
+            vec![
+                ("b1".to_string(), "v1".to_string()),
+                ("tagk1".to_string(), "tagv1".to_string()),
+            ]
+        );
     }
 }

@@ -93,7 +93,7 @@ impl Output for DuckDbOutput {
             writeln!(
                 writer,
                 "{},{:?},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.6},{}",
-                sample.metric,
+                csv_field(&sample.metric),
                 sample.metric_type,
                 sample.timestamp,
                 avg,
@@ -104,7 +104,7 @@ impl Output for DuckDbOutput {
                 p95,
                 count,
                 rate,
-                tags_str,
+                csv_field(&tags_str),
             )?;
         }
         writer.flush()?;
@@ -150,6 +150,14 @@ SELECT * FROM read_csv_auto('{csv}');
 
     fn description(&self) -> String {
         format!("duckdb ({})", self.path)
+    }
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
@@ -200,6 +208,37 @@ mod tests {
         let sql_content = std::fs::read_to_string(&output.sql_path).unwrap();
         assert!(sql_content.contains("CREATE TABLE"));
         assert!(sql_content.contains("read_csv_auto"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duckdb_output_quotes_csv_fields() {
+        let dir = std::env::temp_dir().join("k6rs_duckdb_escape_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("test.duckdb");
+
+        let mut output = DuckDbOutput::new(db_path.to_str().unwrap());
+        output.start().unwrap();
+
+        let snapshot = MetricsSnapshot {
+            trend_histograms: std::collections::HashMap::new(),
+            group_tree: crate::metrics::GroupSnapshot::default(),
+            counters: vec![("custom_metric{name:a\"b}".to_string(), 1, 1.0)],
+            gauges: vec![],
+            rates: vec![],
+            trends: vec![],
+        };
+
+        output.add_snapshot(&snapshot, 5.0).unwrap();
+        output.stop().unwrap();
+
+        let csv_content = std::fs::read_to_string(&output.csv_path).unwrap();
+        let row = csv_content.lines().nth(1).unwrap();
+        assert!(
+            row.ends_with("\"name=a\"\"b\""),
+            "row should quote payloads that require CSV escaping: {row}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

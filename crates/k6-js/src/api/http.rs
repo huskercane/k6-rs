@@ -1337,8 +1337,9 @@ mod tests {
             assert_eq!(sent, "a=x%20y&b=2", "object body must be form-urlencoded");
             let hs = headers.lock().unwrap().clone();
             assert!(
-                hs.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type")
-                    && v == "application/x-www-form-urlencoded"),
+                hs.iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("content-type")
+                        && v == "application/x-www-form-urlencoded"),
                 "content-type must be set to form-urlencoded, got {hs:?}"
             );
         })
@@ -1388,7 +1389,9 @@ mod tests {
             assert!(sent.contains(&format!("--{boundary}\r\n")));
             assert!(sent.trim_end().ends_with(&format!("--{boundary}--")));
             // Plain field part.
-            assert!(sent.contains("Content-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n"));
+            assert!(
+                sent.contains("Content-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n")
+            );
             // File part carries filename + its content-type + the data.
             assert!(sent.contains(
                 "Content-Disposition: form-data; name=\"document\"; filename=\"report.csv\""

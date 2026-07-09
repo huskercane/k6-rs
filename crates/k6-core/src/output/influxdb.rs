@@ -59,24 +59,38 @@ impl Output for InfluxDbOutput {
             let mut tag_str = String::new();
             for (k, v) in &sample.tags {
                 tag_str.push(',');
-                tag_str.push_str(k);
+                tag_str.push_str(&escape_tag_or_field_key(k));
                 tag_str.push('=');
-                tag_str.push_str(v);
+                tag_str.push_str(&escape_tag_value(v));
             }
 
             let fields = match &sample.value {
                 MetricValue::Counter { count, rate } => {
-                    format!("count={count}i,rate={rate}")
+                    format!(
+                        "{}={count}i,{}={rate}",
+                        escape_tag_or_field_key("count"),
+                        escape_tag_or_field_key("rate")
+                    )
                 }
                 MetricValue::Gauge { value, min, max } => {
-                    format!("value={value},min={min},max={max}")
+                    format!(
+                        "{}={value},{}={min},{}={max}",
+                        escape_tag_or_field_key("value"),
+                        escape_tag_or_field_key("min"),
+                        escape_tag_or_field_key("max")
+                    )
                 }
                 MetricValue::Rate {
                     rate,
                     passes,
                     total,
                 } => {
-                    format!("rate={rate},passes={passes}i,total={total}i")
+                    format!(
+                        "{}={rate},{}={passes}i,{}={total}i",
+                        escape_tag_or_field_key("rate"),
+                        escape_tag_or_field_key("passes"),
+                        escape_tag_or_field_key("total")
+                    )
                 }
                 MetricValue::Trend {
                     avg,
@@ -88,14 +102,21 @@ impl Output for InfluxDbOutput {
                     count,
                 } => {
                     format!(
-                        "avg={avg},min={min},med={med},max={max},p90={p90},p95={p95},count={count}i"
+                        "{}={avg},{}={min},{}={med},{}={max},{}={p90},{}={p95},{}={count}i",
+                        escape_tag_or_field_key("avg"),
+                        escape_tag_or_field_key("min"),
+                        escape_tag_or_field_key("med"),
+                        escape_tag_or_field_key("max"),
+                        escape_tag_or_field_key("p90"),
+                        escape_tag_or_field_key("p95"),
+                        escape_tag_or_field_key("count"),
                     )
                 }
             };
 
             self.buffer.push(format!(
                 "{}{tag_str} {fields} {timestamp_ns}",
-                sample.metric
+                escape_measurement(&sample.metric)
             ));
         }
 
@@ -124,24 +145,46 @@ pub fn to_line_protocol(
     fields: &[(String, f64)],
     timestamp_ns: u64,
 ) -> String {
-    let mut line = measurement.to_string();
+    let mut line = escape_measurement(measurement);
 
     for (k, v) in tags {
         line.push(',');
-        line.push_str(k);
+        line.push_str(&escape_tag_or_field_key(k));
         line.push('=');
-        line.push_str(v);
+        line.push_str(&escape_tag_value(v));
     }
 
     line.push(' ');
 
-    let field_strs: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let field_strs: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| format!("{}={v}", escape_tag_or_field_key(k)))
+        .collect();
     line.push_str(&field_strs.join(","));
 
     line.push(' ');
     line.push_str(&timestamp_ns.to_string());
 
     line
+}
+
+fn escape_measurement(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace(',', "\\,")
+        .replace(' ', "\\ ")
+}
+
+fn escape_tag_or_field_key(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('=', "\\=")
+}
+
+fn escape_tag_value(value: &str) -> String {
+    escape_tag_or_field_key(value)
 }
 
 #[cfg(test)]
@@ -173,6 +216,27 @@ mod tests {
         assert!(line.contains("avg=125.5"));
         assert!(line.contains("p95=300"));
         assert!(line.ends_with("1000000000"));
+    }
+
+    #[test]
+    fn line_protocol_escapes_measurements_tags_and_fields() {
+        let line = to_line_protocol(
+            "http req,duration",
+            &[
+                ("scenario name".to_string(), "default,smoke".to_string()),
+                (
+                    "url".to_string(),
+                    "https://example.test/a b?x=1".to_string(),
+                ),
+            ],
+            &[("field key".to_string(), 1.5)],
+            1000000000,
+        );
+
+        assert_eq!(
+            line,
+            "http\\ req\\,duration,scenario\\ name=default\\,smoke,url=https://example.test/a\\ b?x\\=1 field\\ key=1.5 1000000000"
+        );
     }
 
     #[test]

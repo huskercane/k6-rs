@@ -15,7 +15,7 @@
 //! will consume them, so subsequent slices are purely additive.
 //!
 //! Scope at S0+S1+Phase 1:
-//!   - Plain HTTP only. HTTPS, TLS handshake timing, and HTTP/2 are out (S7).
+//!   - HTTP/1.1 only. Direct HTTPS is wired; HTTP/2 is a follow-up.
 //!   - Pooling by [`RouteKey`] — same as the spike's per-authority pool, but
 //!     keyed on a type whose shape is frozen now (transport + origin host +
 //!     port + source-IP bind + proxy route) so HTTPS/local_ips/proxy slices
@@ -23,10 +23,10 @@
 //!   - Request timeout, `no_connection_reuse`, user-agent override, and
 //!     `http_debug` are wired.
 //!   - `blockHostnames`, `blacklistIPs`, and static `hosts` mappings are
-//!     wired for plain HTTP.
+//!     wired.
 //!   - Redirects, `Connection: close` pooling behavior, and `localIPs`
 //!     source binding are wired.
-//!   - No proxy (S10).
+//!   - Plain HTTP proxy routing is wired; HTTPS CONNECT remains a follow-up.
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -49,11 +49,14 @@ use hyper::client::conn::http1::{self, SendRequest};
 use hyper::header::{CONNECTION, HOST, HeaderValue, LOCATION, USER_AGENT};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
 
-use k6_core::config::TestConfig;
+use k6_core::config::{TestConfig, TlsVersionConfig};
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
 
 use crate::http_client::ReqwestHttpClient;
@@ -85,7 +88,6 @@ const DEFAULT_MAX_REDIRECTS: u32 = 10;
 /// Keying the pool on this struct (rather than a raw `"host:port"` string)
 /// means subsequent slices can extend connection identity without overloading
 /// existing fields' semantics:
-///   - S7 will add `Transport::Https`.
 ///   - S5 will write the **resolved** host into `target_host` after the
 ///     static `hosts` override resolves.
 ///   - S9 will populate `source_ip` when `localIPs` round-robin binds a
@@ -109,7 +111,7 @@ pub(crate) struct RouteKey {
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub(crate) enum Transport {
     Http,
-    // S7 adds Https.
+    Https,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
@@ -189,10 +191,13 @@ struct HyperConfig {
     http_proxy: Option<ProxyRoute>,
     no_proxy: Vec<String>,
 
+    // Phase 4 — direct HTTPS/TLS.
+    insecure_skip_tls_verify: bool,
+    tls_version: Option<TlsVersionConfig>,
+    tls_client_config: Arc<rustls::ClientConfig>,
+
     // Phase 1 — request/response logging to stderr.
     http_debug: Option<String>,
-    // S7 fields (insecure_skip_tls_verify, tls_version min/max) enter
-    // HyperConfig when HTTPS lands.
 }
 
 /// Hyper-backed HTTP client. See module docs.
@@ -265,6 +270,9 @@ impl HyperHttpClient {
             local_ips,
             http_proxy: proxy_from_env()?,
             no_proxy: no_proxy_from_env(),
+            insecure_skip_tls_verify: config.insecure_skip_tls_verify,
+            tls_version: config.tls_version.clone(),
+            tls_client_config: build_tls_client_config(config)?,
             http_debug: config.http_debug.clone(),
         };
 
@@ -355,12 +363,15 @@ struct WireMetrics {
 /// successful write. Sits between hyper and the TcpStream so that `sending`
 /// can be measured separately from `waiting` — write completion is observable
 /// even when hyper's `send_request` only resolves on header receipt.
-struct CountingStream {
-    inner: TcpStream,
+struct CountingStream<S> {
+    inner: S,
     metrics: WireMetrics,
 }
 
-impl AsyncWrite for CountingStream {
+impl<S> AsyncWrite for CountingStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -410,7 +421,10 @@ impl AsyncWrite for CountingStream {
     }
 }
 
-impl AsyncRead for CountingStream {
+impl<S> AsyncRead for CountingStream<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -493,13 +507,12 @@ async fn send_once(
 
     let uri: Uri = req.url.parse().context("invalid URL")?;
     let scheme = uri.scheme_str().unwrap_or("http");
-    anyhow::ensure!(
-        scheme == "http",
-        "TLS/HTTPS error: HyperHttpClient supports plain HTTP only (got scheme `{scheme}`); \
-         HTTPS support lands in S7."
-    );
+    let transport = transport_for_scheme(scheme)?;
     let host = uri.host().context("URL missing host")?.to_string();
-    let port = uri.port_u16().unwrap_or(80);
+    let port = uri.port_u16().unwrap_or(match transport {
+        Transport::Http => 80,
+        Transport::Https => 443,
+    });
     let origin_authority = format!("{host}:{port}");
 
     check_blocked_hostname(&client.config, &host)?;
@@ -519,7 +532,7 @@ async fn send_once(
     // populate their own axis without overloading existing semantics — see
     // the type's doc-comment.
     let route_key = RouteKey {
-        transport: Transport::Http,
+        transport,
         target_host: target_host.clone(),
         target_port: port,
         source_ip,
@@ -529,15 +542,17 @@ async fn send_once(
     // Try the pool first. On a hit, `blocked` and `connecting` are 0 — the
     // request reuses an existing TCP connection. On a miss, do the DNS+TCP
     // dance and record real timings for those phases.
-    let (mut pooled, blocked_ms, connecting_ms) = if !client.config.no_connection_reuse {
-        if let Some(p) = client.try_acquire(&route_key) {
-            (p, 0.0, 0.0)
+    let (mut pooled, blocked_ms, connecting_ms, tls_handshaking_ms) =
+        if !client.config.no_connection_reuse {
+            if let Some(p) = client.try_acquire(&route_key) {
+                (p, 0.0, 0.0, 0.0)
+            } else {
+                open_connection(&connect_target, source_ip, transport, &host, &client.config)
+                    .await?
+            }
         } else {
-            open_connection(&connect_target, source_ip, &client.config).await?
-        }
-    } else {
-        open_connection(&connect_target, source_ip, &client.config).await?
-    };
+            open_connection(&connect_target, source_ip, transport, &host, &client.config).await?
+        };
 
     // Snapshot wire counters before this request so the byte counts come out
     // per-request, not cumulative across all requests that used this pooled
@@ -647,7 +662,7 @@ async fn send_once(
     let timings = Timings {
         blocked: blocked_ms,
         connecting: connecting_ms,
-        tls_handshaking: 0.0,
+        tls_handshaking: tls_handshaking_ms,
         sending: sending_ms,
         waiting: waiting_ms,
         receiving: receiving_ms,
@@ -781,6 +796,14 @@ fn proxy_for(config: &HyperConfig, scheme: &str, host: &str) -> Option<ProxyRout
     config.http_proxy.clone()
 }
 
+fn transport_for_scheme(scheme: &str) -> Result<Transport> {
+    match scheme {
+        "http" => Ok(Transport::Http),
+        "https" => Ok(Transport::Https),
+        _ => anyhow::bail!("unsupported URL scheme `{scheme}`"),
+    }
+}
+
 fn no_proxy_matches(patterns: &[String], host: &str) -> bool {
     patterns.iter().any(|pattern| {
         let p = pattern.trim();
@@ -851,8 +874,10 @@ fn hostname_matches(host: &str, pattern: &str) -> bool {
 async fn open_connection(
     target: &ConnectTarget,
     source_ip: Option<IpAddr>,
+    transport: Transport,
+    tls_server_name: &str,
     config: &HyperConfig,
-) -> Result<(PooledConn, f64, f64)> {
+) -> Result<(PooledConn, f64, f64, f64)> {
     let blocked_start = Instant::now();
     let addr = match target {
         ConnectTarget::Ip(addr) => *addr,
@@ -877,12 +902,34 @@ async fn open_connection(
         inner: tcp,
         metrics: wire.clone(),
     };
-    let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-        .await
-        .context("hyper http1 handshake failed")?;
-    let conn_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let (sender, conn_task, tls_handshaking) = match transport {
+        Transport::Http => {
+            let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                .await
+                .context("hyper http1 handshake failed")?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (sender, conn_task, 0.0)
+        }
+        Transport::Https => {
+            let tls_start = Instant::now();
+            let server_name = ServerName::try_from(tls_server_name.to_string())
+                .with_context(|| format!("invalid TLS server name {tls_server_name:?}"))?;
+            let tls_stream = TlsConnector::from(config.tls_client_config.clone())
+                .connect(server_name, stream)
+                .await
+                .context("TLS handshake failed")?;
+            let tls_handshaking = tls_start.elapsed().as_secs_f64() * 1000.0;
+            let (sender, connection) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(tls_stream))
+                .await
+                .context("hyper http1 handshake failed")?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (sender, conn_task, tls_handshaking)
+        }
+    };
 
     let blocked = blocked_done
         .saturating_duration_since(blocked_start)
@@ -901,7 +948,130 @@ async fn open_connection(
         },
         blocked,
         connecting,
+        tls_handshaking,
     ))
+}
+
+fn build_tls_client_config(config: &TestConfig) -> Result<Arc<rustls::ClientConfig>> {
+    let versions = tls_protocol_versions(config.tls_version.as_ref())?;
+    let version_slice = versions.as_deref().unwrap_or(rustls::DEFAULT_VERSIONS);
+    let builder = rustls::ClientConfig::builder_with_provider(rustls_provider())
+        .with_protocol_versions(version_slice)
+        .context("building TLS client protocol versions")?;
+
+    let client_config = if config.insecure_skip_tls_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+
+    Ok(Arc::new(client_config))
+}
+
+fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+fn tls_protocol_versions(
+    tls: Option<&TlsVersionConfig>,
+) -> Result<Option<Vec<&'static rustls::SupportedProtocolVersion>>> {
+    let Some(tls) = tls else {
+        return Ok(None);
+    };
+
+    let min = tls.min.as_deref().and_then(supported_tls_version_rank);
+    let max = tls.max.as_deref().and_then(supported_tls_version_rank);
+
+    if let (Some(min), Some(max)) = (min, max) {
+        anyhow::ensure!(
+            min <= max,
+            "invalid tlsVersion range: min {:?} is greater than max {:?}",
+            tls.min,
+            tls.max
+        );
+    }
+
+    let versions: Vec<&'static rustls::SupportedProtocolVersion> = [
+        (3_u8, &rustls::version::TLS13),
+        (2_u8, &rustls::version::TLS12),
+    ]
+    .into_iter()
+    .filter(|(rank, _)| min.is_none_or(|m| *rank >= m) && max.is_none_or(|m| *rank <= m))
+    .map(|(_, version)| version)
+    .collect();
+
+    if versions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(versions))
+    }
+}
+
+fn supported_tls_version_rank(version: &str) -> Option<u8> {
+    match version {
+        "tls1.2" => Some(2),
+        "tls1.3" => Some(3),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(rustls_provider()))
+    }
+}
+
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 async fn connect_tcp(addr: SocketAddr, source_ip: Option<IpAddr>) -> Result<TcpStream> {
@@ -1013,7 +1183,13 @@ mod tests {
     use axum::Router;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{get, post};
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    const TEST_TLS_CERT_DER_B64: &str = "MIIDJTCCAg2gAwIBAgIUaPczj/t0/C0gODXNAiU8TaDSAgIwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwOTA1MDQzM1oXDTM2MDcwNjA1MDQzM1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArrZWpRB7AesYDV40L/hSV5tNSxZ7GxxcO8hhjsy+9UYka4BnVRCdmkG6J5bt81LARql/ZQAkQ3hb0mosflgqmm6Ht4GGFt32Am31CjR+jVTjCyM5Is4rm+3oTomXl/UKe9KaJkidxtk3VJ58mIt9dP0F/IsP00bxoeAvTGroOGFVorPj2OypxRaU9qaFcvK4/I+eDCJmxT9MV866//AwOiBNth7W+nJkwCEl5wIJkkw5nRQkMWrJyocKPS2+9dhRKp+2CFJ3T8oEkEqDIxr1eLi8n1sV8byH4jhZZp0l4+9MV4AVcnngBFv4Q0SqfKVbs8A4gVge+TDgZmdgDlxGBQIDAQABo28wbTAdBgNVHQ4EFgQUYudNX1WRv3OAB6nPtk+37fVmGjYwHwYDVR0jBBgwFoAUYudNX1WRv3OAB6nPtk+37fVmGjYwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDQYJKoZIhvcNAQELBQADggEBADxaHHJkMN2mMQTokoScJkqk2sbg8eqW+PKcJA7RgjwZbjtp2bg82ctLa1k+5/wH7cqnvh1LOBMb7rtHh5WkE/v/Q1f4oVleV8wSEOjLWbNfvi/OxemTzSBJAzxPzhOGhhzyXiRAAsN3PV/zDTSq3Yb9XBKOtwDOIN70LzLElNnDXqyEFGOp7W7NQWJAUW2GyBc9rhWyxiPQ4oeRCxOZh+CB86jTuVY2NZSkeegF4TALfP6Oo4fznPRDUys0fVgO8Jv+A1+ZqUi7h9QfXbZzgrsPKbVzQkr8HHCkBKXnynyMKbIMGzE2Nt1l/+qwgka/pa0ouB0OpuyEMU+cS5NHXnE=";
+    const TEST_TLS_KEY_DER_B64: &str = "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCutlalEHsB6xgNXjQv+FJXm01LFnsbHFw7yGGOzL71RiRrgGdVEJ2aQbonlu3zUsBGqX9lACRDeFvSaix+WCqaboe3gYYW3fYCbfUKNH6NVOMLIzkiziub7ehOiZeX9Qp70pomSJ3G2TdUnnyYi310/QX8iw/TRvGh4C9Maug4YVWis+PY7KnFFpT2poVy8rj8j54MImbFP0xXzrr/8DA6IE22Htb6cmTAISXnAgmSTDmdFCQxasnKhwo9Lb712FEqn7YIUndPygSQSoMjGvV4uLyfWxXxvIfiOFlmnSXj70xXgBVyeeAEW/hDRKp8pVuzwDiBWB75MOBmZ2AOXEYFAgMBAAECggEAB4Bwy/mfLn/nsns/BmhFMNnMQdMfShS3qSF7fuQvttxiJ/OFfFOQUNVNpvGGGhKNivswKygMZpE+cBR7AJnMioEAdtKq7URukcAi62NBo9PnQ80pYOM1YCag+O5TggTVhGeQkuA/VhBxncKIWwxyQJm0rhlSfqHnMiosHb3hZrpE+m8E+b9nvCTlKSo/VdYSHE0CnNA5OVXb5bHJR/0eBrWdYN6g9MynHLrQQaP5BDgbRaOpoZ8p2AM+hc9O2c5kAIVTyBA51RmV64QaheuUuIVhDFWWVRGrwy84NQx9v1xdYx+iJCD3HU6k+HRgrPEpQ5ptsZZjNOZKP9C1dwWpaQKBgQDkDdkv01NPkqldI7RSMrFHJJula1Xy9cQ0NvOI3vrixZVEl02KXh7IP4teZbMqb949zujbwsp4oQU58QU30zgIGyKxKWBtygGan8ovJBa3PmDUqLA80ibnjEaa9FUzIAQAf+dzcT24EUX6jg71kDQiSa3OjaZ3dHDXNxFqDS6rDwKBgQDEHyJxuSV/uBnEdsCqPKu08sd+MY1+xHcpRaNuX7Gd5EqeRe+Es9VZDlQwQ/iRm4EiZrzoPz9jP/g2dL9772LN+yvXzajnYLfyHir9wDw5fO1S+YVOa3TM1cOVqnBzO8/vpDG3rZ7XI96nXWN0ZOgEZepEeCTv0QgqG5kqP3vNqwKBgQDDqhIO04ymOBoxvGGJKM8rUABu1AHhO/YEKqWWaGHvUUC5oes4bXqRqtuDuVQYc/TFKRJnAuC+0MBwLxegBwwLAGUqhWqjp+7qYHCTM659t/pSWw0ikdgpUBR//GRhQfXNC/Bj/uPKWp+k0l+JVxkz1e1Wy/fog7IRJME/MWI6BwKBgQCRAZQuEX6wWCZ1JHh/ZixutbLakzjTKeARG/Qif46L92dUbtERhQWRuw50QU1gG2H3VY8HCPyNHZcgbGHH+M9NDRD1lpHzwYc/9R5EUAY3Wy790o/F052gdc0Os95A1VCBFx3LeQugdl0B0gLe5FzII7J6vXpR9nPa7lzo59dZ0QKBgQDj+4zksm7lmp9bapd4RXqr3FX6V/tStpHR687r08kLBxmjTC0eDeifnDhqly1IeStcVW3jC8MFa4nUtwAcRwiqFtP185tq8hu7ESL9OuDePve6C7EhDveKup3xXkGqS0N20f/4vvTHo3bFVOCxi/X91N6DqrXOzoZvya8NWnIvMw==";
 
     fn buffered_string(resp: &HttpResponse) -> String {
         match &resp.body {
@@ -1030,6 +1206,53 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    async fn start_tls_fixture() -> String {
+        let cert = CertificateDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_TLS_CERT_DER_B64)
+                .unwrap(),
+        );
+        let key = rustls_pki_types::PrivateKeyDer::try_from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_TLS_KEY_DER_B64)
+                .unwrap(),
+        )
+        .unwrap();
+        let server_config = rustls::ServerConfig::builder_with_provider(rustls_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\ntls-good",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        format!("https://127.0.0.1:{}", addr.port())
     }
 
     #[tokio::test]
@@ -1244,31 +1467,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hyper_client_rejects_https_in_spike_scope() {
+    async fn https_rejects_self_signed_cert_by_default() {
+        let base_url = start_tls_fixture().await;
         let client = HyperHttpClient::new();
         let result = client
             .send(HttpRequest {
                 method: HttpMethod::Get,
-                url: "https://example.com/".to_string(),
+                url: format!("{base_url}/secure"),
                 headers: Vec::new(),
                 body: None,
                 timeout: None,
             })
             .await;
-        // HttpResponse doesn't impl Debug, so use a manual match instead of
-        // expect_err / unwrap_err.
         let err = match result {
-            Ok(_) => panic!("HTTPS must error in the spike"),
+            Ok(_) => panic!("self-signed HTTPS fixture must fail with default verification"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HTTP only"),
-            "error should mention HTTP-only scope; got: {msg}"
+            msg.contains("TLS handshake failed"),
+            "error should retain TLS context; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_insecure_skip_verify_succeeds_and_records_tls_timing() {
+        let base_url = start_tls_fixture().await;
+        let mut config = TestConfig::default();
+        config.insecure_skip_tls_verify = true;
+        let client = HyperHttpClient::from_config(&config).unwrap();
+
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/secure"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(buffered_string(&resp), "tls-good");
+        assert!(
+            resp.timings.tls_handshaking > 0.0,
+            "HTTPS must measure TLS handshaking; got {}",
+            resp.timings.tls_handshaking
         );
         assert!(
-            msg.to_lowercase().contains("tls"),
-            "error should classify as TLS/HTTPS-related; got: {msg}"
+            resp.data_sent > 0,
+            "TLS request must count encrypted wire bytes sent"
+        );
+        assert!(
+            resp.data_received > "tls-good".len() as u64,
+            "TLS response must count encrypted response bytes plus headers"
         );
     }
 
@@ -1291,6 +1544,11 @@ mod tests {
         config.http_debug = Some("full".to_string());
         config.max_redirects = Some(3);
         config.local_ips = vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()];
+        config.insecure_skip_tls_verify = true;
+        config.tls_version = Some(TlsVersionConfig {
+            min: Some("tls1.2".to_string()),
+            max: Some("tls1.3".to_string()),
+        });
 
         let client = HyperHttpClient::from_config(&config).unwrap();
         // S1 fields actively read in S0+S1
@@ -1321,7 +1579,45 @@ mod tests {
         assert_eq!(client.config.hosts.get("svc.local").unwrap(), "127.0.0.1");
         assert_eq!(client.config.max_redirects, 3);
         assert_eq!(client.config.local_ips.len(), 2);
+        assert!(client.config.insecure_skip_tls_verify);
+        assert_eq!(
+            client.config.tls_version.as_ref().unwrap().min.as_deref(),
+            Some("tls1.2")
+        );
         assert_eq!(client.config.http_debug.as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_supported_tls_version_range() {
+        let mut config = TestConfig::default();
+        config.tls_version = Some(TlsVersionConfig {
+            min: Some("tls1.3".to_string()),
+            max: Some("tls1.2".to_string()),
+        });
+
+        let err = match HyperHttpClient::from_config(&config) {
+            Ok(_) => panic!("invalid supported TLS version range must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid tlsVersion range"),
+            "error should mention invalid tlsVersion range; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn tls_version_ignores_rustls_unsupported_legacy_versions_like_reqwest() {
+        let mut config = TestConfig::default();
+        config.tls_version = Some(TlsVersionConfig {
+            min: Some("tls1.0".to_string()),
+            max: Some("tls1.1".to_string()),
+        });
+
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        assert_eq!(
+            client.config.tls_version.as_ref().unwrap().min.as_deref(),
+            Some("tls1.0")
+        );
     }
 
     #[test]
@@ -1534,6 +1830,8 @@ mod tests {
         let result = open_connection(
             &ConnectTarget::Host("127.0.0.1:9".to_string()),
             None,
+            Transport::Http,
+            "127.0.0.1",
             &client.config,
         )
         .await;

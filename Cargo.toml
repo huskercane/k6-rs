@@ -21,6 +21,8 @@ crossbeam-queue = "0.3"
 rquickjs = { version = "0.11", features = ["classes", "properties", "parallel"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+rustls = "0.23"
+rustls-pki-types = "1"
 hdrhistogram = "7"
 base64 = "0.22"
 md-5 = "0.10"
@@ -35,6 +37,7 @@ scraper = "0.22"
 ipnet = "2"
 url = "2"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = "0.26"
 futures-util = "0.3"
 tonic = "0.13"
 prost = "0.13"
@@ -42,6 +45,7 @@ prost-types = "0.13"
 hyper = { version = "1", features = ["server", "http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+webpki-roots = "1"
 snap = "1"
 duckdb = "1"
 csv = "1"

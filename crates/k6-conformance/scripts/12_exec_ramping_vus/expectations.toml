@@ -1,0 +1,28 @@
+[run]
+expected_exit_code = 0
+
+[tolerances]
+# Ramp-shaped VU count → iteration total is the integral of a staged VU curve,
+# rate-limited by the 100ms sleep so it stays a cross-engine signal. After the
+# rounding fix (executor/ramping_vus.rs now rounds the interpolated VU count
+# instead of truncating it) k6-rs runs 147-148 vs upstream 144-145 — ~2% over,
+# stable. This is a closed model, so the count keeps a small timing-dependent
+# component; 0.05 covers the measured spread without masking a real ramp
+# regression (pre-fix it drifted ~12% LOW, far outside this band).
+default_counter = "relative:0.05"
+default_trend = "ignore"
+
+[tolerances.overrides]
+# iterations/http_reqs carry the ramp signal at the tight 0.05 band. data_sent
+# additionally inherits the documented ~5-6 B/request wire-byte accounting
+# offset (see 01_http_get) which compounds with the 2% count spread, so it
+# gets the same 0.10 band the other scripts give it — not a loosening of the
+# ramp check.
+"http_reqs" = { count = "relative:0.05", rate = "ignore" }
+"iterations" = { count = "relative:0.05", rate = "ignore" }
+"data_sent" = { count = "relative:0.10", rate = "ignore" }
+"data_received" = { count = "relative:0.10", rate = "ignore" }
+
+[known_drift]
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
+"vus_max" = "same as vus"

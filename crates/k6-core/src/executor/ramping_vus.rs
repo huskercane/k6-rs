@@ -137,7 +137,13 @@ impl<V: VirtualUser + 'static> RampingVusExecutor<V> {
                 let stage_elapsed = (elapsed - stage_start).as_secs_f64();
                 let progress = stage_elapsed / stage_duration;
 
-                return (from_vus as f64 + (to_vus as f64 - from_vus as f64) * progress) as u32;
+                // Round, don't truncate. `as u32` floors, so a 0→5 ramp held
+                // one VU short for almost the whole ramp (4.9 → 4), costing
+                // VU-seconds and systematically under-running iterations vs
+                // upstream (measured ~12% short). Rounding tracks the intended
+                // linear VU count symmetrically on the way up and down.
+                return (from_vus as f64 + (to_vus as f64 - from_vus as f64) * progress).round()
+                    as u32;
             }
         }
         0

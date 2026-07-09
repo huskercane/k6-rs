@@ -54,6 +54,7 @@ pub struct HttpRequest {
     pub timeout: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
 pub enum HttpMethod {
     Get,
     Post,

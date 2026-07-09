@@ -34,6 +34,8 @@ Status: completed in this branch.
 
 ## Phase 3: Response Semantics
 
+Status: completed in this branch.
+
 8. Redirects: implement `maxRedirects`, including `0` as disabled, with final
    URL preserved in `HttpResponse.url`.
 9. Error behavior: normalize hyper errors so JS classification remains stable

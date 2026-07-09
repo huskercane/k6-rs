@@ -24,7 +24,8 @@
 //!     `http_debug` are wired.
 //!   - `blockHostnames`, `blacklistIPs`, and static `hosts` mappings are
 //!     wired for plain HTTP.
-//!   - No redirects (S8), no local-IP source-bind (S9), no proxy (S10).
+//!   - Redirects and `Connection: close` pooling behavior are wired.
+//!   - No local-IP source-bind (S9), no proxy (S10).
 //!   - Body reader uses a frame loop with cap-then-drain semantics: buffer
 //!     truncates at [`HyperConfig::max_response_body_size`] but the remainder
 //!     of the response is ALWAYS drained to end-of-stream before the pooled
@@ -43,7 +44,7 @@ use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1::{self, SendRequest};
-use hyper::header::{HOST, HeaderValue, USER_AGENT};
+use hyper::header::{CONNECTION, HOST, HeaderValue, LOCATION, USER_AGENT};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -72,6 +73,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default response-body buffer cap, matching reqwest's hardcoded 10 MiB.
 /// Beyond this, the response body is drained but not retained.
 const DEFAULT_MAX_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Reqwest follows up to 10 redirects by default when no explicit
+/// `maxRedirects` option is set.
+const DEFAULT_MAX_REDIRECTS: u32 = 10;
 
 /// Identity of a reusable connection.
 ///
@@ -118,6 +123,25 @@ enum ConnectTarget {
     Ip(SocketAddr),
 }
 
+#[derive(Clone)]
+struct HyperRequest {
+    method: HttpMethod,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+}
+
+impl From<HttpRequest> for HyperRequest {
+    fn from(req: HttpRequest) -> Self {
+        Self {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: req.body,
+        }
+    }
+}
+
 /// Snapshot of every HTTP-shaping knob the hyper client cares about, captured
 /// at [`HyperHttpClient::from_config`] time.
 ///
@@ -146,6 +170,9 @@ struct HyperConfig {
     blacklist_ips: Vec<ipnet::IpNet>,
     block_hostnames: Vec<String>,
     hosts: HashMap<String, String>,
+
+    // Phase 3 — maximum redirects to follow. `0` disables redirects.
+    max_redirects: u32,
 
     // Phase 1 — request/response logging to stderr.
     http_debug: Option<String>,
@@ -209,6 +236,7 @@ impl HyperHttpClient {
             blacklist_ips,
             block_hostnames: config.block_hostnames.clone(),
             hosts: config.hosts.clone(),
+            max_redirects: config.max_redirects.unwrap_or(DEFAULT_MAX_REDIRECTS),
             http_debug: config.http_debug.clone(),
         };
 
@@ -395,13 +423,42 @@ async fn send_inner(
     req: HttpRequest,
     user_agent: HeaderValue,
 ) -> Result<HttpResponse> {
+    let mut current = HyperRequest::from(req);
+    let mut redirects_followed = 0;
+
+    loop {
+        let response = send_once(client, current.clone(), user_agent.clone()).await?;
+        let Some(next_url) = redirect_target(&response, &current.url)? else {
+            return Ok(response);
+        };
+
+        if client.config.max_redirects == 0 {
+            return Ok(response);
+        }
+        if redirects_followed >= client.config.max_redirects {
+            anyhow::bail!(
+                "too many redirects: exceeded maxRedirects={}",
+                client.config.max_redirects
+            );
+        }
+
+        redirects_followed += 1;
+        current = redirected_request(current, next_url, response.status);
+    }
+}
+
+async fn send_once(
+    client: &HyperHttpClient,
+    req: HyperRequest,
+    user_agent: HeaderValue,
+) -> Result<HttpResponse> {
     let start = Instant::now();
 
     let uri: Uri = req.url.parse().context("invalid URL")?;
     let scheme = uri.scheme_str().unwrap_or("http");
     anyhow::ensure!(
         scheme == "http",
-        "HyperHttpClient supports plain HTTP only (got scheme `{scheme}`); \
+        "TLS/HTTPS error: HyperHttpClient supports plain HTTP only (got scheme `{scheme}`); \
          HTTPS support lands in S7."
     );
     let host = uri.host().context("URL missing host")?.to_string();
@@ -495,6 +552,7 @@ async fn send_inner(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+    let should_close = connection_close_requested(&headers);
     debug_response(&client.config, status, &req.url, &headers);
 
     // Read the response body with the cap + drain rule. CRUCIAL: even when
@@ -558,7 +616,7 @@ async fn send_inner(
     // HTTP/1.1 keep-alive. If the server actually sent `Connection: close`,
     // the next caller's send_request will fail and trigger the drop-on-err
     // path above; the pool self-heals one mistake at a time.
-    if client.config.no_connection_reuse {
+    if client.config.no_connection_reuse || should_close {
         drop(pooled);
     } else {
         client.release(route_key, pooled);
@@ -573,6 +631,49 @@ async fn send_inner(
         data_sent: bytes_sent,
         data_received: bytes_received,
     })
+}
+
+fn redirect_target(response: &HttpResponse, base_url: &str) -> Result<Option<String>> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+
+    let Some(location) = header_value(&response.headers, LOCATION.as_str()) else {
+        return Ok(None);
+    };
+    let base = url::Url::parse(base_url).context("parsing redirect base URL")?;
+    let next = base
+        .join(location)
+        .with_context(|| format!("invalid redirect Location {location:?}"))?;
+    Ok(Some(next.to_string()))
+}
+
+fn redirected_request(mut req: HyperRequest, next_url: String, status: u16) -> HyperRequest {
+    if matches!(status, 301 | 302 | 303) && matches!(req.method, HttpMethod::Post) {
+        req.method = HttpMethod::Get;
+        req.body = None;
+        req.headers.retain(|(k, _)| {
+            !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("content-type")
+        });
+    }
+    req.url = next_url;
+    req
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+fn connection_close_requested(headers: &[(String, String)]) -> bool {
+    header_value(headers, CONNECTION.as_str())
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("close"))
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_connect_target(
@@ -769,7 +870,7 @@ fn hyper_method(m: &HttpMethod) -> Method {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{get, post};
     use tokio::net::TcpListener;
 
@@ -1024,6 +1125,10 @@ mod tests {
             msg.contains("HTTP only"),
             "error should mention HTTP-only scope; got: {msg}"
         );
+        assert!(
+            msg.to_lowercase().contains("tls"),
+            "error should classify as TLS/HTTPS-related; got: {msg}"
+        );
     }
 
     // ── S0+S1 regression tests ─────────────────────────────────────────────
@@ -1043,6 +1148,7 @@ mod tests {
             .hosts
             .insert("svc.local".to_string(), "127.0.0.1".to_string());
         config.http_debug = Some("full".to_string());
+        config.max_redirects = Some(3);
 
         let client = HyperHttpClient::from_config(&config).unwrap();
         // S1 fields actively read in S0+S1
@@ -1071,6 +1177,7 @@ mod tests {
             vec!["*.internal".to_string()]
         );
         assert_eq!(client.config.hosts.get("svc.local").unwrap(), "127.0.0.1");
+        assert_eq!(client.config.max_redirects, 3);
         assert_eq!(client.config.http_debug.as_deref(), Some("full"));
     }
 
@@ -1315,6 +1422,133 @@ mod tests {
             .unwrap();
 
         assert_eq!(buffered_string(&resp), format!("mapped.test:{port}"));
+    }
+
+    #[tokio::test]
+    async fn redirects_follow_location_and_return_final_url() {
+        let base_url = start_app(
+            Router::new()
+                .route(
+                    "/start",
+                    get(|| async {
+                        (
+                            StatusCode::FOUND,
+                            [(LOCATION.as_str(), "/final")],
+                            "redirecting",
+                        )
+                    }),
+                )
+                .route("/final", get(|| async { "done" })),
+        )
+        .await;
+
+        let client = HyperHttpClient::new();
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/start"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.url, format!("{base_url}/final"));
+        assert_eq!(buffered_string(&resp), "done");
+    }
+
+    #[tokio::test]
+    async fn max_redirects_zero_returns_redirect_response() {
+        let base_url = start_app(Router::new().route(
+            "/start",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(LOCATION.as_str(), "/final")],
+                    "redirecting",
+                )
+            }),
+        ))
+        .await;
+
+        let mut config = TestConfig::default();
+        config.max_redirects = Some(0);
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let resp = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/start"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.url, format!("{base_url}/start"));
+        assert_eq!(buffered_string(&resp), "redirecting");
+    }
+
+    #[tokio::test]
+    async fn too_many_redirects_errors() {
+        let base_url = start_app(Router::new().route(
+            "/loop",
+            get(|| async { (StatusCode::FOUND, [(LOCATION.as_str(), "/loop")], "loop") }),
+        ))
+        .await;
+
+        let mut config = TestConfig::default();
+        config.max_redirects = Some(1);
+        let client = HyperHttpClient::from_config(&config).unwrap();
+        let result = client
+            .send(HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{base_url}/loop"),
+                headers: Vec::new(),
+                body: None,
+                timeout: None,
+            })
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("redirect loop must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("too many redirects"),
+            "error should mention redirect limit; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_close_response_is_not_repooled() {
+        let base_url = start_app(Router::new().route(
+            "/close",
+            get(|| async { (StatusCode::OK, [(CONNECTION.as_str(), "close")], "ok") }),
+        ))
+        .await;
+
+        let client = HyperHttpClient::new();
+        let url = format!("{base_url}/close");
+        let req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+
+        let r1 = client.send(req()).await.unwrap();
+        let r2 = client.send(req()).await.unwrap();
+
+        assert_eq!(r1.status, 200);
+        assert!(
+            r2.timings.connecting > 0.0,
+            "second request must open a new connection after Connection: close"
+        );
     }
 
     /// S0 — RouteKey shape is the load-bearing identity for the pool. Each

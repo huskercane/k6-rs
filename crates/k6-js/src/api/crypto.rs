@@ -1,7 +1,7 @@
 use anyhow::Result;
-use digest::Digest;
+use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
-use rand::Rng;
+use rand::RngExt;
 use rquickjs::{Ctx, Function};
 
 fn hex_hash<D: Digest>(input: &[u8]) -> String {

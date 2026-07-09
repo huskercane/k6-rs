@@ -1,7 +1,7 @@
 //! Prometheus remote write output plugin.
 //!
 //! Usage: `--out prometheus=http://localhost:9090/api/v1/write`
-//! Converts k6 metrics to Prometheus time series and buffers for remote write.
+//! Converts k6 metrics to Prometheus time series and buffers for remote writing.
 
 use super::{MetricValue, Output, snapshot_to_samples};
 use crate::metrics::MetricsSnapshot;
@@ -44,7 +44,7 @@ impl Output for PrometheusOutput {
         let timestamp_ms = (elapsed_secs * 1000.0) as i64;
 
         for sample in &samples {
-            let mut labels: Vec<(String, String)> = sample
+            let labels: Vec<(String, String)> = sample
                 .tags
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -133,7 +133,7 @@ impl Output for PrometheusOutput {
     }
 
     fn description(&self) -> String {
-        format!("prometheus ({})", self.url)
+        format!("Prometheus ({})", self.url)
     }
 }
 

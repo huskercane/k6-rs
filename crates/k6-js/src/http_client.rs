@@ -11,7 +11,7 @@ use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, Respons
 
 /// Production HTTP client backed by reqwest.
 ///
-/// Uses a shared connection pool. Clone is cheap (internally Arc'd).
+/// Uses a shared connection pool. Clone is inexpensive (internally Arc'd).
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
     client: reqwest::Client,
@@ -21,10 +21,10 @@ pub struct ReqwestHttpClient {
     discard_response_bodies: bool,
     max_response_body_size: usize,
     http_debug: Option<String>,
-    throw: bool,
+    _should_throw: bool,
     blacklist_ips: Vec<ipnet::IpNet>,
     block_hostnames: Vec<String>,
-    hosts: HashMap<String, String>,
+    _hosts: HashMap<String, String>,
 }
 
 struct LocalIpPool {
@@ -53,10 +53,10 @@ impl ReqwestHttpClient {
             discard_response_bodies,
             max_response_body_size: 10 * 1024 * 1024,
             http_debug: None,
-            throw: false,
+            _should_throw: false,
             blacklist_ips: Vec::new(),
             block_hostnames: Vec::new(),
-            hosts: HashMap::new(),
+            _hosts: HashMap::new(),
         })
     }
 
@@ -169,10 +169,10 @@ impl ReqwestHttpClient {
             discard_response_bodies: config.discard_response_bodies,
             max_response_body_size: 10 * 1024 * 1024,
             http_debug: config.http_debug.clone(),
-            throw: config.throw,
+            _should_throw: config.throw,
             blacklist_ips,
             block_hostnames: config.block_hostnames.clone(),
-            hosts: config.hosts.clone(),
+            _hosts: config.hosts.clone(),
         })
     }
 
@@ -487,10 +487,10 @@ mod tests {
             discard_response_bodies: false,
             max_response_body_size: 10 * 1024 * 1024,
             http_debug: None,
-            throw: false,
+            _should_throw: false,
             blacklist_ips: Vec::new(),
             block_hostnames: vec!["*.internal.com".to_string()],
-            hosts: HashMap::new(),
+            _hosts: HashMap::new(),
         };
 
         assert!(
@@ -509,10 +509,10 @@ mod tests {
             discard_response_bodies: false,
             max_response_body_size: 10 * 1024 * 1024,
             http_debug: None,
-            throw: false,
+            _should_throw: false,
             blacklist_ips: vec!["10.0.0.0/8".parse().unwrap()],
             block_hostnames: Vec::new(),
-            hosts: HashMap::new(),
+            _hosts: HashMap::new(),
         };
 
         assert!(client.check_blocked("http://10.1.2.3/path").is_err());
@@ -541,7 +541,7 @@ mod tests {
 
         let client = ReqwestHttpClient::from_config(&config).unwrap();
         assert_eq!(client.http_debug, Some("full".to_string()));
-        assert!(client.throw);
+        assert!(client._should_throw);
     }
 
     /// Regression for bug (a): `sending` was being computed as

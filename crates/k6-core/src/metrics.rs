@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1593,7 +1593,7 @@ mod tests {
         reg.rate_add_tagged("http_req_failed", true, &tags);
         reg.rate_add_tagged("http_req_failed", false, &tags);
 
-        let (_, passes, total) = reg.rate_get("http_req_failed");
+        let (_, _passes, total) = reg.rate_get("http_req_failed");
         assert_eq!(total, 2);
 
         let (_, tagged_passes, tagged_total) = reg.rate_get("http_req_failed{scenario:api}");

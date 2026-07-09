@@ -9,7 +9,7 @@ use crate::metrics::MetricsSnapshot;
 pub struct InfluxDbOutput {
     base_url: String,
     database: String,
-    write_url: String,
+    _write_url: String,
     buffer: Vec<String>,
 }
 
@@ -35,7 +35,7 @@ impl InfluxDbOutput {
         Ok(Self {
             base_url,
             database,
-            write_url,
+            _write_url: write_url,
             buffer: Vec::new(),
         })
     }

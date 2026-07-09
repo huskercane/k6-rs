@@ -127,7 +127,7 @@ fn resolve_commands(
 /// immediately with EOF instead of hanging the test run. A 30-second timeout
 /// acts as a safety net for any other blocking scenario.
 fn shell_exec(cmd: &str) -> Result<String> {
-    let mut child = if cfg!(target_os = "windows") {
+    let child = if cfg!(target_os = "windows") {
         Command::new("cmd")
             .args(["/C", cmd])
             .stdin(Stdio::null())

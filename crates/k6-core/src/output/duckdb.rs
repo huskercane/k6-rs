@@ -76,7 +76,7 @@ impl Output for DuckDbOutput {
                 }
                 MetricValue::Rate {
                     rate,
-                    passes,
+                    passes: _passes,
                     total,
                 } => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *total, *rate),
                 MetricValue::Trend {

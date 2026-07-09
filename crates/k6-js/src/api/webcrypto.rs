@@ -1,4 +1,5 @@
 use anyhow::Result;
+use digest::KeyInit;
 use hmac::{Hmac, Mac};
 use rquickjs::{Ctx, Function};
 use sha2::Digest;
@@ -52,7 +53,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
     globals.set(
         "__wc_random_bytes",
         Function::new(ctx.clone(), |count: usize| -> String {
-            use rand::Rng;
+            use rand::RngExt;
             let mut rng = rand::rng();
             let bytes: Vec<u8> = (0..count).map(|_| rng.random()).collect();
             hex_encode(&bytes)
@@ -216,7 +217,13 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                         &format!("AES-GCM key error: {e}"),
                     )
                 })?;
-                let nonce = Nonce::from_slice(&iv_bytes);
+                let nonce: &Nonce<_> = (&iv_bytes[..]).try_into().map_err(|e| {
+                    rquickjs::Error::new_from_js_message(
+                        "string",
+                        "string",
+                        &format!("AES-GCM nonce error: {e}"),
+                    )
+                })?;
                 let ciphertext = cipher.encrypt(nonce, data.as_ref()).map_err(|e| {
                     rquickjs::Error::new_from_js_message(
                         "string",
@@ -247,7 +254,13 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                         &format!("AES-GCM key error: {e}"),
                     )
                 })?;
-                let nonce = Nonce::from_slice(&iv_bytes);
+                let nonce: &Nonce<_> = (&iv_bytes[..]).try_into().map_err(|e| {
+                    rquickjs::Error::new_from_js_message(
+                        "string",
+                        "string",
+                        &format!("AES-GCM nonce error: {e}"),
+                    )
+                })?;
                 let plaintext = cipher.decrypt(nonce, data.as_ref()).map_err(|e| {
                     rquickjs::Error::new_from_js_message(
                         "string",
@@ -266,7 +279,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+                use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
                 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
@@ -280,7 +293,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             &format!("AES-CBC key error: {e}"),
                         )
                     })?;
-                let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(&data);
+                let ciphertext = encryptor.encrypt_padded_vec::<Pkcs7>(&data);
                 Ok(hex_encode(&ciphertext))
             },
         )?,
@@ -292,7 +305,7 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |key_hex: String, iv_hex: String, data_hex: String| -> rquickjs::Result<String> {
-                use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+                use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
                 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
                 let key_bytes = hex_decode(&key_hex);
                 let iv_bytes = hex_decode(&iv_hex);
@@ -306,15 +319,13 @@ pub fn register(ctx: &Ctx<'_>) -> Result<()> {
                             &format!("AES-CBC key error: {e}"),
                         )
                     })?;
-                let plaintext = decryptor
-                    .decrypt_padded_vec_mut::<Pkcs7>(&mut data.clone())
-                    .map_err(|e| {
-                        rquickjs::Error::new_from_js_message(
-                            "string",
-                            "string",
-                            &format!("AES-CBC decrypt error: {e}"),
-                        )
-                    })?;
+                let plaintext = decryptor.decrypt_padded_vec::<Pkcs7>(&data).map_err(|e| {
+                    rquickjs::Error::new_from_js_message(
+                        "string",
+                        "string",
+                        &format!("AES-CBC decrypt error: {e}"),
+                    )
+                })?;
                 Ok(hex_encode(&plaintext))
             },
         )?,

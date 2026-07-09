@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,6 +13,80 @@ struct JsGrpcResponse {
     status: i32,
     message: Option<serde_json::Value>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProstCodec<T, U> {
+    _pd: PhantomData<(T, U)>,
+}
+
+impl<T, U> Default for ProstCodec<T, U> {
+    fn default() -> Self {
+        Self { _pd: PhantomData }
+    }
+}
+
+impl<T, U> tonic::codec::Codec for ProstCodec<T, U>
+where
+    T: prost::Message + Send + 'static,
+    U: prost::Message + Default + Send + 'static,
+{
+    type Encode = T;
+    type Decode = U;
+    type Encoder = ProstEncoder<T>;
+    type Decoder = ProstDecoder<U>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        ProstEncoder { _pd: PhantomData }
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ProstDecoder { _pd: PhantomData }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProstEncoder<T> {
+    _pd: PhantomData<T>,
+}
+
+impl<T> tonic::codec::Encoder for ProstEncoder<T>
+where
+    T: prost::Message,
+{
+    type Item = T;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        item.encode(dst)
+            .map_err(|err| tonic::Status::internal(err.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProstDecoder<U> {
+    _pd: PhantomData<U>,
+}
+
+impl<U> tonic::codec::Decoder for ProstDecoder<U>
+where
+    U: prost::Message + Default,
+{
+    type Item = U;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        prost::Message::decode(src)
+            .map(Some)
+            .map_err(|err| tonic::Status::internal(err.to_string()))
+    }
 }
 
 impl<'js> IntoJs<'js> for JsGrpcResponse {
@@ -80,7 +155,7 @@ fn serde_json_to_js<'js>(ctx: &Ctx<'js>, val: &serde_json::Value) -> rquickjs::R
 ///
 /// Also provides status codes: `grpc.StatusOK`, `grpc.StatusCancelled`, etc.
 pub fn register(
-    ctx: &rquickjs::Ctx<'_>,
+    ctx: &Ctx<'_>,
     handle: tokio::runtime::Handle,
     metrics: Option<BuiltinMetrics>,
 ) -> Result<()> {
@@ -181,7 +256,7 @@ pub fn register(
 }
 
 struct GrpcConnection {
-    endpoint: String,
+    _endpoint: String,
     channel: tonic::transport::Channel,
     metadata: HashMap<String, String>,
 }
@@ -231,7 +306,7 @@ async fn grpc_connect_impl(
         map.insert(
             conn_id.clone(),
             GrpcConnection {
-                endpoint,
+                _endpoint: endpoint,
                 channel,
                 metadata,
             },
@@ -249,8 +324,6 @@ async fn grpc_invoke_impl(
     connections: Arc<Mutex<HashMap<String, GrpcConnection>>>,
     metrics: Option<&BuiltinMetrics>,
 ) -> Result<JsGrpcResponse> {
-    use tonic::codec::ProstCodec;
-
     let (channel, default_metadata) = {
         let map = connections.lock().unwrap();
         let conn = map
@@ -274,8 +347,7 @@ async fn grpc_invoke_impl(
     for (k, v) in &default_metadata {
         if let Ok(val) = v.parse() {
             let _ = meta.insert(
-                k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
-                    .unwrap(),
+                k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()?,
                 val,
             );
         }
@@ -287,18 +359,13 @@ async fn grpc_invoke_impl(
             for (k, v) in &call_meta {
                 if let Ok(val) = v.parse() {
                     let _ = meta.insert(
-                        k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
-                            .unwrap(),
+                        k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()?,
                         val,
                     );
                 }
             }
         }
     }
-
-    // Encode request as raw bytes (JSON → prost_types::Struct → bytes)
-    // For generic gRPC invocation, we send raw bytes
-    let request_bytes = request_json.as_bytes().to_vec();
 
     // Create a generic gRPC client
     let mut client = tonic::client::Grpc::new(channel);

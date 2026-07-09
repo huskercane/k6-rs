@@ -434,6 +434,13 @@ async fn run_test(
     // rates collapse to 0. Without this, a rate-based abort threshold
     // like `http_reqs: 'rate<1'` would always see rate=0 mid-run and
     // either spuriously pass or spuriously fail depending on direction.
+    //
+    // NOTE: mid-run this deliberately stays wall-clock (eval_start ==
+    // test_start), unlike the end-of-test summary which divides by the
+    // execution window (exec_duration). The gap between them is the one-time
+    // VU/runtime-init overhead, negligible against any mid-run elapsed
+    // (>=1s here, since the first tick is skipped), so rate-based abort
+    // thresholds are unaffected.
     if !cli.no_thresholds
         && test_config
             .thresholds
@@ -523,6 +530,16 @@ async fn run_test(
                 })
                 .collect()
         };
+
+    // Accumulated executor execution window, used as the counter-rate
+    // denominator (and reported test-run duration) below. This is the sum of
+    // each executor's own active run time (RunSummary.duration), which starts
+    // only once iterations begin scheduling — it excludes VU/QuickJS-runtime
+    // init and setup/teardown. It matches upstream's TestRunDuration
+    // (MarkStarted-after-init .. MarkEnded-after-teardown) far better than
+    // test_start.elapsed(), whose init/teardown overhead made k6-rs counter
+    // rates read ~20-50x too low on short runs.
+    let mut exec_duration = std::time::Duration::ZERO;
 
     // Run each scenario
     for (name, scenario) in &test_config.scenarios {
@@ -629,6 +646,8 @@ async fn run_test(
             }
         };
 
+        exec_duration += summary.duration;
+
         eprintln!(
             "  scenario {name}: {} iterations in {:?}",
             summary.iterations_completed, summary.duration
@@ -640,10 +659,13 @@ async fn run_test(
             );
         }
 
-        // Push snapshot to output plugins after each scenario
+        // Push snapshot to output plugins after each scenario. The snapshot's
+        // rate denominator uses the accumulated execution window (consistent
+        // with the end-of-test summary); the plugin's `elapsed` timestamp
+        // stays wall-clock since it marks when the batch was emitted.
         if !output_plugins.is_empty() {
             let elapsed = test_start.elapsed().as_secs_f64();
-            let snap = metrics.registry.snapshot(elapsed);
+            let snap = metrics.registry.snapshot(exec_duration.as_secs_f64());
             for plugin in &mut output_plugins {
                 if let Err(e) = plugin.add_snapshot(&snap, elapsed) {
                     eprintln!("  warning: output plugin error: {e}");
@@ -676,8 +698,12 @@ async fn run_test(
         }
     }
 
-    // End-of-test summary
-    let total_duration = test_start.elapsed();
+    // End-of-test summary. The rate denominator (and the reported test-run
+    // duration) is the execution window accumulated above, NOT
+    // test_start.elapsed(): wall-clock includes VU/QuickJS-runtime init and
+    // teardown, which upstream excludes from TestRunDuration. Dividing by
+    // wall-clock made k6-rs counter rates read ~20-50x too low on short tests.
+    let total_duration = exec_duration;
     let snapshot = metrics.registry.snapshot(total_duration.as_secs_f64());
 
     // Evaluate thresholds (unless --no-thresholds)

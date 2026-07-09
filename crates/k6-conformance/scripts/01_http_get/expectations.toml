@@ -18,20 +18,24 @@ default_counter = "exact"
 default_trend = "ignore"
 
 [tolerances.overrides]
-# `rate = "ignore"` is NOT noise-hiding: it silences a large, CONSISTENT,
-# structural discrepancy in how the two engines compute a counter's per-second
-# rate. Measured on this script (labeled, both engines): upstream reports
-# ~3600-13500 http_reqs/s vs k6-rs ~166-276/s — k6-rs is ~20-50x LOWER on
-# IDENTICAL counts, every run. Cause: the rate denominator differs — k6-rs
-# divides by full wall-clock incl. VU/runtime init + teardown (test_start
-# .elapsed(), ~36-55ms), upstream by the tight execution window (MarkStarted
-# after init -> MarkEnded after teardown, ~0.7-3ms). Fix scoped: feed the
-# executor's own RunSummary.duration to snapshot() instead of wall-clock.
-# Until then `ignore` is the only per-field lever (metric-level known_drift
-# would also drop the `count = exact` parity we rely on). Counts carry the
-# real signal. NOTE: even after the fix, sub-ms local windows stay jittery
-# (upstream itself swings 3600->13500/s), so rate becomes a moderate relative
-# band, not exact.
+# `rate = "ignore"` retained, but the reason has SHRUNK after the denominator
+# fix. Originally the rate denominator was structurally wrong: k6-rs divided by
+# full wall-clock incl. VU/runtime init + teardown (test_start.elapsed()),
+# upstream by the tight execution window (MarkStarted-after-init .. MarkEnded).
+# That made k6-rs rates read ~20-50x too low. Fixed in main.rs by dividing by
+# the accumulated executor RunSummary.duration (the real execution window);
+# labeled drift on this script dropped from ~95% to ~70%.
+# The ~70% RESIDUAL is NOT a denominator bug — it's genuine per-iteration
+# overhead: on a trivial 10-iteration localhost loop k6-rs runs ~1ms/iter vs
+# upstream ~0.25ms/iter (QuickJS vs Go), so k6-rs's execution window is ~4x
+# longer and its rate ~4x lower. This is the SAME micro-overhead that keeps the
+# trend metrics ignored, and it vanishes under real network latency (measured:
+# both engines ~230 req/s at ~42ms/req). Sub-ms windows are also jittery
+# (upstream swings 3600->4100/s run-to-run). So rate stays `ignore` on this
+# micro-script; gate rate on a longer-duration script where per-iteration
+# overhead is amortized. `ignore` remains the only per-field lever (metric-
+# level known_drift would also drop the `count = exact` parity). Counts carry
+# the real signal.
 "http_reqs" = { count = "exact", rate = "ignore" }
 "iterations" = { count = "exact", rate = "ignore" }
 # data_sent count band admits a DETERMINISTIC offset, not slop: k6-rs counts

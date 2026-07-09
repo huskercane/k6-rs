@@ -109,20 +109,23 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                 move |method: String,
                       url: String,
                       body: rquickjs::Value<'_>,
-                      headers_json: String,
+                      headers_val: rquickjs::Value<'_>,
                       timeout_ms: f64,
-                      tags_json: String|
+                      tags_val: rquickjs::Value<'_>|
                       -> rquickjs::Result<JsHttpResponse> {
-                    let headers: Vec<(String, String)> =
-                        serde_json::from_str(&headers_json).unwrap_or_default();
+                    // Headers and tags arrive as native JS objects and are
+                    // iterated directly, avoiding a per-request
+                    // `JSON.stringify` (JS side) + `serde_json::from_str`
+                    // (Rust side) round-trip that ran even for the common
+                    // no-headers/no-tags `http.get(url)` case.
+                    let headers = object_entries_to_pairs(&headers_val);
                     // CG-3: user-provided `tags: { k: v }` flows through to
                     // the metric sample tagging. Combined with the system
                     // tags below (status, method) the engine can store one
                     // submetric per unique full-tag combination, which
                     // makes thresholds like `http_req_duration{name:X,
                     // status:200}` work as users expect.
-                    let user_tags: Vec<(String, String)> =
-                        serde_json::from_str(&tags_json).unwrap_or_default();
+                    let user_tags = object_entries_to_pairs(&tags_val);
                     let timeout = if timeout_ms > 0.0 {
                         Some(std::time::Duration::from_millis(timeout_ms as u64))
                     } else {
@@ -162,7 +165,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                     });
 
                     match result {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             if let Some(ref m) = metrics {
                                 // Default expected-statuses semantics: status
                                 // is "expected" iff it falls in upstream's
@@ -203,10 +206,19 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                                 m.record_data_received(resp.data_received);
                             }
 
-                            let body_str = match &resp.body {
-                                ResponseBody::Buffered(b) => String::from_utf8_lossy(b).to_string(),
-                                ResponseBody::Discarded => String::new(),
-                            };
+                            // Move the buffered bytes out and decode in place:
+                            // `String::from_utf8` consumes the Vec with no copy
+                            // on the valid-UTF-8 fast path (the overwhelming
+                            // common case), only falling back to a lossy copy
+                            // when the body contains invalid UTF-8.
+                            let body_str =
+                                match std::mem::replace(&mut resp.body, ResponseBody::Discarded) {
+                                    ResponseBody::Buffered(b) => String::from_utf8(b)
+                                        .unwrap_or_else(|e| {
+                                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                                        }),
+                                    ResponseBody::Discarded => String::new(),
+                                };
 
                             Ok(JsHttpResponse {
                                 status: resp.status,
@@ -352,16 +364,17 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                             (allHeaders['Cookie'] ? '; ' : '') + parts.join('; ');
                     }
                 }
-                const headers = JSON.stringify(Object.entries(allHeaders));
                 const bodyArg = (typeof body === 'object' && body !== null) ? JSON.stringify(body) : (body || null);
                 const timeoutMs = (params && params.timeout) ? Number(params.timeout) : 0;
                 // CG-3: forward user-provided `tags: { k: v }` so the engine
                 // can attach them to http metric samples and store the full
-                // tag combination.
-                const tagsJson = (params && params.tags && typeof params.tags === 'object')
-                    ? JSON.stringify(Object.entries(params.tags))
-                    : '[]';
-                const responseObj = __http_request(method, url, bodyArg, headers, timeoutMs, tagsJson);
+                // tag combination. Headers and tags are passed as native
+                // objects (not JSON strings); the Rust side iterates them
+                // directly, avoiding a stringify + parse round-trip per request.
+                const tagsArg = (params && params.tags && typeof params.tags === 'object')
+                    ? params.tags
+                    : null;
+                const responseObj = __http_request(method, url, bodyArg, allHeaders, timeoutMs, tagsArg);
                 return __wrap_response(responseObj);
             },
             get: function(url, params) {
@@ -442,6 +455,23 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
     "##)?;
 
     Ok(())
+}
+
+/// Collect a JS object's own enumerable string-valued entries into pairs,
+/// preserving enumeration order.
+///
+/// Used for both request headers and user tags on the request hot path. A
+/// non-object value (`undefined`/`null`, e.g. `http.get(url)` with no params)
+/// yields no pairs. Entries whose value is not a JS string are skipped, which
+/// closely matches the prior
+/// `serde_json::from_str::<Vec<(String, String)>>(...).unwrap_or_default()`
+/// contract (where a non-string value made the whole parse fail) while
+/// avoiding the `JSON.stringify` + parse round-trip entirely.
+fn object_entries_to_pairs(value: &Value<'_>) -> Vec<(String, String)> {
+    match value.as_object() {
+        Some(obj) => obj.props::<String, String>().flatten().collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Build a native JS object for response headers, coalescing duplicates into arrays.
@@ -571,6 +601,32 @@ mod tests {
         }
     }
 
+    /// Mock that records the request headers it received, so tests can assert
+    /// the JS->Rust request bridge forwards headers through the native
+    /// object-passing path (no JSON round-trip).
+    struct MockHttpClientCapture {
+        last_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl HttpClient for MockHttpClientCapture {
+        fn send(
+            &self,
+            req: HttpRequest,
+        ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+            *self.last_headers.lock().unwrap() = req.headers.clone();
+            let resp = HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: ResponseBody::Buffered(b"{}".to_vec()),
+                timings: Timings::default(),
+                url: "http://mock.test".to_string(),
+                data_sent: 0,
+                data_received: 0,
+            };
+            async move { Ok(resp) }
+        }
+    }
+
     // All HTTP tests run in spawn_blocking to simulate real VU execution
     // (block_on requires not being on an async thread).
 
@@ -640,6 +696,81 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_request_forwards_headers_natively() {
+        // Regression-locks the native header-passing bridge: custom request
+        // headers built in JS must reach the HttpClient. Previously these were
+        // JSON.stringify'd in JS and parsed back in Rust; now the object is
+        // iterated directly, so a broken iteration would silently drop them.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = Arc::new(MockHttpClientCapture {
+                last_headers: captured.clone(),
+            });
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let status: i32 = ctx
+                    .eval(
+                        r#"
+                        http.get('http://example.com', {
+                            headers: { 'Authorization': 'Bearer token123', 'X-Trace': 'abc' }
+                        }).status
+                    "#,
+                    )
+                    .unwrap();
+                assert_eq!(status, 200);
+            });
+
+            let headers = captured.lock().unwrap().clone();
+            assert!(
+                headers
+                    .iter()
+                    .any(|(k, v)| k == "Authorization" && v == "Bearer token123"),
+                "expected Authorization header to reach client, got {headers:?}"
+            );
+            assert!(
+                headers.iter().any(|(k, v)| k == "X-Trace" && v == "abc"),
+                "expected X-Trace header to reach client, got {headers:?}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_entries_to_pairs_semantics() {
+        // Locks the contract the request bridge relies on: an object yields its
+        // string entries in order, a non-object (undefined/null) yields none,
+        // and non-string values are skipped rather than aborting the whole set.
+        let rt = runtime::create_runtime().unwrap();
+        let ctx = runtime::create_context(&rt).unwrap();
+        ctx.with(|ctx| {
+            let obj: Value = ctx.eval("({a:'1', b:'2'})").unwrap();
+            assert_eq!(
+                object_entries_to_pairs(&obj),
+                vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+            );
+
+            let null_val: Value = ctx.eval("null").unwrap();
+            assert!(object_entries_to_pairs(&null_val).is_empty());
+
+            let undef: Value = ctx.eval("undefined").unwrap();
+            assert!(object_entries_to_pairs(&undef).is_empty());
+
+            // A numeric value is skipped; the string entry still comes through.
+            let mixed: Value = ctx.eval("({a:'1', n:5})").unwrap();
+            assert_eq!(
+                object_entries_to_pairs(&mixed),
+                vec![("a".to_string(), "1".to_string())]
+            );
+        });
     }
 
     #[tokio::test]

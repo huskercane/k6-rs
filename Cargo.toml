@@ -55,3 +55,5 @@ aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 pbkdf2 = "0.12"
+criterion = { version = "0.5", features = ["html_reports"] }
+axum = "0.8"

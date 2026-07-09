@@ -18,6 +18,7 @@ use crate::report::ScriptReport;
 pub struct Config {
     pub upstream_bin: String,
     pub k6rs_bin: String,
+    pub k6rs_http_client: String,
     pub scripts_dir: PathBuf,
     pub filter: Option<String>,
     /// CG-6 — when set, write a structured JSON report to this path.
@@ -100,6 +101,7 @@ async fn run_one(cfg: &Config, script: &ScriptDef) -> Result<ScriptReport> {
         &exp,
         workdir.path(),
         "upstream",
+        None,
     )
     .await?;
     let k6rs_artifacts = invoke_against_fresh_fixture(
@@ -108,6 +110,7 @@ async fn run_one(cfg: &Config, script: &ScriptDef) -> Result<ScriptReport> {
         &exp,
         workdir.path(),
         "k6rs",
+        Some(cfg.k6rs_http_client.as_str()),
     )
     .await?;
 
@@ -169,6 +172,7 @@ async fn invoke_against_fresh_fixture(
     exp: &Expectations,
     workdir: &Path,
     tag: &str,
+    k6rs_http_client: Option<&str>,
 ) -> Result<RunArtifacts> {
     let fixture = HttpFixture::start().await?;
     let url = fixture.base_url.clone();
@@ -177,9 +181,18 @@ async fn invoke_against_fresh_fixture(
     let script = script.to_path_buf();
     let workdir = workdir.to_path_buf();
     let tag = tag.to_string();
+    let k6rs_http_client = k6rs_http_client.map(str::to_string);
     let exp = exp.clone();
     let artifacts = tokio::task::spawn_blocking(move || {
-        invoke_binary(&bin, &script, &url, &workdir, &tag, &exp)
+        invoke_binary(
+            &bin,
+            &script,
+            &url,
+            &workdir,
+            &tag,
+            &exp,
+            k6rs_http_client.as_deref(),
+        )
     })
     .await
     .context("subprocess task panicked")??;
@@ -194,6 +207,7 @@ fn invoke_binary(
     workdir: &Path,
     tag: &str,
     exp: &Expectations,
+    k6rs_http_client: Option<&str>,
 ) -> Result<RunArtifacts> {
     let out_json = workdir.join(format!("{tag}.out.json"));
     let summary_export = workdir.join(format!("{tag}.summary.json"));
@@ -226,12 +240,12 @@ fn invoke_binary(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
-    // Tell k6-rs to use the (b)-spike hyper-level client. Upstream k6
-    // ignores unrecognised env vars, so this is safe for both binaries.
-    // The hyper client gives us DNS/TCP/sending phase timings and exact
-    // wire-byte counts that the reqwest path can't see.
+    // Select which k6-rs HTTP backend this conformance pass exercises.
+    // Upstream k6 never receives this env var.
     if tag == "k6rs" {
-        cmd.env("K6RS_HTTP_CLIENT", "hyper");
+        if let Some(client) = k6rs_http_client {
+            cmd.env("K6RS_HTTP_CLIENT", client);
+        }
     }
 
     let status = cmd.status().with_context(|| format!("spawning {bin}"))?;

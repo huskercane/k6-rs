@@ -360,16 +360,18 @@ async fn run_test(
     print_banner(&test_config, script_path, &output_plugins);
 
     // Create HTTP client and shared metrics.
-    // K6RS_HTTP_CLIENT=hyper switches to the hyper-level client, which
-    // captures DNS/TCP/sending phase timings and exact wire-byte counts
-    // that the high-level reqwest API can't surface. Reqwest stays the
-    // default; the hyper path is plain-HTTP-only until S7 lands HTTPS.
-    let use_hyper_client = std::env::var("K6RS_HTTP_CLIENT").as_deref() == Ok("hyper");
-    let client = Arc::new(if use_hyper_client {
-        eprintln!("  http client: hyper (plain HTTP only — HTTPS lands in S7)");
-        AnyHttpClient::Hyper(HyperHttpClient::from_config(&test_config)?)
-    } else {
+    // The hyper-level client is the default: it captures DNS/TCP/sending
+    // phase timings and exact wire-byte counts that reqwest's high-level
+    // API can't surface, matching upstream k6's timing model more closely,
+    // and it carries ~20µs/req less fixed overhead on localhost (measured
+    // 2026-07-09). It has full network parity (HTTPS/HTTP2, proxy,
+    // redirects, localIPs). Set K6RS_HTTP_CLIENT=reqwest to fall back to
+    // the reqwest client.
+    let use_reqwest_client = std::env::var("K6RS_HTTP_CLIENT").as_deref() == Ok("reqwest");
+    let client = Arc::new(if use_reqwest_client {
         AnyHttpClient::Reqwest(ReqwestHttpClient::from_config(&test_config)?)
+    } else {
+        AnyHttpClient::Hyper(HyperHttpClient::from_config(&test_config)?)
     });
     let handle = tokio::runtime::Handle::current();
     let cancel = CancellationToken::new();

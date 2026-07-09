@@ -58,6 +58,16 @@ Status: completed in this branch.
 
 ## Phase 5: Default Switch
 
+Validation notes (2026-07-09):
+
+- Item 15 passed locally with `cargo test --workspace`.
+- Item 16 ran against upstream k6 built from `../k6` with
+  `go build -mod=vendor -o /tmp/k6-upstream .`.
+  Hyper conformance failed overall: `01_http_get` passed, and the remaining
+  six scripts failed on timing/rate drift. Reqwest conformance failed overall:
+  all seven scripts failed, primarily timing/rate drift plus reqwest
+  `data_sent` count differences.
+
 15. Run `cargo test --workspace`.
 16. Run conformance with hyper and reqwest paths.
 17. Add a temporary escape hatch such as `K6RS_HTTP_CLIENT=reqwest`.

@@ -27,6 +27,10 @@ enum Cmd {
         #[arg(long)]
         k6rs_bin: Option<String>,
 
+        /// k6-rs HTTP backend to exercise. Use `hyper` or `reqwest`.
+        #[arg(long, default_value = "hyper", value_parser = ["hyper", "reqwest"])]
+        k6rs_http_client: String,
+
         /// Directory containing scripts/*/script.js + expectations.toml.
         #[arg(long, default_value = "crates/k6-conformance/scripts")]
         scripts_dir: String,
@@ -48,6 +52,7 @@ async fn main() -> Result<()> {
             filter,
             upstream_bin,
             k6rs_bin,
+            k6rs_http_client,
             scripts_dir,
             report_json,
         } => {
@@ -58,6 +63,7 @@ async fn main() -> Result<()> {
                 k6rs_bin: k6rs_bin
                     .or_else(|| std::env::var("K6RS_BIN").ok())
                     .unwrap_or_else(|| "target/debug/k6-rs".into()),
+                k6rs_http_client,
                 scripts_dir: scripts_dir.into(),
                 filter,
                 report_json: report_json.map(std::path::PathBuf::from),

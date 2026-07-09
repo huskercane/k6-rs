@@ -1,10 +1,12 @@
 //! Hyper-level HTTP client.
 //!
-//! Lives alongside the production [`crate::http_client::ReqwestHttpClient`]
-//! and is selected at runtime by setting `K6RS_HTTP_CLIENT=hyper`. The trade
-//! is: this client gives us connection-level visibility (DNS, TCP, write
-//! completion, exact wire bytes) that reqwest's high-level API hides, at the
-//! cost of a smaller feature surface today.
+//! The default client, with [`crate::http_client::ReqwestHttpClient`] kept
+//! alongside as a fallback selected by `K6RS_HTTP_CLIENT=reqwest`. This client
+//! gives us connection-level visibility (DNS, TCP, write completion, exact
+//! wire bytes) that reqwest's high-level API hides — matching upstream k6's
+//! timing model more closely — and carries less fixed per-request overhead.
+//! It has full network parity (HTTPS/HTTP2 via ALPN, proxy, redirects,
+//! localIPs); the reqwest path remains only as an escape hatch.
 //!
 //! Originally landed as the (b) spike for bug (b) — phase timing
 //! instrumentation. As of S0 it has graduated into the "promote hyper toward

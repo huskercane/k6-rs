@@ -42,5 +42,10 @@ http-body-util = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
-axum = "0.8"
+axum = { workspace = true }
 tokio-util = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "http_bridge"
+harness = false

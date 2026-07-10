@@ -437,29 +437,43 @@ fn vu_coroutine(
 /// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
 /// coroutine — awaits tokio futures and services I/O yields. In #5 the executor
 /// spawns this per VU and the fixed `iters` becomes an arrival/duration signal.
-fn spawn_vu<C: HttpClient + 'static>(
+fn spawn_vu<C, F>(
     coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
-    iters: u32,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, iters))
+    control: F,
+) -> tokio::task::JoinHandle<()>
+where
+    C: HttpClient + 'static,
+    F: FnMut(u32) -> bool + 'static,
+{
+    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control))
 }
 
-/// Drive a VU coroutine through `iters` iterations. Owns the VU's futures; never
-/// touches its `Context` (I1); metrics-free. Runs each op via [`run_op`].
-async fn drive_vu<C: HttpClient + 'static>(
+/// Drive a VU coroutine's iteration loop. Owns the VU's futures; never touches
+/// its `Context` (I1); metrics-free. Runs each op via [`run_op`].
+///
+/// `control(completed_iters) -> bool` is the RunNext/Stop hook, consulted at each
+/// `IterationBoundary` (and once up front). This is deliberately a *hook*, not a
+/// baked count: in #5 the executor supplies it (arrival curve / duration /
+/// graceful stop), and the two-tier cancellation plugs in here — prefer stopping
+/// at the boundary (`control` returns false), reserving `force_unwind` mid-op for
+/// a hard deadline. The harness passes `|n| n < iters`.
+async fn drive_vu<C, F>(
     mut coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
-    iters: u32,
-) {
+    mut control: F,
+) where
+    C: HttpClient + 'static,
+    F: FnMut(u32) -> bool,
+{
     type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, OpDone)>>>;
     let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
-    // First resume runs iteration 0 (or Stop immediately if none requested).
-    let mut resume = if iters == 0 { Resume::Stop } else { Resume::RunNext };
+    // First resume runs iteration 0 unless control declines it up front.
+    let mut resume = if control(0) { Resume::RunNext } else { Resume::Stop };
     let mut done_iters = 0u32;
     let home = std::thread::current().id();
 
@@ -522,10 +536,10 @@ async fn drive_vu<C: HttpClient + 'static>(
                 // point (#5 prefers cancelling here over force_unwind). Run the
                 // next one, or stop.
                 done_iters += 1;
-                resume = if done_iters >= iters {
-                    Resume::Stop
-                } else {
+                resume = if control(done_iters) {
                     Resume::RunNext
+                } else {
+                    Resume::Stop
                 };
             }
         }
@@ -619,7 +633,9 @@ mod tests {
                 metrics,
                 boots.clone(),
             );
-            spawn_vu(coro, shared.clone(), client, Backpressure::new(64), iters)
+            // Control hook: run while completed < iters (in #5 this is the
+            // executor's arrival/duration/cancel decision).
+            spawn_vu(coro, shared.clone(), client, Backpressure::new(64), move |n| n < iters)
                 .await
                 .unwrap();
             let out = (result.borrow().clone(), extra.borrow().clone(), boots.get());

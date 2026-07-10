@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use anyhow::Result;
 use corosensei::stack::DefaultStack;
@@ -149,6 +150,12 @@ pub(crate) fn build_coroutine_vu(
                 s.async_meta.clear();
             }
 
+            // Iteration wall-clock starts here — start of the default fn through
+            // event-loop drain, INCLUDING sleeps + I/O waits (the coroutine is
+            // suspended during I/O but wall time keeps ticking). Same window the
+            // sync VU measures (`vu.rs`), so `iteration_duration` is parity-faithful.
+            let iter_start = Instant::now();
+
             // Call the default fn with a catch boundary; a sync `http.get` inside
             // yields the coroutine (borrow held) — the scheduler runs the request
             // and resumes. Async work (asyncRequest) settles via the driver loop.
@@ -230,6 +237,14 @@ pub(crate) fn build_coroutine_vu(
                     // TODO(#5): surface to the run logger (folds in the init eprintln gap).
                     IterationOutcome::Errored { message }
                 } else {
+                    // Match the sync VU exactly: record `iteration_duration` +
+                    // bump the `iterations` counter ONLY for a completed iteration.
+                    // A thrown iteration records neither (the sync path returns Err
+                    // before `record_iteration`), so error iterations don't inflate
+                    // the iteration trend or count.
+                    if let Some(ref m) = metrics {
+                        m.record_iteration(iter_start.elapsed().as_secs_f64() * 1000.0);
+                    }
                     let value: String = ctx.globals().get("__ret").unwrap_or_default();
                     IterationOutcome::Completed { value }
                 };

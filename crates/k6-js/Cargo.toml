@@ -54,10 +54,10 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 webpki-roots = { workspace = true }
 corosensei = { version = "0.3.4" }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-tokio-util = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

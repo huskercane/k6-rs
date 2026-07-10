@@ -261,9 +261,82 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use corosensei::CoroutineResult;
     use k6_core::backpressure::Backpressure;
     use k6_core::traits::{HttpClient, HttpRequest, HttpResponse, ResponseBody, Timings};
     use tokio::task::LocalSet;
+
+    use crate::vu_sched::HostOp;
+
+    /// SPIKE (#5 slice 3b gate): can we `force_unwind` a coroutine that is parked
+    /// mid `http.get` — i.e. suspended INSIDE a native http fn called from
+    /// QuickJS's C interpreter, so QuickJS C frames sit on the coroutine stack
+    /// between the suspend point and the root? corosensei unwinds via a Rust panic
+    /// from the suspend point; that panic must pass through those cleanup-free C
+    /// frames. On Linux x86-64 CFI unwind tables usually allow it, but it is
+    /// platform-fragile and has never been exercised. This drives the risk to a
+    /// yes/no before the hard-cancellation tier is built on it.
+    ///
+    /// `#[ignore]` so a potential abort can't break normal CI; run explicitly:
+    ///   cargo test -p k6-js force_unwind_through_quickjs -- --ignored --nocapture
+    /// PASS ⇒ the coroutine reaches `done()` cleanly (Context dropped on unwind).
+    /// A process abort/SIGILL here ⇒ force_unwind-through-C is UNSAFE → redesign 3b.
+    #[test]
+    #[ignore = "force_unwind-through-QuickJS-C spike; run explicitly (may abort if unsafe)"]
+    fn force_unwind_through_quickjs_c_frames_tears_down_cleanly() {
+        // No client / tokio runtime needed: resuming synchronously drives the JS
+        // until http.get YIELDS AwaitOne(Http); we never run the op.
+        let shared = Shared::new();
+        let result = Rc::new(RefCell::new(None));
+        let mut coro = build_coroutine_vu(
+            "export default function () { http.get('http://x/'); }".to_string(),
+            shared.clone(),
+            None,
+            result,
+        );
+
+        // Resume once → the coroutine bootstraps, runs the default fn, and parks at
+        // AwaitOne(Http) inside ctx.eval (QuickJS C frames now on its stack).
+        match coro.resume(Resume::RunNext) {
+            CoroutineResult::Yield(Yield::AwaitOne(HostOp::Http(_))) => {}
+            CoroutineResult::Yield(_) => {
+                panic!("expected to park at AwaitOne(Http); yielded a different op")
+            }
+            CoroutineResult::Return(()) => panic!("coroutine returned without parking on http.get"),
+        }
+        assert!(coro.started() && !coro.done(), "must be parked mid-iteration");
+
+        // The moment of truth: unwind the coroutine while QuickJS C frames are live.
+        coro.force_unwind();
+
+        assert!(
+            coro.done(),
+            "force_unwind must fully unwind the coroutine (Context dropped) — reaching \
+             here at all means the Rust panic passed through the QuickJS C frames without \
+             aborting the process"
+        );
+    }
+
+    /// Sibling spike: force_unwind while parked mid `sleep` (AwaitOne(Sleep)) — the
+    /// suspend is likewise inside ctx.eval, so C frames are on the stack.
+    #[test]
+    #[ignore = "force_unwind-through-QuickJS-C spike; run explicitly (may abort if unsafe)"]
+    fn force_unwind_while_parked_on_sleep_tears_down_cleanly() {
+        let shared = Shared::new();
+        let result = Rc::new(RefCell::new(None));
+        let mut coro = build_coroutine_vu(
+            "export default function () { sleep(10); }".to_string(),
+            shared.clone(),
+            None,
+            result,
+        );
+        match coro.resume(Resume::RunNext) {
+            CoroutineResult::Yield(Yield::AwaitOne(HostOp::Sleep(_))) => {}
+            _ => panic!("expected to park at AwaitOne(Sleep)"),
+        }
+        coro.force_unwind();
+        assert!(coro.done(), "force_unwind mid-sleep must tear down cleanly");
+    }
 
     use crate::vu_sched::spawn_vu;
 

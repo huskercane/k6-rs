@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -116,42 +116,30 @@ where
         interrupted: Arc::new(AtomicU64::new(0)),
     };
 
-    let mut threads = Vec::with_capacity(num_threads);
-    for t in 0..num_threads {
-        // Round-robin VU→thread assignment (static: VUs are `!Send`, so there is
-        // no work-stealing — load balances at the dispatch layer, not by moving
-        // VUs). Thread `t` owns the VUs whose id ≡ t (mod num_threads).
-        let my_vus = (0..num_vus).filter(|id| id % num_threads == t).count();
-        if my_vus == 0 {
-            continue;
-        }
-        let script = script.clone();
-        let client = Arc::clone(&client);
-        let bp = bp.clone();
-        let metrics = metrics.clone();
-        let cancel = cancel.clone();
+    // constant-vus control: run continuously until the deadline (or cancel). No
+    // drops (no arrival curve); a stuck VU is force_unwound by the watchdog.
+    let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
-        let hard = hard.clone();
-
-        threads.push(
-            thread::Builder::new()
-                .name(format!("k6-loop-{t}"))
-                .spawn(move || {
-                    run_loop_thread(my_vus, script, deadline, client, bp, metrics, cancel, completed, errored, hard)
-                })
-                .expect("spawn loop thread"),
-        );
-    }
+        let cancel = cancel.clone();
+        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+            let (completed, errored, cancel) =
+                (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
+            move |n: u32| -> bool {
+                if n >= 1 {
+                    tally_outcome(&result, &completed, &errored);
+                }
+                !cancel.is_cancelled() && Instant::now() < deadline
+            }
+        }
+    };
 
     // Watchdog arms the hard tier `graceful_stop` after graceful stop begins
     // (deadline reached or cancel), so a VU stuck mid-op past the deadline is
     // force_unwound and the join can't hang.
     let watchdog =
         spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    for h in threads {
-        let _ = h.join();
-    }
+    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
     watchdog.finish();
 
     RunSummary {
@@ -163,83 +151,257 @@ where
     }
 }
 
-/// One loop thread: a current-thread runtime + `LocalSet` hosting `vu_count`
-/// coroutine VUs, each driven to the `deadline`.
-#[allow(clippy::too_many_arguments)]
-fn run_loop_thread<C>(
-    vu_count: usize,
+/// Read the just-finished iteration's outcome from the per-VU `result` cell and
+/// increment the matching lane. Shared by the VU-count control ports (constant-vus,
+/// per-vu-iterations, shared-iterations); the arrival path inlines the same logic.
+fn tally_outcome(
+    result: &Rc<RefCell<Option<IterationOutcome>>>,
+    completed: &AtomicU64,
+    errored: &AtomicU64,
+) {
+    match result.borrow().as_ref() {
+        Some(IterationOutcome::Completed { .. }) => {
+            completed.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(IterationOutcome::Errored { .. }) => {
+            errored.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
+    }
+}
+
+/// Shared spawn skeleton for the VU-count executors (constant-vus,
+/// per-vu-iterations, shared-iterations): `num_vus` coroutine VUs sharded
+/// round-robin across `num_threads` loop threads (static — VUs are `!Send`), each
+/// driven by a per-VU control built by `make_control(result_cell)`. Blocks until
+/// every VU stops. The executor-specific policy (deadline, iteration cap, shared
+/// budget) lives entirely in the control the factory returns; this owns only the
+/// spawn/runtime/join. The watchdog + summary stay with each caller.
+fn run_vus_on_loops<C, F, K>(
+    num_threads: usize,
+    num_vus: usize,
     script: String,
-    deadline: Instant,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    hard: HardStop,
+    make_control: F,
+) where
+    C: HttpClient + 'static,
+    F: Fn(Rc<RefCell<Option<IterationOutcome>>>) -> K + Clone + Send + 'static,
+    K: IterationControl + 'static,
+{
+    let mut threads = Vec::with_capacity(num_threads);
+    for t in 0..num_threads {
+        let my_vus = (0..num_vus).filter(|id| id % num_threads == t).count();
+        if my_vus == 0 {
+            continue;
+        }
+        let script = script.clone();
+        let client = Arc::clone(&client);
+        let bp = bp.clone();
+        let metrics = metrics.clone();
+        let hard = hard.clone();
+        let make_control = make_control.clone();
+
+        threads.push(
+            thread::Builder::new()
+                .name(format!("k6-loop-{t}"))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build loop-thread runtime");
+                    LocalSet::new().block_on(&rt, async move {
+                        let mut handles = Vec::with_capacity(my_vus);
+                        for _ in 0..my_vus {
+                            let shared = Shared::new();
+                            // Per-VU outcome cell: the coroutine writes the last
+                            // iteration's outcome, the control reads it (same thread).
+                            let result = Rc::new(RefCell::new(None));
+                            let coro = build_coroutine_vu(
+                                script.clone(),
+                                shared.clone(),
+                                Some(metrics.clone()),
+                                result.clone(),
+                            );
+                            let control = make_control(result);
+                            handles.push(spawn_vu_hard(
+                                coro,
+                                shared,
+                                Arc::clone(&client),
+                                bp.clone(),
+                                control,
+                                hard.clone(),
+                            ));
+                        }
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                    });
+                })
+                .expect("spawn loop thread"),
+        );
+    }
+    for h in threads {
+        let _ = h.join();
+    }
+}
+
+/// Each VU runs exactly `iterations_per_vu` iterations (or until `max_duration` /
+/// cancel). `dropped` = the per-VU iterations that never started (planned minus
+/// those that ran). Reuses the VU-count spawn skeleton with a capped control.
+#[allow(clippy::too_many_arguments)]
+pub fn run_per_vu_iterations<C>(
+    script: String,
+    num_vus: usize,
+    iterations_per_vu: u32,
+    max_duration: Duration,
     client: Arc<C>,
     bp: Backpressure,
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
-    completed: Arc<AtomicU64>,
-    errored: Arc<AtomicU64>,
-    hard: HardStop,
-) where
+    graceful_stop: Duration,
+) -> RunSummary
+where
     C: HttpClient + 'static,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build loop-thread runtime");
+    let num_threads = loop_thread_count(num_vus);
+    if num_threads == 0 {
+        return RunSummary::default();
+    }
+    let start = Instant::now();
+    let deadline = start + max_duration;
+    let completed = Arc::new(AtomicU64::new(0));
+    let errored = Arc::new(AtomicU64::new(0));
+    let hard = HardStop {
+        token: CancellationToken::new(),
+        interrupted: Arc::new(AtomicU64::new(0)),
+    };
 
-    LocalSet::new().block_on(&rt, async move {
-        let mut handles = Vec::with_capacity(vu_count);
-        for _ in 0..vu_count {
-            let shared = Shared::new();
-            // `result` is the per-VU outcome cell: the coroutine writes the last
-            // iteration's typed outcome, the control hook reads it (same thread).
-            let result = Rc::new(RefCell::new(None));
-            let coro = build_coroutine_vu(
-                script.clone(),
-                shared.clone(),
-                Some(metrics.clone()),
-                result.clone(),
-            );
-
-            let cancel = cancel.clone();
-            let completed = Arc::clone(&completed);
-            let errored = Arc::clone(&errored);
-            // constant-vus control hook, consulted at each `IterationBoundary`
-            // (and once up front at n==0). It reads the iteration that just
-            // finished — published to `result` before this call — tallies it, then
-            // decides RunNext (true) / Stop (false). Sync is sufficient here: no
-            // coordinator, just a deadline/cancel check. (The async next_action
-            // hook arrives with the arrival-rate coordinator slice.)
-            let control = move |n: u32| -> bool {
+    let make_control = {
+        let completed = Arc::clone(&completed);
+        let errored = Arc::clone(&errored);
+        let cancel = cancel.clone();
+        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+            let (completed, errored, cancel) =
+                (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
+            move |n: u32| -> bool {
                 if n >= 1 {
-                    // n>=1 ⇒ iteration n-1 just finished; classify it. Completed
-                    // and Errored are counted in separate lanes (parity with the
-                    // sync path: an Errored iteration is NOT a completion and
-                    // records no iteration metric — that's coroutine-side).
-                    match result.borrow().as_ref() {
-                        Some(IterationOutcome::Completed { .. }) => {
-                            completed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Some(IterationOutcome::Errored { .. }) => {
-                            errored.fetch_add(1, Ordering::Relaxed);
-                        }
-                        None => {}
+                    tally_outcome(&result, &completed, &errored);
+                }
+                // `n` iterations already done ⇒ run the (n)th while under the cap.
+                n < iterations_per_vu && !cancel.is_cancelled() && Instant::now() < deadline
+            }
+        }
+    };
+
+    let watchdog =
+        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
+    watchdog.finish();
+
+    let c = completed.load(Ordering::Relaxed);
+    let e = errored.load(Ordering::Relaxed);
+    let i = hard.interrupted.load(Ordering::Relaxed);
+    let planned = iterations_per_vu as u64 * num_vus as u64;
+    RunSummary {
+        iterations_completed: c,
+        // Iterations that never started: planned minus those that ran (any outcome).
+        iterations_dropped: planned.saturating_sub(c + e + i),
+        iterations_errored: e,
+        iterations_interrupted: i,
+        duration: start.elapsed(),
+    }
+}
+
+/// A fixed `total_iterations` shared across all VUs: each VU CAS-claims one from a
+/// shared budget until it's exhausted (or `max_duration` / cancel) — faster VUs do
+/// more. `dropped` = the shared iterations that never started. Reuses the VU-count
+/// spawn skeleton with a budget-claiming control.
+#[allow(clippy::too_many_arguments)]
+pub fn run_shared_iterations<C>(
+    script: String,
+    num_vus: usize,
+    total_iterations: u32,
+    max_duration: Duration,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    cancel: CancellationToken,
+    graceful_stop: Duration,
+) -> RunSummary
+where
+    C: HttpClient + 'static,
+{
+    let num_threads = loop_thread_count(num_vus);
+    if num_threads == 0 {
+        return RunSummary::default();
+    }
+    let start = Instant::now();
+    let deadline = start + max_duration;
+    let completed = Arc::new(AtomicU64::new(0));
+    let errored = Arc::new(AtomicU64::new(0));
+    // The shared iteration budget — CAS-claimed by every VU across all threads.
+    let remaining = Arc::new(AtomicU32::new(total_iterations));
+    let hard = HardStop {
+        token: CancellationToken::new(),
+        interrupted: Arc::new(AtomicU64::new(0)),
+    };
+
+    let make_control = {
+        let completed = Arc::clone(&completed);
+        let errored = Arc::clone(&errored);
+        let remaining = Arc::clone(&remaining);
+        let cancel = cancel.clone();
+        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+            let (completed, errored, remaining, cancel) = (
+                Arc::clone(&completed),
+                Arc::clone(&errored),
+                Arc::clone(&remaining),
+                cancel.clone(),
+            );
+            move |n: u32| -> bool {
+                if n >= 1 {
+                    tally_outcome(&result, &completed, &errored);
+                }
+                if cancel.is_cancelled() || Instant::now() >= deadline {
+                    return false;
+                }
+                // Claim one iteration from the shared budget (CAS). Returning true
+                // ⇒ this VU runs it, so claims == iterations that run.
+                loop {
+                    let cur = remaining.load(Ordering::Relaxed);
+                    if cur == 0 {
+                        return false; // budget exhausted
+                    }
+                    if remaining
+                        .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return true;
                     }
                 }
-                !cancel.is_cancelled() && Instant::now() < deadline
-            };
+            }
+        }
+    };
 
-            handles.push(spawn_vu_hard(
-                coro,
-                shared,
-                Arc::clone(&client),
-                bp.clone(),
-                control,
-                hard.clone(),
-            ));
-        }
-        for h in handles {
-            let _ = h.await;
-        }
-    });
+    let watchdog =
+        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
+    watchdog.finish();
+
+    let c = completed.load(Ordering::Relaxed);
+    let e = errored.load(Ordering::Relaxed);
+    let i = hard.interrupted.load(Ordering::Relaxed);
+    RunSummary {
+        iterations_completed: c,
+        // Unclaimed budget = iterations that never started.
+        iterations_dropped: (total_iterations as u64).saturating_sub(c + e + i),
+        iterations_errored: e,
+        iterations_interrupted: i,
+        duration: start.elapsed(),
+    }
 }
 
 /// Constant-vus watchdog: graceful stop begins at `deadline` (or earlier on
@@ -1225,6 +1387,112 @@ mod tests {
             (lo..=hi).contains(&summary.iterations_completed),
             "ramp completed {} should land near the integral {integral:.1}",
             summary.iterations_completed
+        );
+    }
+
+    // --- per-vu-iterations + shared-iterations ------------------------------
+
+    /// per-vu-iterations: each of 3 VUs runs exactly 4 iterations ⇒ 12 total, none
+    /// dropped (ample duration). Conservation: completed + errored + interrupted +
+    /// dropped == planned (12).
+    #[test]
+    fn per_vu_iterations_each_vu_runs_its_quota() {
+        let summary = run_per_vu_iterations(
+            "export default function () { http.get('http://x/'); }".to_string(),
+            3,
+            4,
+            Duration::from_secs(30), // ample: the quota, not the clock, bounds it
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(summary.iterations_completed, 12, "3 VUs × 4 = 12: {summary:?}");
+        assert_eq!(summary.iterations_dropped, 0, "the quota was met, nothing dropped");
+        assert_eq!(summary.iterations_errored, 0);
+        assert_eq!(summary.iterations_interrupted, 0);
+    }
+
+    /// per-vu-iterations with a max-duration cutoff: a slow script (sleep) can't
+    /// finish the quota in time ⇒ the unrun per-VU iterations are dropped, and
+    /// completed + dropped == planned.
+    #[test]
+    fn per_vu_iterations_maxduration_cutoff_drops_the_rest() {
+        let planned = 2u64 * 100; // 2 VUs × 100 quota
+        let summary = run_per_vu_iterations(
+            "export default function () { sleep(0.02); }".to_string(), // 20 ms/iter
+            2,
+            100,                          // unreachable in the window
+            Duration::from_millis(150),   // ~7 iters/VU possible
+            Arc::new(Mock200),
+            Backpressure::new(8),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(100),
+        );
+        assert!(summary.iterations_completed > 0, "some ran: {summary:?}");
+        assert!(summary.iterations_dropped > 0, "the quota couldn't be met: {summary:?}");
+        let total = summary.iterations_completed
+            + summary.iterations_dropped
+            + summary.iterations_errored
+            + summary.iterations_interrupted;
+        assert_eq!(total, planned, "completed+dropped+errored+interrupted == planned");
+    }
+
+    /// shared-iterations: 4 VUs draw from a shared budget of 20 ⇒ exactly 20 run,
+    /// none dropped (ample duration). Faster VUs do more, but the total is the
+    /// budget. Conservation: the four lanes sum to the budget.
+    #[test]
+    fn shared_iterations_budget_is_fully_drawn() {
+        let summary = run_shared_iterations(
+            "export default function () { http.get('http://x/'); }".to_string(),
+            4,
+            20,
+            Duration::from_secs(30),
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(summary.iterations_completed, 20, "budget of 20 fully drawn: {summary:?}");
+        assert_eq!(summary.iterations_dropped, 0);
+        let total = summary.iterations_completed
+            + summary.iterations_dropped
+            + summary.iterations_errored
+            + summary.iterations_interrupted;
+        assert_eq!(total, 20, "the four lanes conserve to the shared budget");
+    }
+
+    /// shared-iterations three-way conservation: a script that throws every 3rd
+    /// iteration ⇒ the 20-iteration budget splits across completed and errored,
+    /// with the budget still fully drawn (nothing dropped). Locks that an errored
+    /// claim is still an attempt (not re-dropped) — completed + errored == budget.
+    #[test]
+    fn shared_iterations_errored_claims_still_consume_budget() {
+        let metrics = BuiltinMetrics::new();
+        let summary = run_shared_iterations(
+            r#"export default function () {
+                globalThis.__n = (globalThis.__n || 0) + 1;
+                if (globalThis.__n % 3 === 0) throw new Error('third');
+            }"#
+            .to_string(),
+            2,
+            20,
+            Duration::from_secs(30),
+            Arc::new(Mock200),
+            Backpressure::new(8),
+            metrics,
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        );
+        assert!(summary.iterations_errored > 0, "some threw: {summary:?}");
+        assert_eq!(summary.iterations_dropped, 0, "the budget was fully drawn");
+        assert_eq!(
+            summary.iterations_completed + summary.iterations_errored,
+            20,
+            "completed + errored == budget (an errored claim is an attempt): {summary:?}"
         );
     }
 }

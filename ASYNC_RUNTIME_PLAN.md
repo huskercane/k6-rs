@@ -767,3 +767,54 @@ ample pool ⇒ zero drops; (b) integral parity — fast VUs, completed lands on 
 curve integral, mirroring the sync `ramp_matches_integral_count`; (c) completed vs
 dropped divergence (finding #2 at arrival-rate — the three counts pull apart);
 (d) ArrivalCurve extraction regression-lock (identical `expected_arrivals` values).
+
+### #5 slice 3 — design note: cancellation + the accounting buckets finalize
+
+Slice-2 review sharpened three things; folded in here.
+
+**Conservation is four-way, not two.** A dispatched iteration that THROWS consumed
+an arrival slot but is invisible today (not completed, not dropped). That hides the
+load-test-critical distinction between "couldn't keep up" (dropped = capacity) and
+"kept up but erroring under load" (errored = app health). Add BOTH lanes so:
+`completed + dropped + errored + interrupted == integral`. `errored` +
+`interrupted` are the same accounting surface, so they finalize together here.
+- **errored** — counted in the control port's `Errored` branch (both constant-vus
+  and arrival paths), same place `completed` is tallied.
+- **interrupted** — a force-unwound iteration never reaches the boundary/publish,
+  so it is counted where the unwind happens (drive_vu's hard-cancel arm), and
+  attributed as **interrupted, NOT errored** — else a shutdown trips an error
+  threshold in the run's final second. Matches k6's separate interrupted count.
+
+**Claim precision (slice-2 finding 2).** The coordinator↔sync correspondence is
+**conservation-identical, split-approximate**: the sync semaphore returns a permit
+synchronously, while the coordinator learns idle one `try_recv`-drain quantum late
+(≤ one sleep, typ. ≤10 ms), so the completed/dropped SPLIT can diverge by a
+marginal-VU lag under saturation. Negligible at 7900 VUs (genuine exhaustion
+dominates); the tests lock conservation, not the split, which is why they're robust.
+Do NOT carry "structurally identical" into soak analysis.
+
+**Startup is a deadlock, not an undercount (slice-2 finding 3).** In the arrival
+path a VU that dies before its first idle report (e.g. `DefaultStack::new().expect()`
+OOM at 7900 VUs — the soak condition) leaves the coordinator's
+`for _ in 0..num_vus { blocking_recv }` waiting forever → senders never dropped →
+every survivor parks forever = full-run deadlock. Fix: make startup cancel- AND
+timeout-aware — poll `try_recv` with a bounded deadline, and on cancel/timeout
+**proceed-degraded** with the VUs that did report (logged), or return empty if none.
+
+**force_unwind is a DISCOVERED RISK — spike before relying on it.** corosensei
+`force_unwind` unwinds the coroutine from its `suspend` point via a panic. Our
+coroutines suspend INSIDE a native http fn called from QuickJS's C interpreter, so
+the unwind drives a Rust panic THROUGH QuickJS C frames. `unwind` is a default
+corosensei feature and no profile sets `panic=abort`, so it's available; on Linux
+x86-64 CFI unwind tables usually let a Rust panic pass through cleanup-free C
+frames, but this is platform-fragile and has NEVER been exercised here. So:
+
+- **3a (safe, this pass):** errored lane + three-way conservation
+  (`completed+dropped+errored==integral`, `interrupted==0` — graceful stop loses no
+  dispatched iteration) + cancel/timeout-aware startup. Closes findings 1 & 3.
+- **3b (spike-gated):** a focused test — force_unwind a coroutine parked mid
+  `http.get` (C frames on stack) and mid `sleep`; confirm clean teardown (Context
+  drop, no abort) on the soak platform. If SAFE → hard-deadline tier + interrupted
+  lane + ws `JoinHandle::abort` + four-way conservation. If UNSAFE → redesign: the
+  hard deadline is END-OF-RUN, so abandon still-in-flight VUs (count interrupted,
+  stop joining, summary, process-exit reclaims) rather than unwind through C.

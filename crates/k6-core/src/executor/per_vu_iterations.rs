@@ -69,6 +69,7 @@ impl<V: VirtualUser + 'static> PerVuIterationsExecutor<V> {
             iterations_completed,
             iterations_dropped: planned_iterations.saturating_sub(iterations_completed),
             duration: start.elapsed(),
+            ..Default::default()
         })
     }
 }

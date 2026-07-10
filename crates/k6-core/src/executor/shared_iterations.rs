@@ -92,6 +92,7 @@ impl<V: VirtualUser + 'static> SharedIterationsExecutor<V> {
             iterations_completed,
             iterations_dropped: (self.total_iterations as u64).saturating_sub(iterations_completed),
             duration: start.elapsed(),
+            ..Default::default()
         })
     }
 }

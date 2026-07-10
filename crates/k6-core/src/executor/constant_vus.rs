@@ -67,6 +67,7 @@ impl<V: VirtualUser + 'static> ConstantVusExecutor<V> {
             iterations_completed: total_iterations.load(Ordering::Relaxed),
             iterations_dropped: 0, // constant-vus never drops
             duration: elapsed,
+            ..Default::default()
         })
     }
 }

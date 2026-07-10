@@ -21,7 +21,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,11 +36,21 @@ use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, HttpResponse, HttpRequest};
 
 use crate::api::http::{
-    build_http_request, finish_http_response, object_entries_to_pairs, parse_response_callback,
+    ResponseCallback, build_http_request, finish_http_response, object_entries_to_pairs,
+    parse_response_callback,
 };
 use crate::runtime;
 
 type OpId = u64;
+
+/// Per-request info an async http op needs at *resolution* time (driver-loop
+/// side), carried in a side-map keyed by op id so the scheduler stays ignorant of
+/// it (I1) — it only moves the owned request/response.
+struct AsyncMeta {
+    method: String,
+    user_tags: Vec<(String, String)>,
+    response_callback: ResponseCallback,
+}
 
 /// A blocking op the scheduler runs on the VU's behalf. The scheduler is the ONLY
 /// place futures are created (I1).
@@ -68,6 +78,8 @@ struct VuShared {
     registered: Vec<(OpId, HostOp)>,
     /// Completed async results — drained ONLY by the driver loop (I2).
     completed: VecDeque<(OpId, OpDone)>,
+    /// Resolution-time metadata for async http ops (see [`AsyncMeta`]).
+    async_meta: HashMap<OpId, AsyncMeta>,
 }
 
 /// `Send` newtype over the per-VU `Rc` (I3 FFI lie; single-threaded in practice).
@@ -191,8 +203,8 @@ fn vu_coroutine(
             )
             .unwrap();
 
-            // async register: pushes a Sleep op, returns its id; the promise is
-            // minted in JS and its resolver stashed. Does NOT yield.
+            // async register (sleep): pushes a Sleep op, returns its id; the
+            // promise is minted in JS and its resolver stashed. Does NOT yield.
             let sh = shared.clone();
             g.set(
                 "__register_async",
@@ -209,9 +221,51 @@ fn vu_coroutine(
             )
             .unwrap();
 
+            // asyncRequest: build the request (owned) + stash resolution meta,
+            // register an Http op, return its id. Does NOT yield — the promise is
+            // minted in JS. Metrics are recorded when the driver loop drains the
+            // result (driver-loop-side, once), NOT here and NOT on the scheduler.
+            let sh = shared.clone();
+            g.set(
+                "__register_async_http",
+                Function::new(
+                    ctx.clone(),
+                    move |method: String,
+                          url: String,
+                          body: rquickjs::Value<'_>,
+                          headers: rquickjs::Value<'_>,
+                          timeout_ms: f64,
+                          tags: rquickjs::Value<'_>,
+                          cb: rquickjs::Value<'_>|
+                          -> f64 {
+                        let req = build_http_request(&method, url, &body, &headers, timeout_ms);
+                        let meta = AsyncMeta {
+                            method,
+                            user_tags: object_entries_to_pairs(&tags),
+                            response_callback: parse_response_callback(&cb),
+                        };
+                        let mut s = sh.0.borrow_mut();
+                        let id = s.next_op;
+                        s.next_op += 1;
+                        s.outstanding += 1;
+                        s.registered.push((id, HostOp::Http(req)));
+                        s.async_meta.insert(id, meta);
+                        id as f64
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
             ctx.eval::<(), _>(
                 r#"
                 globalThis.__resolvers = {};
+                // Minimal stand-in for http.rs's __wrap_response (adds .json());
+                // the real one is reused once this graduates into QuickJsVu.
+                globalThis.__wrap_response = function (raw) {
+                    raw.json = function () { return JSON.parse(raw.body); };
+                    return raw;
+                };
                 globalThis.httpGet = function (url, params) {
                     return __http_get('GET', url, null,
                         (params && params.headers) || {},
@@ -222,6 +276,16 @@ fn vu_coroutine(
                 globalThis.asyncSleep = function (ms) {
                     var id = __register_async(ms);
                     return new Promise(function (resolve) { globalThis.__resolvers[id] = resolve; });
+                };
+                globalThis.asyncGet = function (url, params) {
+                    var id = __register_async_http('GET', url, null,
+                        (params && params.headers) || {},
+                        (params && params.timeout) || 0,
+                        (params && params.tags) || null, undefined);
+                    // The stored resolver wraps the raw response (parity: .json()).
+                    return new Promise(function (resolve) {
+                        globalThis.__resolvers[id] = function (raw) { resolve(__wrap_response(raw)); };
+                    });
                 };
                 globalThis.__done = false;
                 globalThis.__ret = "";
@@ -253,19 +317,36 @@ fn vu_coroutine(
                 let resolvers: rquickjs::Object = ctx.globals().get("__resolvers").unwrap();
                 let n = drained.len() as u64;
                 for (op, done) in drained {
-                    let val: String = match done {
-                        OpDone::Slept => "slept".to_string(),
-                        // No async-http op is issued yet. Loud on purpose: a
-                        // half-wired asyncRequest that pushes HostOp::Http before
-                        // the resolution logic lands must PANIC here, not silently
-                        // resolve its JS promise to a garbage string.
-                        OpDone::Http(_) => {
-                            unreachable!("async http resolution lands in the next slice")
-                        }
-                    };
                     let key = op.to_string();
-                    if let Ok(f) = resolvers.get::<_, Function>(key.as_str()) {
-                        let _ = f.call::<_, ()>((val,));
+                    let resolver = resolvers.get::<_, Function>(key.as_str()).ok();
+                    match done {
+                        OpDone::Slept => {
+                            if let Some(f) = resolver {
+                                let _ = f.call::<_, ()>(("slept".to_string(),));
+                            }
+                        }
+                        OpDone::Http(result) => {
+                            // Async http metrics land HERE — driver-loop-side,
+                            // inside our own borrow, exactly once per op (each op
+                            // is queued once and drained once). finish_http_response
+                            // is pure Rust; the JS resolver wraps the response.
+                            let meta = shared
+                                .0
+                                .borrow_mut()
+                                .async_meta
+                                .remove(&op)
+                                .expect("async http op must have resolution meta");
+                            let resp = finish_http_response(
+                                result,
+                                &meta.method,
+                                meta.user_tags,
+                                &meta.response_callback,
+                                metrics.as_ref(),
+                            );
+                            if let Some(f) = resolver {
+                                let _ = f.call::<_, ()>((resp,));
+                            }
+                        }
                     }
                     let _ = resolvers.remove(key.as_str());
                 }
@@ -542,6 +623,75 @@ mod tests {
                 .counter_get("http_reqs{expected_response:false,method:GET,status:0}"),
             1,
             "failure bucket recorded"
+        );
+    }
+
+    // --- async http on the driver loop (asyncRequest) ---
+
+    #[test]
+    fn async_http_resolves_wrapped_response_and_records_once() {
+        let metrics = BuiltinMetrics::new();
+        // await the async request; the resolved value is wrapped (.json() works).
+        let (ret, _) = run_vu(
+            "var r = await asyncGet('http://x/'); return String(r.status) + ':' + r.json().ok;",
+            Arc::new(Mock200),
+            Some(metrics.clone()),
+            None,
+        );
+        assert_eq!(ret, "200:true", "async http resolves a wrapped response");
+        // Metrics recorded driver-loop-side, exactly once.
+        assert_eq!(
+            metrics
+                .registry
+                .counter_get("http_reqs{expected_response:true,method:GET,status:200}"),
+            1,
+            "async http records http_reqs exactly once, driver-loop-side"
+        );
+    }
+
+    #[test]
+    fn fire_and_forget_async_http_records_reqs_before_iteration_end() {
+        // The conformance-critical case, now on REAL http_reqs (not the sleep
+        // model): a no-await asyncRequest must still fire + record before the
+        // iteration ends. Assert the METRIC, not just a JS global.
+        let metrics = BuiltinMetrics::new();
+        let (ret, _) = run_vu(
+            "asyncGet('http://x/'); return 7;",
+            Arc::new(Mock200),
+            Some(metrics.clone()),
+            None,
+        );
+        assert_eq!(ret, "7");
+        assert_eq!(
+            metrics
+                .registry
+                .counter_get("http_reqs{expected_response:true,method:GET,status:200}"),
+            1,
+            "fire-and-forget asyncRequest fired + recorded http_reqs before iteration end"
+        );
+    }
+
+    #[test]
+    fn async_http_completing_during_sync_park_records_once() {
+        // Hazard on real http: an async http op completes while the VU is parked
+        // in a sync sleep (borrow held) — queued, resolved after — and must
+        // record http_reqs EXACTLY once (no double-record from park+redrain).
+        let metrics = BuiltinMetrics::new();
+        let script = r#"
+            var got = null;
+            var p = asyncGet('http://x/').then(function (r) { got = r.status; });
+            var s = sleepMs(50);
+            await p;
+            return s + '|' + got;
+        "#;
+        let (ret, _) = run_vu(script, Arc::new(Mock200), Some(metrics.clone()), None);
+        assert_eq!(ret, "s50|200");
+        assert_eq!(
+            metrics
+                .registry
+                .counter_get("http_reqs{expected_response:true,method:GET,status:200}"),
+            1,
+            "exactly one http_reqs despite completing during the park"
         );
     }
 }

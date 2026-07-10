@@ -391,7 +391,9 @@ impl QuickJsVu {
         Ok(())
     }
 
-    fn register_fail(ctx: &rquickjs::Ctx<'_>) -> Result<()> {
+    // pub(crate): reused by the coroutine VU (crate::coroutine_vu) so the seeded
+    // PRNG / fail() have ONE source of truth — no second impl to drift.
+    pub(crate) fn register_fail(ctx: &rquickjs::Ctx<'_>) -> Result<()> {
         ctx.eval::<(), _>(
             r#"
             globalThis.fail = function(msg) {
@@ -402,7 +404,7 @@ impl QuickJsVu {
         Ok(())
     }
 
-    fn register_random_seed(ctx: &rquickjs::Ctx<'_>) -> Result<()> {
+    pub(crate) fn register_random_seed(ctx: &rquickjs::Ctx<'_>) -> Result<()> {
         // randomSeed() replaces Math.random with a seeded PRNG (xorshift32)
         // for reproducible test runs, matching k6 behavior.
         ctx.eval::<(), _>(

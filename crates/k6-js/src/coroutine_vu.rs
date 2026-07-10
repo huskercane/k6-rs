@@ -57,15 +57,16 @@ fn bootstrap_api(
     yp: YielderPtr,
     metrics: Option<BuiltinMetrics>,
 ) -> Result<()> {
-    // Minimal console/fail/randomSeed (the sync VU's richer console-output
-    // capture is shared in at cleanup, not duplicated in anger here).
+    // console is OBSERVABILITY — richer output capture folds into #6 with the
+    // logger; a no-op stub is a safe defer.
     ctx.eval::<(), _>(
-        r#"
-        globalThis.console = { log: function () {}, warn: function () {}, error: function () {} };
-        globalThis.fail = function (msg) { throw new Error('fail: ' + (msg || 'test aborted')); };
-        globalThis.randomSeed = function () {};
-    "#,
+        "globalThis.console = { log: function () {}, warn: function () {}, error: function () {} };",
     )?;
+    // fail + randomSeed are BEHAVIORAL — reuse the sync VU's real impls (one
+    // source of truth). randomSeed installs a real seeded xorshift32 PRNG; a
+    // no-op stub would silently diverge script results vs the sync VU + upstream.
+    crate::vu::QuickJsVu::register_fail(ctx)?;
+    crate::vu::QuickJsVu::register_random_seed(ctx)?;
 
     // Dependency-free k6 API (all &Ctx, no block_on — safe in the coroutine).
     crate::api::encoding::register(ctx)?;
@@ -429,6 +430,24 @@ mod tests {
             "crypto + encoding + http + check all work in the bootstrapped coroutine"
         );
         let _ = metrics; // http_reqs etc. covered by the dedicated http tests.
+    }
+
+    /// Behavioral parity: `randomSeed(42)` installs the REAL seeded xorshift32
+    /// PRNG on the coroutine path too (not a no-op) — so two runs produce the
+    /// same sequence. A no-op stub would leave `Math.random` non-deterministic
+    /// and this asserts false, catching the silent divergence.
+    #[test]
+    fn random_seed_is_deterministic_on_coroutine_path() {
+        let script = "export default function () { randomSeed(42); return Math.random() + ',' + Math.random(); }";
+        let a = run_script(script, 1);
+        let b = run_script(script, 1);
+        match &a {
+            Some(IterationOutcome::Completed { value }) => {
+                assert!(!value.starts_with("0,") && value.contains(','), "seeded values: {value}")
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(a, b, "randomSeed must be a real PRNG (deterministic), not a no-op");
     }
 
     /// bar (b): a thrown iteration is a TYPED `Errored`, not a `"ERR:"` string a

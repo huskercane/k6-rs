@@ -336,15 +336,50 @@ what carry forward.
 between them.** NOT per-iteration coroutines. The deciding constraint is one the
 `vu_loop` harness hides: **host fns capture the yielder pointer**, which is
 per-coroutine-run. A persistent `Context` with a per-iteration coroutine would
-force a *mutable* yielder slot — reintroducing exactly the cross-VU staleness the
-captured-pointer design eliminated. And bootstrapping the full k6 API per
+force a **per-VU mutable yielder slot** (updated each run) — *within-VU*
+indirection + the re-bootstrap cost, NOT a correctness dead end. (Precisely: this
+is **not** the cross-VU staleness the captured-pointer design killed — that was a
+*thread-local* yielder shared by all VUs on a pool-of-loops thread; a per-VU slot
+is never cross-VU stale.) The decisive reason for long-lived stands on its own:
+**capture-the-yielder-once + bootstrap-once** (bootstrapping the full k6 API per
 iteration is the per-iteration-re-eval regression class already fixed once —
-catastrophic at 7900 VUs. So: bootstrap (runtime + context + whole API) at
+catastrophic at 7900 VUs). So: bootstrap (runtime + context + whole API) at
 coroutine start; then `loop { run one iteration (driver loop, yielding for I/O);
-yield IterationBoundary }`. `run_iteration` = resume the persistent coroutine,
-service its I/O yields on the scheduler, return at `IterationBoundary`;
-Context/globals/cookie-jar persist across iterations by construction. Three more
-graduation gates: (2) the async path must run the **request-side cookie merge**
+yield IterationBoundary }`; Context/globals/cookie-jar persist by construction.
+
+**The #4↔#5 seam (R1 — resolve before writing code).** "Service I/O yields" is
+**async** (awaiting tokio futures), so it is NOT the sync `run_iteration` trait
+method — a sync fn awaiting = `block_on` = the loop-thread panic we've architected
+around. The async **`drive_vu`** (executor-spawned onto the loop, #5) resumes the
+coroutine and services `AwaitOne`/`AwaitPending`. The sync per-iteration body
+(eval default fn + turn the JS event loop via **coroutine yields**, not tokio
+awaits) runs *inside* the coroutine — invoked by the coroutine, never by the
+executor as a blocking call. `IterationBoundary` is the handoff: `drive_vu`
+returns/loops there. Do not let `run_iteration` become the executor's sync entry
+that drives the async scheduler (R2 = illegal = block_on-on-loop panic).
+
+**Long-lived's new costs (graduation spec):**
+- **Per-iteration state reset (silent-if-wrong):** one reused `Context` means
+  fresh globals are NOT free. **Persist** (per-VU, upstream-correct): user
+  module-scope vars, cookie jar. **Reset at `IterationBoundary`** (or bleed):
+  driver bookkeeping — `__done`/`__ret`/`__resolvers` and Rust-side
+  `outstanding`/`registered`/`completed`/`async_meta`. Unreset `__done` →
+  iteration N+1 terminates instantly; stale `__resolvers`/`async_meta` →
+  mis-resolution or an 8-hour leak. Prefer Rust-side per-iteration locals
+  re-init'd each `RunNext` over JS globals (smaller bleed surface). Test: iter 2
+  starts clean while a module counter + a jar cookie persist.
+- **Per-iteration catch boundary:** a host-fn panic now unwinds the WHOLE VU
+  coroutine, killing all its remaining iterations — a VU silently dropped at
+  hour 3 thins load without failing loudly. Wrap each iteration's eval in a catch
+  boundary so a script/host error ends that iteration and loops on (or count +
+  log whole-VU death — but for the soak, prefer the boundary).
+- **Free win for #5 cancellation:** `IterationBoundary` is a clean cancel point
+  (no borrow held, no I/O in flight). Two-tier shutdown: cancel at the boundary
+  (drain in-flight, stop between iterations — preferred, no `force_unwind`) and
+  `force_unwind` mid-`AwaitOne` only on a hard deadline. Makes the scary
+  borrow-held `force_unwind` (the #5 gate) the exception, not the rule.
+
+Three more graduation gates: (2) the async path must run the **request-side cookie merge**
 (`__buildCookieHeader`) + `Set-Cookie` extract, not just `__wrap_response` —
 `asyncGet` bypasses `__http.request` today; (3) `http.batch` needs a
 **yield-and-wait-for-all** variant (register N ops, park until all complete) — it

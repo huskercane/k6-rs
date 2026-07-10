@@ -695,3 +695,26 @@ stack.
 **Build in SLICES (each a review boundary):** (1) spawn model + ONE executor
 green; (2) remaining executors; (3) cancellation (two-tier + 4 gates + ws-abort);
 (4) fat-frame stack measurement + 7900 soak.
+
+### #5 slice 1 — review findings (carried forward)
+
+- **[soak-critical, → cancellation/soak slice] Loop-thread panic accounting.**
+  `pool.rs` `let _ = h.join()` swallows loop-thread panics; the loop thread carries
+  live `.expect()`s (`create_runtime`/`create_context`/`bootstrap_api`). One VU
+  panic kills the whole loop thread → all its sharded VUs stop → `RunSummary`
+  silently undercounts and reports GREEN. Realistic trigger: `Context` alloc
+  failing under memory pressure at 7900 VUs — the exact soak condition. Blast
+  radius ≈ `num_vus/cores` (hundreds), invisible. Min fix: check `join()` →
+  failed/degraded run + log, never silent undercount. Better: per-VU fault
+  isolation. **Gates soak-result trustworthiness.** (task #9)
+- **[test gap — CLOSED this slice] Count-only-`Completed` untested at pool level.**
+  Added `errored_iterations_are_not_counted_but_their_requests_are`: `http.get`
+  then throw every 3rd iter ⇒ `http_reqs` (all attempts) > `iterations_completed`
+  (completed only) ⇒ the discriminating branch is exercised. Slice 2 adds the
+  arrival-rate completed/dropped divergence test.
+- **[conformance, → separate] Failed-iteration metrics vs upstream.**
+  Skipping `iteration_duration` + `iterations` on a throw is now cemented on BOTH
+  internal paths but UNVERIFIED against upstream k6 (which likely still emits both
+  and surfaces the error separately). Two paths agreeing ≠ correct. Route through
+  the conformance harness (sometimes-throwing default fn) as a field-level
+  known_drift candidate. (task #10)

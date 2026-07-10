@@ -298,6 +298,63 @@ mod tests {
         );
     }
 
+    /// Discriminating outcome test (finding #2): a script that does `http.get`
+    /// and THEN throws every 3rd iteration. Because the request is recorded
+    /// coroutine-side before the throw, `http_reqs` counts EVERY attempt while the
+    /// pool tally + the `iterations` metric count only *completed* ones. So they
+    /// must diverge: `iterations_completed < http_reqs` (≈ 2/3 of it). If the tally
+    /// wrongly counted `Errored` too, the two would be equal — this is the only
+    /// test that exercises the count-only-Completed branch (pool.rs).
+    #[test]
+    fn errored_iterations_are_not_counted_but_their_requests_are() {
+        let metrics = BuiltinMetrics::new();
+        // Per-VU `globalThis.__n` persists across iterations (long-lived VU).
+        let script = r#"
+            export default function () {
+                globalThis.__n = (globalThis.__n || 0) + 1;
+                http.get('http://x/');           // recorded BEFORE any throw
+                if (globalThis.__n % 3 === 0) throw new Error('every third');
+            }
+        "#;
+
+        let summary = run_constant_vus_on(
+            2,
+            script.to_string(),
+            4,
+            Duration::from_millis(200),
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            metrics.clone(),
+            CancellationToken::new(),
+        );
+
+        let iterations_metric = metrics.registry.counter_get("iterations");
+        let http_reqs =
+            metrics.registry.counter_get("http_reqs{expected_response:true,method:GET,status:200}");
+
+        assert!(summary.iterations_completed > 0, "some iterations completed");
+        // Every iteration (incl. thrown ones) issued exactly one GET, so http_reqs
+        // == total attempts > completed. This is the discriminating assertion.
+        assert!(
+            summary.iterations_completed < http_reqs,
+            "thrown iterations must NOT be counted: completed {} should be < http_reqs {}",
+            summary.iterations_completed,
+            http_reqs
+        );
+        // ~2/3 complete (every 3rd throws) — comfortably above half.
+        assert!(
+            summary.iterations_completed >= http_reqs / 2,
+            "≈2/3 of attempts complete: completed {} vs http_reqs {}",
+            summary.iterations_completed,
+            http_reqs
+        );
+        // Three lanes still agree on the completed-only count.
+        assert_eq!(
+            iterations_metric, summary.iterations_completed,
+            "iterations metric (coroutine lane) counts completed only, == executor tally"
+        );
+    }
+
     /// Cancellation (graceful, at the boundary): a token cancelled early stops the
     /// run well before the nominal duration. VUs stop at the next
     /// `IterationBoundary` — no force-unwind (that hard tier is a later slice).

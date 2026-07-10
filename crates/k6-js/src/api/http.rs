@@ -8,7 +8,7 @@ use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
 
-use crate::vu_sched::{HostOp, OpDone, YielderPtr};
+use crate::vu_sched::{AsyncMeta, HostOp, OpDone, Shared, YielderPtr};
 
 pub(crate) enum ResponseCallback {
     Default,
@@ -449,7 +449,10 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
             return raw;
         }
         const __http = {
-            request: function(method, url, body, params) {
+            // Request preparation (cookie-jar merge, body serialization, content
+            // type) shared by the sync `request` and the async path — so an
+            // async request participates in the jar BOTH directions too.
+            _prep: function(method, url, body, params) {
                 // Merge cookie header from jar
                 const allHeaders = Object.assign({}, (params && params.headers) || {});
                 const jarCookie = __buildCookieHeader(url);
@@ -539,8 +542,11 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
                 if (params && Object.prototype.hasOwnProperty.call(params, 'responseCallback')) {
                     responseCallbackArg = params.responseCallback;
                 }
-                const responseObj = __http_request(method, url, bodyArg, allHeaders, timeoutMs, tagsArg, responseCallbackArg);
-                return __wrap_response(responseObj);
+                return [method, url, bodyArg, allHeaders, timeoutMs, tagsArg, responseCallbackArg];
+            },
+            request: function(method, url, body, params) {
+                const a = this._prep(method, url, body, params);
+                return __wrap_response(__http_request(a[0], a[1], a[2], a[3], a[4], a[5], a[6]));
             },
             get: function(url, params) {
                 return __http.request('GET', url, null, params);
@@ -660,10 +666,48 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
 pub(crate) fn register_yielding_http(
     ctx: &Ctx<'_>,
     yp: YielderPtr,
+    shared: Shared,
     metrics: Option<BuiltinMetrics>,
 ) -> Result<()> {
+    // sync http.get/request: YIELD the coroutine, resume with the response.
+    {
+        let metrics = metrics.clone();
+        ctx.globals().set(
+            "__http_request",
+            Function::new(
+                ctx.clone(),
+                move |method: String,
+                      url: String,
+                      body: Value<'_>,
+                      headers_val: Value<'_>,
+                      timeout_ms: f64,
+                      tags_val: Value<'_>,
+                      response_callback_val: Value<'_>|
+                      -> JsHttpResponse {
+                    // Read the JS Values into owned data BEFORE the yield (they
+                    // don't survive the coroutine suspension); method/tags/callback
+                    // stay on the coroutine stack across the yield.
+                    let req = build_http_request(&method, url, &body, &headers_val, timeout_ms);
+                    let user_tags = object_entries_to_pairs(&tags_val);
+                    let response_callback = parse_response_callback(&response_callback_val);
+                    let result = match yp.await_one(HostOp::Http(req)) {
+                        OpDone::Http(r) => r,
+                        OpDone::Slept => unreachable!("http op resolved as a sleep"),
+                    };
+                    // Metrics recorded here, after resume — coroutine-side, no
+                    // borrow across the await. Reuses the sync CG-3 mapping.
+                    finish_http_response(result, &method, user_tags, &response_callback, metrics.as_ref())
+                },
+            )?,
+        )?;
+    }
+
+    // asyncRequest: REGISTER the request (does NOT yield) and return its op id.
+    // The driver loop runs it concurrently with others and resolves the promise
+    // via finish_http_response (metrics driver-loop-side). Prepped args come from
+    // __http._prep, so the async path carries the cookie jar + tags too.
     ctx.globals().set(
-        "__http_request",
+        "__register_async_http",
         Function::new(
             ctx.clone(),
             move |method: String,
@@ -673,24 +717,34 @@ pub(crate) fn register_yielding_http(
                   timeout_ms: f64,
                   tags_val: Value<'_>,
                   response_callback_val: Value<'_>|
-                  -> JsHttpResponse {
-                // Read the JS Values into owned data BEFORE the yield (they don't
-                // survive the coroutine suspension); method/tags/callback stay on
-                // the coroutine stack across the yield.
+                  -> f64 {
                 let req = build_http_request(&method, url, &body, &headers_val, timeout_ms);
-                let user_tags = object_entries_to_pairs(&tags_val);
-                let response_callback = parse_response_callback(&response_callback_val);
-                let result = match yp.await_one(HostOp::Http(req)) {
-                    OpDone::Http(r) => r,
-                    OpDone::Slept => unreachable!("http op resolved as a sleep"),
+                let meta = AsyncMeta {
+                    method,
+                    user_tags: object_entries_to_pairs(&tags_val),
+                    response_callback: parse_response_callback(&response_callback_val),
                 };
-                // Metrics recorded here, after resume — coroutine-side, no borrow
-                // across the await. Reuses the exact sync CG-3 mapping.
-                finish_http_response(result, &method, user_tags, &response_callback, metrics.as_ref())
+                shared.register_async(HostOp::Http(req), Some(meta)) as f64
             },
         )?,
     )?;
+
     register_http_object(ctx)?;
+
+    // Override the stub asyncRequest with the register-based concurrent one. It
+    // reuses __http._prep (cookie jar both directions) and __wrap_response (parity
+    // bar: res.json()/.cookies), and mints its promise via the driver-loop resolver.
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.http.asyncRequest = function (method, url, body, params) {
+            var a = globalThis.http._prep(method, url, body || null, params);
+            var id = __register_async_http(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+            return new Promise(function (resolve) {
+                globalThis.__resolvers[id] = function (raw) { resolve(__wrap_response(raw)); };
+            });
+        };
+    "#,
+    )?;
     Ok(())
 }
 

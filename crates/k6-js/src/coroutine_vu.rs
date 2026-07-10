@@ -55,6 +55,7 @@ pub(crate) enum IterationOutcome {
 fn bootstrap_api(
     ctx: &rquickjs::Ctx<'_>,
     yp: YielderPtr,
+    shared: Shared,
     metrics: Option<BuiltinMetrics>,
 ) -> Result<()> {
     // console is OBSERVABILITY — richer output capture folds into #6 with the
@@ -80,7 +81,7 @@ fn bootstrap_api(
     crate::api::webcrypto::register(ctx)?;
 
     // Yielding http + sleep (native fns yield instead of block_on).
-    register_yielding_http(ctx, yp, metrics.clone())?;
+    register_yielding_http(ctx, yp, shared, metrics.clone())?;
     crate::api::sleep::register_yielding(ctx, yp)?;
 
     // check + group + custom metric constructors.
@@ -112,7 +113,7 @@ pub(crate) fn build_coroutine_vu(
         // --- bootstrap ONCE: real yielding http (jar + __wrap_response) + the
         // user module scope (defines __k6_default). Real API surface grows here.
         ctx.with(|ctx| {
-            bootstrap_api(&ctx, yp, metrics.clone()).expect("bootstrap k6 API");
+            bootstrap_api(&ctx, yp, shared.clone(), metrics.clone()).expect("bootstrap k6 API");
             ctx.eval::<(), _>(
                 "globalThis.__resolvers = {}; globalThis.__done = false; globalThis.__ret = '';",
             )
@@ -449,6 +450,74 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         }
         assert_eq!(a, b, "randomSeed must be a real PRNG (deterministic), not a no-op");
+    }
+
+    /// asyncRequest concurrency + parity: two in-VU `http.asyncRequest`s behind
+    /// `Promise.all` OVERLAP (~100 ms, not ~200 ms serial), and each resolves a
+    /// WRAPPED response (`res.json()` works — the parity bar). The async path
+    /// registers (doesn't yield the whole VU), so they run concurrently.
+    #[test]
+    fn async_requests_overlap_in_vu_with_wrapper_parity() {
+        use std::time::{Duration, Instant};
+
+        struct DelayMock;
+        impl HttpClient for DelayMock {
+            fn send(
+                &self,
+                _req: HttpRequest,
+            ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/json".into())],
+                        body: ResponseBody::Buffered(br#"{"n":7}"#.to_vec()),
+                        timings: Timings { duration: 100.0, ..Default::default() },
+                        url: "http://x/".into(),
+                        data_sent: 20,
+                        data_received: 20,
+                    })
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (out, elapsed) = LocalSet::new().block_on(&rt, async {
+            let script = r#"
+                export default async function () {
+                    const rs = await Promise.all([
+                        http.asyncRequest('GET', 'http://x/'),
+                        http.asyncRequest('GET', 'http://x/'),
+                    ]);
+                    return rs[0].status + ',' + rs[0].json().n + ',' + rs[1].json().n;
+                }
+            "#;
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro =
+                build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+            let start = Instant::now();
+            spawn_vu(coro, shared.clone(), Arc::new(DelayMock), Backpressure::new(8), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            (out, start.elapsed())
+        });
+
+        // Wrapper parity: json() works on both resolved responses.
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "200,7,7".into() }),
+            "both asyncRequests resolved WRAPPED responses (res.json())"
+        );
+        // Overlap: two 100 ms requests in flight together, not serialized.
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "two in-VU asyncRequests should overlap (~100 ms), got {elapsed:?} — serialized"
+        );
     }
 
     /// bar (b): a thrown iteration is a TYPED `Errored`, not a `"ERR:"` string a

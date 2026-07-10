@@ -513,3 +513,55 @@ Spike landed behind the throwaway `async-spike` feature
   — but the guard drop must be async-safe and not double-count the iteration).
 - Keep the executor arrival-curve integral and dropped-iteration accounting
   (already correct) untouched by the spawn-model change.
+
+## ws/grpc streaming on the coroutine VU — design note (2026-07-10, review-before-build)
+
+ws/grpc do NOT fit the request/response yield (`AwaitOne`/`AwaitAll`). Forcing
+them in would be wrong. But — key finding — they need **no new `Yield`
+vocabulary**; the streaming is a **JS-level nested loop**, and each event is a
+*repeatable* one-op yield.
+
+**Current sync model (`ws.rs`):** `__ws_open(url)` block_on's the handshake and
+spawns a background connection task holding `cmd_tx` (JS→socket) + `evt_rx`
+(socket→JS). The `ws.connect(url, fn)` JS shim runs a **recv loop**:
+`fn(socket)`, then `while(open){ evt = __ws_recv(id, timeout); dispatch evt to
+socket.on(...) handlers }` until Close. `__ws_recv` block_on's `evt_rx.recv()`.
+
+**Coroutine mapping:**
+- **The nested driver loop is the JS recv loop** (`ws.connect`'s shim), running
+  *inside* the coroutine's iteration, under its `ctx.with` borrow. It is NOT a
+  second Rust driver loop.
+- `__ws_open` → `AwaitOne(HostOp::WsConnect(url))` → scheduler does the handshake
+  + spawns the connection task → resumes with a session handle, stored in a
+  **per-VU Rust session registry** (extend `Shared`: `HashMap<id,{cmd_tx,evt_rx}>`).
+- `__ws_recv` → `AwaitOne(HostOp::WsRecv(id))` → scheduler awaits that session's
+  `evt_rx` (with timeout) → resumes with the event. **Repeatable** — the recv
+  loop calls it each turn. So ws reuses `AwaitOne`; only the op vocabulary grows
+  (`HostOp::WsConnect`/`WsRecv`, `OpDone::WsSession`/`WsEvent`).
+- `__ws_send`/`ping`/`close` → **non-yielding**: push a `WsCommand` onto the
+  session's `cmd_tx` (Rust channel), return.
+
+**I2 holds, new event source:** socket events queue in `evt_rx` (Rust channel),
+dispatched into JS **only** by the coroutine's recv loop under its own borrow.
+`drive_vu` only *awaits* the channel and resumes — it never touches a `Context`
+(I1). `run_op`'s access to the session registry is to channels, not a `Context`,
+so I1 is preserved.
+
+**Re-entrancy — the reviewer's question:** the recv loop is **sequential** (recv
+→ dispatch one handler to completion → recv), so `socket.on` handlers never
+overlap. A handler MAY itself yield (e.g. `http.get` inside `on('message')`) —
+that's a **nested** `AwaitOne` on the coroutine stack; the recv-loop frame is
+preserved across it and resumes cleanly. No re-entrant `with`.
+
+**grpc-streaming follows the same mold:** open stream → repeatable "await next
+message" (`AwaitOne(GrpcRecv)`), same session-registry + recv-loop shape.
+
+**Open decisions for the build:** (a) the connection task — `spawn_local` on the
+loop thread (its channels are `Send`, but keeping it local avoids cross-thread
+wakeups and fits I3); (b) recv timeout semantics (map tokio `timeout` →
+`WsEvent::Timeout` as today); (c) how the session registry threads through
+`Shared` vs a sibling `Rc` (leaning: a `ws` field on `VuShared`, since it's per-VU
+and the scheduler + coroutine both reach it same-thread); (d) whether `HostOp`
+grows ws/grpc variants or gains a generic `Boxed(future)` escape hatch to avoid
+`vu_sched` learning every protocol — the variant approach is simpler now, the
+generic one keeps `vu_sched` protocol-agnostic (decide at build).

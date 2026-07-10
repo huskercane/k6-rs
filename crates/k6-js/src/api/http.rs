@@ -692,7 +692,7 @@ pub(crate) fn register_yielding_http(
                     let response_callback = parse_response_callback(&response_callback_val);
                     let result = match yp.await_one(HostOp::Http(req)) {
                         OpDone::Http(r) => r,
-                        OpDone::Slept => unreachable!("http op resolved as a sleep"),
+                        _ => unreachable!("yielding http op must resolve as Http"),
                     };
                     // Metrics recorded here, after resume — coroutine-side, no
                     // borrow across the await. Reuses the sync CG-3 mapping.
@@ -760,7 +760,7 @@ pub(crate) fn register_yielding_http(
                 for (result, (method, user_tags, response_callback)) in results.into_iter().zip(metas) {
                     let r = match result {
                         OpDone::Http(r) => r,
-                        OpDone::Slept => unreachable!("batch op resolved as a sleep"),
+                        _ => unreachable!("batch op must resolve as Http"),
                     };
                     out.push(finish_http_response(r, &method, user_tags, &response_callback, metrics.as_ref()));
                 }

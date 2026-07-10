@@ -279,6 +279,7 @@ fn vu_coroutine(
                                     let _ = f.call::<_, ()>(("slept".to_string(),));
                                 }
                             }
+                            OpDone::Stream(_) => unreachable!("no streaming op in the harness"),
                             OpDone::Http(result) => {
                                 // Async http metrics land HERE — driver-loop-side,
                                 // inside our own borrow, exactly once per op.

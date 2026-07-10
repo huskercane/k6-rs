@@ -24,21 +24,24 @@
 //! coordinator.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
 
 use k6_core::backpressure::Backpressure;
+use k6_core::executor::arrival::ArrivalCurve;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, RunSummary};
 
 use crate::coroutine_vu::{IterationOutcome, build_coroutine_vu};
-use crate::vu_sched::{Shared, spawn_vu};
+use crate::vu_sched::{IterationControl, Shared, spawn_vu};
 
 /// Loop-thread count for `num_vus`: one per core, capped at the VU count (never
 /// more threads than VUs), floored at 1 when there are VUs at all.
@@ -202,6 +205,282 @@ fn run_loop_thread<C>(
             let _ = h.await;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Arrival-rate: the coordinator + its VU control port.
+// ---------------------------------------------------------------------------
+
+/// The arrival-rate control port: at each `IterationBoundary` (and once up front)
+/// the VU tallies the iteration it just finished, signals itself idle to the
+/// coordinator, then parks awaiting its per-VU dispatch (`RunNext`). The VU is a
+/// member of the coordinator's idle set **iff** parked here (= available); it is
+/// removed the instant the coordinator dispatches it (= busy) and re-enters only
+/// on its next boundary. The VU never touches the idle queue — it only SENDS its
+/// id — so the coordinator is the single writer.
+struct ArrivalControl {
+    my_id: usize,
+    idle_tx: UnboundedSender<usize>,
+    run_next_rx: UnboundedReceiver<()>,
+    result: Rc<RefCell<Option<IterationOutcome>>>,
+    completed: Arc<AtomicU64>,
+}
+
+impl IterationControl for ArrivalControl {
+    async fn next(&mut self, completed_iters: u32) -> bool {
+        if completed_iters >= 1 {
+            // Count only Completed (parity with the sync path — see constant-vus).
+            if let Some(IterationOutcome::Completed { .. }) = self.result.borrow().as_ref() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Signal idle, then await dispatch. A send error (coordinator gone) or a
+        // closed channel (senders dropped at end-of-run) ⇒ graceful Stop.
+        if self.idle_tx.send(self.my_id).is_err() {
+            return false;
+        }
+        self.run_next_rx.recv().await.is_some()
+    }
+}
+
+/// Run `num_vus` arrival-rate coroutine VUs of `script` driven by `curve` (constant
+/// OR ramping — `ArrivalCurve::constant`/`::new`), sharded across `num_threads`
+/// loop threads and paced by a single global coordinator. Blocks until the run
+/// completes. Drops (an arrival with no idle VU) ARE the load-test result.
+#[allow(clippy::too_many_arguments)]
+pub fn run_arrival_rate<C>(
+    script: String,
+    num_vus: usize,
+    curve: ArrivalCurve,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    cancel: CancellationToken,
+) -> RunSummary
+where
+    C: HttpClient + 'static,
+{
+    run_arrival_rate_on(
+        loop_thread_count(num_vus),
+        script,
+        num_vus,
+        curve,
+        client,
+        bp,
+        metrics,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_arrival_rate_on<C>(
+    num_threads: usize,
+    script: String,
+    num_vus: usize,
+    curve: ArrivalCurve,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    cancel: CancellationToken,
+) -> RunSummary
+where
+    C: HttpClient + 'static,
+{
+    if num_vus == 0 || num_threads == 0 {
+        return RunSummary {
+            iterations_completed: 0,
+            iterations_dropped: 0,
+            duration: Duration::ZERO,
+        };
+    }
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+
+    // Per-VU dispatch channels: coordinator holds the senders (by id), each VU its
+    // receiver. Idle channel: every VU clones `idle_tx` → coordinator's `idle_rx`.
+    let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let mut run_next_tx: Vec<UnboundedSender<()>> = Vec::with_capacity(num_vus);
+    let mut per_thread_rx: Vec<Vec<(usize, UnboundedReceiver<()>)>> =
+        (0..num_threads).map(|_| Vec::new()).collect();
+    for id in 0..num_vus {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        run_next_tx.push(tx);
+        per_thread_rx[id % num_threads].push((id, rx));
+    }
+
+    // Spawn loop threads FIRST so their VUs park and report idle; the coordinator's
+    // startup phase waits for all N reports before starting the clock.
+    let mut loop_threads = Vec::with_capacity(num_threads);
+    for (t, my_vus) in per_thread_rx.into_iter().enumerate() {
+        if my_vus.is_empty() {
+            continue;
+        }
+        let script = script.clone();
+        let client = Arc::clone(&client);
+        let bp = bp.clone();
+        let metrics = metrics.clone();
+        let idle_tx = idle_tx.clone();
+        let completed = Arc::clone(&completed);
+        loop_threads.push(
+            thread::Builder::new()
+                .name(format!("k6-loop-{t}"))
+                .spawn(move || run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed))
+                .expect("spawn loop thread"),
+        );
+    }
+    // Drop the main-thread idle_tx clone; only the VUs' clones keep it open.
+    drop(idle_tx);
+
+    // Coordinator on its own thread — it owns the idle set and the global arrival
+    // view. Returns the tight execution window (post-startup → exit).
+    let coordinator = {
+        let dropped = Arc::clone(&dropped);
+        thread::Builder::new()
+            .name("k6-coordinator".into())
+            .spawn(move || run_coordinator(idle_rx, run_next_tx, curve, num_vus, cancel, dropped))
+            .expect("spawn coordinator")
+    };
+
+    // Join coordinator first (it drops the dispatch senders on exit), then the loop
+    // threads (VUs see the closed channel and stop at their next boundary).
+    let duration = coordinator.join().unwrap_or(Duration::ZERO);
+    for h in loop_threads {
+        let _ = h.join();
+    }
+
+    RunSummary {
+        iterations_completed: completed.load(Ordering::Relaxed),
+        iterations_dropped: dropped.load(Ordering::Relaxed),
+        duration,
+    }
+}
+
+/// One arrival-rate loop thread: a current-thread runtime + `LocalSet` hosting its
+/// VUs, each with an [`ArrivalControl`] wired to its own dispatch receiver.
+fn run_arrival_loop_thread<C>(
+    vus: Vec<(usize, UnboundedReceiver<()>)>,
+    script: String,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    idle_tx: UnboundedSender<usize>,
+    completed: Arc<AtomicU64>,
+) where
+    C: HttpClient + 'static,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build loop-thread runtime");
+
+    LocalSet::new().block_on(&rt, async move {
+        let mut handles = Vec::with_capacity(vus.len());
+        for (id, run_next_rx) in vus {
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(
+                script.clone(),
+                shared.clone(),
+                Some(metrics.clone()),
+                result.clone(),
+            );
+            let control = ArrivalControl {
+                my_id: id,
+                idle_tx: idle_tx.clone(),
+                run_next_rx,
+                result,
+                completed: Arc::clone(&completed),
+            };
+            handles.push(spawn_vu(coro, shared, Arc::clone(&client), bp.clone(), control));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    });
+}
+
+/// The single global coordinator. Sole owner of the idle set; drives arrivals off
+/// the shared [`ArrivalCurve`] integral. Returns the execution-window duration.
+fn run_coordinator(
+    mut idle_rx: UnboundedReceiver<usize>,
+    run_next_tx: Vec<UnboundedSender<()>>,
+    curve: ArrivalCurve,
+    num_vus: usize,
+    cancel: CancellationToken,
+    dropped: Arc<AtomicU64>,
+) -> Duration {
+    let mut idle: VecDeque<usize> = VecDeque::with_capacity(num_vus);
+
+    // Startup: wait for all N VUs to report idle (the "pool full at t=0"
+    // equivalence — no startup skew), THEN start the arrival clock.
+    for _ in 0..num_vus {
+        match idle_rx.blocking_recv() {
+            Some(id) => idle.push_back(id),
+            None => return Duration::ZERO, // all VUs died before starting
+        }
+    }
+
+    let start = Instant::now();
+    let total = curve.total_duration();
+    let mut dispatched: u64 = 0;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Drain new idle reports into the queue. SINGLE WRITER: this is the only
+        // place the idle set is mutated.
+        while let Ok(id) = idle_rx.try_recv() {
+            idle.push_back(id);
+        }
+
+        let elapsed = start.elapsed();
+        let clamped = elapsed.min(total);
+        let target = curve.expected_arrivals(clamped);
+
+        // Fire every arrival whose scheduled position we've passed. Structurally
+        // identical to the sync executor's `while … { try_acquire → run |
+        // record_dropped }`: `idle.pop_front() == None` ⟺ pool exhausted ⟺ DROP,
+        // at the same integral instants. That correspondence IS the equivalence.
+        while (dispatched as f64) + 1.0 <= target {
+            dispatched += 1;
+            match idle.pop_front() {
+                // Dispatch to an idle VU. A closed VU channel (raced shutdown) is
+                // treated as a drop — the arrival slot is still consumed.
+                Some(id) => {
+                    if run_next_tx[id].send(()).is_err() {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if elapsed >= total {
+            break;
+        }
+
+        // Sleep ≈ next arrival (same prediction as the sync executor; the catch-up
+        // loop guarantees the count regardless of granularity). Cancellation is
+        // polled at the loop top, so worst-case stop latency is one sleep.
+        let inst_rate = curve.interpolate_rate(clamped);
+        let sleep = if inst_rate > 0.1 {
+            let deficit = (dispatched as f64 + 1.0 - target).max(0.0);
+            Duration::from_secs_f64((deficit / inst_rate).clamp(0.0005, 0.05))
+        } else {
+            Duration::from_millis(50)
+        };
+        thread::sleep(sleep);
+    }
+
+    let elapsed = start.elapsed();
+    // Drop the dispatch senders → every VU's `recv()` returns None → graceful Stop
+    // at its next boundary.
+    drop(run_next_tx);
+    elapsed
 }
 
 #[cfg(test)]
@@ -403,5 +682,113 @@ mod tests {
         );
         assert_eq!(summary.iterations_completed, 0);
         assert_eq!(summary.iterations_dropped, 0);
+    }
+
+    // --- arrival-rate coordinator ------------------------------------------
+
+    /// Drop-accounting bar (no-drop half): with an ample pool of fast VUs the
+    /// coordinator never finds the idle set empty at an arrival, so ZERO drops, and
+    /// the completed count lands on the curve integral (50/s × 0.4 s ≈ 20). Fast
+    /// http (instant mock) ⇒ each dispatched VU is back in the idle set long before
+    /// the next arrival.
+    #[test]
+    fn arrival_rate_ample_pool_no_drops_and_hits_integral() {
+        let curve = ArrivalCurve::constant(50, Duration::from_secs(1), Duration::from_millis(400));
+        let integral = curve.expected_arrivals(Duration::from_millis(400)); // ≈ 20
+        let summary = run_arrival_rate_on(
+            2,
+            "export default function () { http.get('http://x/'); }".to_string(),
+            20, // ample
+            curve,
+            Arc::new(Mock200),
+            Backpressure::new(64),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+        );
+        assert_eq!(summary.iterations_dropped, 0, "ample fast pool must not drop");
+        // completed ≈ integral (a small tail either way for the final tick).
+        let lo = (integral as u64).saturating_sub(6);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&summary.iterations_completed),
+            "completed {} should land near the integral {integral:.1}",
+            summary.iterations_completed
+        );
+    }
+
+    /// Drop-accounting bar (the crux) + integral-total equivalence: 2 VUs each
+    /// running a 50 ms iteration cannot sustain 100/s, so the coordinator finds the
+    /// idle set empty at many arrivals ⇒ real drops. AND every arrival slot is
+    /// accounted: completed + dropped ≈ the curve integral (100/s × 0.3 s ≈ 30) —
+    /// idle-empty ⟺ pool-exhausted, nothing lost. This is the drop-accounting
+    /// equivalence the coordinator exists to preserve; completed/dropped pull
+    /// apart here as they never did in slice 1.
+    #[test]
+    fn arrival_rate_saturated_drops_and_total_equals_integral() {
+        let curve = ArrivalCurve::constant(100, Duration::from_secs(1), Duration::from_millis(300));
+        let integral = curve.expected_arrivals(Duration::from_millis(300)); // ≈ 30
+        let summary = run_arrival_rate_on(
+            2,
+            "export default function () { sleep(0.05); }".to_string(), // 50 ms/iter
+            2, // saturated: 2 VUs vs 100/s
+            curve,
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+        );
+
+        assert!(summary.iterations_completed > 0, "some iterations completed");
+        assert!(
+            summary.iterations_dropped > 0,
+            "2 slow VUs vs 100/s must drop, got 0 (completed {})",
+            summary.iterations_completed
+        );
+        // Every arrival is accounted for: completed + dropped ≈ integral (no error
+        // in this script, so nothing sits in the errored bucket). Small tail for
+        // the boundary tick.
+        let total = summary.iterations_completed + summary.iterations_dropped;
+        let lo = (integral as u64).saturating_sub(3);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&total),
+            "completed {} + dropped {} = {total} should equal the integral {integral:.1} \
+             (idle-empty ⟺ pool-exhausted — every arrival dispatched or dropped)",
+            summary.iterations_completed,
+            summary.iterations_dropped
+        );
+    }
+
+    /// Ramp integral parity (mirrors the sync `ramp_matches_integral_count`): a
+    /// 0→100/s ramp over 0.3 s integrates to ≈15; with ample fast VUs the completed
+    /// count lands there — the coroutine coordinator honors the SAME `ArrivalCurve`
+    /// integral as the sync executor, so arrival instants match by construction.
+    #[test]
+    fn arrival_rate_ramp_completed_lands_on_integral() {
+        use k6_core::config::Stage;
+        let curve = ArrivalCurve::new(
+            0.0,
+            &[Stage { duration: Duration::from_millis(300), target: 100 }],
+            Duration::from_secs(1),
+        );
+        let integral = curve.expected_arrivals(Duration::from_millis(300)); // ≈ 15
+        let summary = run_arrival_rate_on(
+            2,
+            "export default function () { http.get('http://x/'); }".to_string(),
+            30, // ample
+            curve,
+            Arc::new(Mock200),
+            Backpressure::new(64),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+        );
+        assert_eq!(summary.iterations_dropped, 0, "ample pool ⇒ no drops on the ramp");
+        let lo = (integral as u64).saturating_sub(6);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&summary.iterations_completed),
+            "ramp completed {} should land near the integral {integral:.1}",
+            summary.iterations_completed
+        );
     }
 }

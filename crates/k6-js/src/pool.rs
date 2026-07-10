@@ -41,7 +41,7 @@ use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, RunSummary};
 
 use crate::coroutine_vu::{IterationOutcome, build_coroutine_vu};
-use crate::vu_sched::{IterationControl, Shared, spawn_vu};
+use crate::vu_sched::{HardStop, IterationControl, Shared, spawn_vu_hard};
 
 /// Max wait for VUs to report their initial idle at arrival-rate startup before
 /// the coordinator proceeds degraded. Idle reports are near-instant (a channel
@@ -71,6 +71,7 @@ pub fn run_constant_vus<C>(
     bp: Backpressure,
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
+    graceful_stop: Duration,
 ) -> RunSummary
 where
     C: HttpClient + 'static,
@@ -84,6 +85,7 @@ where
         bp,
         metrics,
         cancel,
+        graceful_stop,
     )
 }
 
@@ -100,6 +102,7 @@ fn run_constant_vus_on<C>(
     bp: Backpressure,
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
+    graceful_stop: Duration,
 ) -> RunSummary
 where
     C: HttpClient + 'static,
@@ -108,6 +111,10 @@ where
     let deadline = start + duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
+    let hard = HardStop {
+        token: CancellationToken::new(),
+        interrupted: Arc::new(AtomicU64::new(0)),
+    };
 
     let mut threads = Vec::with_capacity(num_threads);
     for t in 0..num_threads {
@@ -125,27 +132,34 @@ where
         let cancel = cancel.clone();
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let hard = hard.clone();
 
         threads.push(
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
                 .spawn(move || {
-                    run_loop_thread(my_vus, script, deadline, client, bp, metrics, cancel, completed, errored)
+                    run_loop_thread(my_vus, script, deadline, client, bp, metrics, cancel, completed, errored, hard)
                 })
                 .expect("spawn loop thread"),
         );
     }
 
+    // Watchdog arms the hard tier `graceful_stop` after graceful stop begins
+    // (deadline reached or cancel), so a VU stuck mid-op past the deadline is
+    // force_unwound and the join can't hang.
+    let watchdog =
+        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
     for h in threads {
         let _ = h.join();
     }
+    watchdog.finish();
 
     RunSummary {
         iterations_completed: completed.load(Ordering::Relaxed),
         iterations_dropped: 0, // constant-vus never drops (no arrival curve)
         iterations_errored: errored.load(Ordering::Relaxed),
+        iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
         duration: start.elapsed(),
-        ..Default::default()
     }
 }
 
@@ -162,6 +176,7 @@ fn run_loop_thread<C>(
     cancel: CancellationToken,
     completed: Arc<AtomicU64>,
     errored: Arc<AtomicU64>,
+    hard: HardStop,
 ) where
     C: HttpClient + 'static,
 {
@@ -212,18 +227,60 @@ fn run_loop_thread<C>(
                 !cancel.is_cancelled() && Instant::now() < deadline
             };
 
-            handles.push(spawn_vu(
+            handles.push(spawn_vu_hard(
                 coro,
                 shared,
                 Arc::clone(&client),
                 bp.clone(),
                 control,
+                hard.clone(),
             ));
         }
         for h in handles {
             let _ = h.await;
         }
     });
+}
+
+/// Constant-vus watchdog: graceful stop begins at `deadline` (or earlier on
+/// `cancel`); this fires the hard `token` `graceful_stop` after that, unless the
+/// run finishes first ([`Watchdog::finish`]). Distinct from the arrival watchdog,
+/// whose graceful stop begins the moment the coordinator returns.
+fn spawn_hard_stop_watchdog_at(
+    token: CancellationToken,
+    cancel: CancellationToken,
+    deadline: Instant,
+    graceful_stop: Duration,
+) -> Watchdog {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_thread = Arc::clone(&done);
+    let handle = thread::Builder::new()
+        .name("k6-hardstop".into())
+        .spawn(move || {
+            // Phase 1: wait for graceful stop to begin (deadline or cancel).
+            while !done_thread.load(Ordering::Relaxed)
+                && !cancel.is_cancelled()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if done_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            // Phase 2: graceful window, then arm the hard tier.
+            let hard_at = Instant::now() + graceful_stop;
+            while !done_thread.load(Ordering::Relaxed) && Instant::now() < hard_at {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !done_thread.load(Ordering::Relaxed) {
+                token.cancel();
+            }
+        })
+        .expect("spawn hard-stop watchdog");
+    Watchdog {
+        handle: Some(handle),
+        done,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +343,7 @@ pub fn run_arrival_rate<C>(
     bp: Backpressure,
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
+    graceful_stop: Duration,
 ) -> RunSummary
 where
     C: HttpClient + 'static,
@@ -299,6 +357,7 @@ where
         bp,
         metrics,
         cancel,
+        graceful_stop,
     )
 }
 
@@ -312,6 +371,7 @@ fn run_arrival_rate_on<C>(
     bp: Backpressure,
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
+    graceful_stop: Duration,
 ) -> RunSummary
 where
     C: HttpClient + 'static,
@@ -323,6 +383,13 @@ where
     let completed = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
+    // Hard-cancellation tier: fired by the watchdog `graceful_stop` after the run
+    // ends, to force_unwind any VU still parked mid-op (hung I/O) so the join
+    // can't hang. Each such VU counts as one interrupted iteration.
+    let hard = HardStop {
+        token: CancellationToken::new(),
+        interrupted: Arc::new(AtomicU64::new(0)),
+    };
 
     // Per-VU dispatch channels: coordinator holds the senders (by id), each VU its
     // receiver. Idle channel: every VU clones `idle_tx` → coordinator's `idle_rx`.
@@ -350,11 +417,12 @@ where
         let idle_tx = idle_tx.clone();
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let hard = hard.clone();
         loop_threads.push(
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
                 .spawn(move || {
-                    run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed, errored)
+                    run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed, errored, hard)
                 })
                 .expect("spawn loop thread"),
         );
@@ -372,19 +440,64 @@ where
             .expect("spawn coordinator")
     };
 
-    // Join coordinator first (it drops the dispatch senders on exit), then the loop
-    // threads (VUs see the closed channel and stop at their next boundary).
+    // Join coordinator first (it drops the dispatch senders on exit → graceful stop
+    // begins). Then, with the watchdog arming the hard tier `graceful_stop` later,
+    // join the loop threads: VUs at a boundary stop gracefully; any still parked
+    // mid-op past the deadline are force_unwound so the join can't hang.
     let duration = coordinator.join().unwrap_or(Duration::ZERO);
+    let watchdog = spawn_hard_stop_watchdog(hard.token.clone(), graceful_stop);
     for h in loop_threads {
         let _ = h.join();
     }
+    watchdog.finish();
 
     RunSummary {
         iterations_completed: completed.load(Ordering::Relaxed),
         iterations_dropped: dropped.load(Ordering::Relaxed),
         iterations_errored: errored.load(Ordering::Relaxed),
+        iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
         duration,
-        ..Default::default()
+    }
+}
+
+/// A watchdog that arms the hard-cancellation `token` a `graceful_stop` after the
+/// run's graceful stop begins — unless [`Watchdog::finish`] is called first
+/// (all VUs stopped gracefully, the common case). Fires exactly once. Kept generic
+/// so both arrival-rate and constant-vus reuse it.
+struct Watchdog {
+    handle: Option<thread::JoinHandle<()>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Watchdog {
+    /// The loop threads all joined ⇒ tell the watchdog to exit without firing.
+    fn finish(mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn spawn_hard_stop_watchdog(token: CancellationToken, graceful_stop: Duration) -> Watchdog {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_thread = Arc::clone(&done);
+    let handle = thread::Builder::new()
+        .name("k6-hardstop".into())
+        .spawn(move || {
+            let deadline = Instant::now() + graceful_stop;
+            while !done_thread.load(Ordering::Relaxed) {
+                if Instant::now() >= deadline {
+                    token.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .expect("spawn hard-stop watchdog");
+    Watchdog {
+        handle: Some(handle),
+        done,
     }
 }
 
@@ -400,6 +513,7 @@ fn run_arrival_loop_thread<C>(
     idle_tx: UnboundedSender<usize>,
     completed: Arc<AtomicU64>,
     errored: Arc<AtomicU64>,
+    hard: HardStop,
 ) where
     C: HttpClient + 'static,
 {
@@ -427,7 +541,14 @@ fn run_arrival_loop_thread<C>(
                 completed: Arc::clone(&completed),
                 errored: Arc::clone(&errored),
             };
-            handles.push(spawn_vu(coro, shared, Arc::clone(&client), bp.clone(), control));
+            handles.push(spawn_vu_hard(
+                coro,
+                shared,
+                Arc::clone(&client),
+                bp.clone(),
+                control,
+                hard.clone(),
+            ));
         }
         for h in handles {
             let _ = h.await;
@@ -571,6 +692,19 @@ mod tests {
         }
     }
 
+    /// A client whose `send` never resolves — models hung I/O (a server that
+    /// accepts the connection but never responds). A VU issuing `http.get` against
+    /// it parks mid-op forever; only the hard-cancellation tier can reclaim it.
+    struct HangClient;
+    impl HttpClient for HangClient {
+        fn send(&self, _req: HttpRequest) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+            async {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+    }
+
     /// Slice-1 headline: the spawn model runs coroutine VUs on loop threads to a
     /// graceful stop, with **many `!Send` VUs sharing one loop thread**
     /// (`num_vus=6` pinned to `num_threads=2` ⇒ 3 VUs per thread — the crux of the
@@ -598,6 +732,7 @@ mod tests {
             Backpressure::new(32),
             metrics.clone(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
 
         // (a) Real work happened — with 6 VUs and near-instant http over 200 ms
@@ -667,6 +802,7 @@ mod tests {
             Backpressure::new(16),
             metrics.clone(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
 
         let iterations_metric = metrics.registry.counter_get("iterations");
@@ -730,6 +866,7 @@ mod tests {
             Backpressure::new(16),
             metrics,
             cancel,
+            Duration::from_secs(5),
         );
 
         assert!(
@@ -752,6 +889,7 @@ mod tests {
             Backpressure::new(4),
             BuiltinMetrics::new(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
         assert_eq!(summary.iterations_completed, 0);
         assert_eq!(summary.iterations_dropped, 0);
@@ -777,6 +915,7 @@ mod tests {
             Backpressure::new(64),
             BuiltinMetrics::new(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
         assert_eq!(summary.iterations_dropped, 0, "ample fast pool must not drop");
         // completed ≈ integral (a small tail either way for the final tick).
@@ -809,6 +948,7 @@ mod tests {
             Backpressure::new(16),
             BuiltinMetrics::new(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
 
         assert!(summary.iterations_completed > 0, "some iterations completed");
@@ -861,6 +1001,7 @@ mod tests {
             Backpressure::new(16),
             BuiltinMetrics::new(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
 
         assert!(summary.iterations_completed > 0, "some completed: {summary:?}");
@@ -901,12 +1042,156 @@ mod tests {
             Backpressure::new(16),
             BuiltinMetrics::new(),
             cancel,
+            Duration::from_secs(5),
         );
         // Cancelled before the clock started ⇒ no arrivals, an empty summary, and
         // (the point) the call RETURNED rather than deadlocking.
         assert_eq!(summary.iterations_completed, 0);
         assert_eq!(summary.iterations_dropped, 0);
         assert!(summary.duration < Duration::from_secs(1));
+    }
+
+    /// Four-way conservation with the HARD tier (slice 3b): every VU issues an
+    /// `http.get` against a client that never responds, so each parks mid-op
+    /// forever. Graceful stop can't reclaim them (they never reach a boundary);
+    /// only the watchdog's `force_unwind` at `graceful_stop` does — counting each
+    /// as INTERRUPTED, not errored. Asserts (a) the run TERMINATES at all (proof
+    /// force_unwind reclaims a coroutine parked inside QuickJS C frames — the join
+    /// would hang forever otherwise); (b) both VUs are interrupted, nothing
+    /// completed/errored; (c) four-way conservation: the remaining arrivals dropped
+    /// (no idle VU), so completed + dropped + errored + interrupted == integral.
+    #[test]
+    fn arrival_rate_hung_vus_interrupted_and_conserve_four_ways() {
+        let curve = ArrivalCurve::constant(100, Duration::from_secs(1), Duration::from_millis(200));
+        let integral = curve.expected_arrivals(Duration::from_millis(200)); // ≈ 20
+        let summary = run_arrival_rate_on(
+            2,
+            "export default function () { http.get('http://hang/'); }".to_string(),
+            2, // both VUs will hang on their first dispatch
+            curve,
+            Arc::new(HangClient),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(150), // short graceful stop → fast force_unwind
+        );
+
+        // (a) We reached this line ⇒ the loop-thread join returned ⇒ force_unwind
+        // reclaimed the two coroutines parked mid-http.get.
+        // (b) Nothing finished; both VUs were force-unwound → interrupted.
+        assert_eq!(summary.iterations_completed, 0, "hung client completes nothing");
+        assert_eq!(summary.iterations_errored, 0, "hung ≠ errored");
+        assert_eq!(
+            summary.iterations_interrupted, 2,
+            "both VUs hung mid-op and were force_unwound as interrupted: {summary:?}"
+        );
+        assert!(
+            summary.iterations_dropped > 0,
+            "arrivals past the 2 hung VUs had no idle VU → dropped: {summary:?}"
+        );
+        // (c) Four-way conservation.
+        let total = summary.iterations_completed
+            + summary.iterations_dropped
+            + summary.iterations_errored
+            + summary.iterations_interrupted;
+        let lo = (integral as u64).saturating_sub(3);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&total),
+            "completed {} + dropped {} + errored {} + interrupted {} = {total} should \
+             conserve to the integral {integral:.1}",
+            summary.iterations_completed,
+            summary.iterations_dropped,
+            summary.iterations_errored,
+            summary.iterations_interrupted
+        );
+    }
+
+    /// Constant-vus hard tier: a VU stuck on hung I/O past the duration must NOT
+    /// hang the run — the watchdog force_unwinds it (counted interrupted) so the
+    /// join returns. Without the hard tier this test would deadlock.
+    #[test]
+    fn constant_vus_hung_vu_is_force_unwound_not_a_deadlock() {
+        let summary = run_constant_vus_on(
+            1,
+            "export default function () { http.get('http://hang/'); }".to_string(),
+            1,
+            Duration::from_millis(100), // duration
+            Arc::new(HangClient),
+            Backpressure::new(4),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(100), // graceful stop
+        );
+        // Reaching here at all is the assertion: the run terminated. The stuck VU
+        // is accounted as interrupted, not completed/errored.
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_errored, 0);
+        assert_eq!(summary.iterations_interrupted, 1, "the hung VU was force-unwound");
+    }
+
+    /// ws-abort gate (slice 3b): a VU parked in a `ws.connect` recv loop — live ws
+    /// read/write tasks, socket, and the sibling session registry all on its
+    /// coroutine stack — is force_unwound at the hard deadline. Proves that path
+    /// tears down CLEANLY (no abort/hang) through the production executor: the
+    /// coroutine's Context drop runs `WsSession::drop`, aborting the read/write
+    /// tasks. The server thread joins once the client side tore the socket down —
+    /// the end-to-end signal the VU was fully reclaimed.
+    #[test]
+    fn constant_vus_ws_blocked_vu_force_unwound_cleanly() {
+        use futures_util::StreamExt;
+        use tokio::net::TcpListener;
+
+        // WS server: accept one conn, never send, hold until the client drops.
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                if let Ok((stream, _)) = listener.accept().await {
+                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                        let (_w, mut r) = ws.split();
+                        // Never send; loop until the client disconnects (read yields
+                        // None) — which happens when its aborted tasks drop the socket.
+                        while let Some(Ok(m)) = r.next().await {
+                            if m.is_close() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+
+        // The recv loop waits forever (no message, no close) → the VU never returns
+        // from ws.connect → force_unwound at the hard deadline.
+        let script = format!(
+            r#"export default function () {{
+                ws.connect('ws://{addr}/', function (socket) {{
+                    socket.on('message', function () {{}});
+                }});
+            }}"#
+        );
+        let summary = run_constant_vus_on(
+            1,
+            script,
+            1,
+            Duration::from_millis(150),
+            Arc::new(Mock200),
+            Backpressure::new(4),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            summary.iterations_interrupted, 1,
+            "ws-blocked VU must be force-unwound as interrupted: {summary:?}"
+        );
+        // The server thread returns only once the client tore the socket down —
+        // i.e. the force_unwound VU's ws tasks/socket were dropped, not leaked.
+        server.join().expect("ws server thread joins ⇒ client fully torn down");
     }
 
     /// Ramp integral parity (mirrors the sync `ramp_matches_integral_count`): a
@@ -931,6 +1216,7 @@ mod tests {
             Backpressure::new(64),
             BuiltinMetrics::new(),
             CancellationToken::new(),
+            Duration::from_secs(5),
         );
         assert_eq!(summary.iterations_dropped, 0, "ample pool ⇒ no drops on the ramp");
         let lo = (integral as u64).saturating_sub(6);

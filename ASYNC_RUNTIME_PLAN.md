@@ -830,3 +830,33 @@ Linux x86-64 (the soak platform). Conclusion: the hard-cancellation tier CAN use
 `force_unwind`; no redesign needed. Kept as regression locks (`#[ignore]`, run
 explicitly) — flip to non-ignored only if we ever gain a non-x86-64/Windows target
 where SEH/DWARF differences could reintroduce the risk.
+
+### #5 slice 3b — hard-cancellation tier: BUILT (force_unwind validated safe)
+
+- `HardStop { token, interrupted }` + `spawn_vu_hard`/`drive_vu`: a hard-cancel
+  arm on each op-select (AwaitOne/AwaitAll/AwaitPending). When it fires (the
+  coroutine is suspended at a yield ⇒ `force_unwind` is safe), the VU is unwound
+  and its in-flight iteration counted **interrupted, not errored**. `spawn_vu`
+  stays a graceful-only forwarder (`HardStop::never()`), so the 10 test/vu_loop
+  callers are unchanged.
+- Executors: a `graceful_stop` watchdog arms the hard token that long after
+  graceful stop begins (arrival: coordinator returns; constant-vus: deadline or
+  cancel), so a VU stuck mid-op past the deadline is force_unwound and the join
+  can't hang. `interrupted` flows to `RunSummary`.
+- ws-abort gate: `WsSession` now owns the read/write `JoinHandle`s and aborts them
+  on `Drop`, so a force_unwind (Context → registry → session drop) can't orphan a
+  read task parked on `read.next()`. No-op on the graceful-close / `__ws_cleanup`
+  paths.
+- Tests: four-way conservation with hung I/O (`completed+dropped+errored+
+  interrupted==integral`, interrupted the hung VUs, dropped the rest); constant-vus
+  hung VU force_unwound not a deadlock; ws-blocked VU force_unwound cleanly through
+  the production executor (server thread joins ⇒ client torn down). All stable.
+- **interrupted ≠ errored is locked**: the hung-client tests assert
+  `errored==0, interrupted==N` — a graceful/hard shutdown cannot inflate the error
+  count or trip an error threshold in the run's final second.
+
+Slice 3 COMPLETE. Remaining before soak: remaining VU-based executors
+(ramping-vus / per-vu / shared-iterations / externally-controlled) on the
+coroutine model, the `main.rs` cutover, fat-frame stack measurement, 7900 soak.
+Task #9 (general loop-thread-panic undercount, distinct from the startup deadlock
+closed in 3a) still open for the soak slice.

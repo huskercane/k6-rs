@@ -192,6 +192,22 @@ pub fn register(
 struct WsSession {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WsCommand>,
     evt_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WsEvent>>>,
+    /// Read/write task handles, aborted on teardown (see `Drop`).
+    read_handle: tokio::task::JoinHandle<()>,
+    write_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WsSession {
+    fn drop(&mut self) {
+        // Gate (a) of the hard-cancellation tier: when a VU is force_unwound
+        // mid-ws, dropping its Context drops the registry → this session. The read
+        // task is parked on `read.next()` (a hung/idle socket may never wake it)
+        // and the write task on `cmd_rx.recv()`; without an explicit abort they'd
+        // orphan on the loop thread. `abort()` on an already-finished task (the
+        // graceful-close path, and `__ws_cleanup`'s removed session) is a no-op.
+        self.read_handle.abort();
+        self.write_handle.abort();
+    }
 }
 
 #[derive(Debug)]
@@ -303,7 +319,7 @@ async fn ws_open_impl(
 
     // Spawn read task
     let evt_tx_clone = evt_tx.clone();
-    handle.spawn(async move {
+    let read_handle = handle.spawn(async move {
         while let Some(msg) = read.next().await {
             let event = match msg {
                 Ok(Message::Text(text)) => WsEvent::Message(text.to_string()),
@@ -327,7 +343,7 @@ async fn ws_open_impl(
     });
 
     // Spawn write task
-    handle.spawn(async move {
+    let write_handle = handle.spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 WsCommand::Send(text) => {
@@ -356,6 +372,8 @@ async fn ws_open_impl(
             WsSession {
                 cmd_tx,
                 evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
+                read_handle,
+                write_handle,
             },
         );
     }
@@ -427,7 +445,7 @@ async fn ws_connect_coro(url: String, timeout_ms: f64) -> WsOpen {
 
     // Read task (socket -> evt_tx), on the loop thread.
     let evt_tx2 = evt_tx.clone();
-    tokio::task::spawn_local(async move {
+    let read_handle = tokio::task::spawn_local(async move {
         while let Some(msg) = read.next().await {
             let event = match msg {
                 Ok(Message::Text(t)) => WsEvent::Message(t.to_string()),
@@ -451,7 +469,7 @@ async fn ws_connect_coro(url: String, timeout_ms: f64) -> WsOpen {
     });
 
     // Write task (cmd_rx -> socket), on the loop thread.
-    tokio::task::spawn_local(async move {
+    let write_handle = tokio::task::spawn_local(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 WsCommand::Send(t) => {
@@ -477,6 +495,8 @@ async fn ws_connect_coro(url: String, timeout_ms: f64) -> WsOpen {
         session: WsSession {
             cmd_tx,
             evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
+            read_handle,
+            write_handle,
         },
         connecting_ms,
     }

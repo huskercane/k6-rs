@@ -255,10 +255,13 @@ fn vu_coroutine(
                 for (op, done) in drained {
                     let val: String = match done {
                         OpDone::Slept => "slept".to_string(),
-                        // async http lands here once asyncRequest is wired (next
-                        // slice); it will finish_http_response + resolve a real
-                        // response. No async-http op is issued in this slice.
-                        OpDone::Http(_) => "http".to_string(),
+                        // No async-http op is issued yet. Loud on purpose: a
+                        // half-wired asyncRequest that pushes HostOp::Http before
+                        // the resolution logic lands must PANIC here, not silently
+                        // resolve its JS promise to a garbage string.
+                        OpDone::Http(_) => {
+                            unreachable!("async http resolution lands in the next slice")
+                        }
                     };
                     let key = op.to_string();
                     if let Ok(f) = resolvers.get::<_, Function>(key.as_str()) {

@@ -344,8 +344,19 @@ shortcut — it would build a special case you later rip out).
   minted via `ctx.promise()` behind one `Promise.all` settle **out of order, with
   the second op still in flight**, across borrow boundaries, job queue intact.
   Confirms the unified model is buildable on a sync `Context` — no `AsyncContext`.
-- **1b-1 — yield primitive + scheduler.** The scheduler owns only
-  `(coroutines, futures)` and **never borrows a `Context`** (the invariant).
+- **1b-1 — yield primitive + scheduler. DONE ✅ (2026-07-10, composition proven).**
+  `crates/k6-js/src/vu_loop.rs` (still `b2-spike`-gated; wires to production
+  `QuickJsVu` in #3). Real composition — a live coroutine yields, a real tokio
+  future completes on the scheduler, the coroutine resumes, the driver loop
+  resolves promises + drains jobs — with **both invariants** enforced: **I1** the
+  scheduler owns only `(coroutines, futures)`, never a `Context`; **I2**
+  (queue-don't-resolve) completions push to a per-VU Rust queue, resolved ONLY by
+  the coroutine's driver loop inside its own borrow. 3 tests green, incl. the
+  headline hazard `composition_async_completes_during_sync_park`: an async op
+  completes *during* a sync-fetch park (borrow held) → queued, not resolved →
+  resolved after the park (`s50|a10`, no double-borrow). Two delivery modes over
+  one yield primitive: `AwaitOne` (sync, direct resume) / `AwaitPending` (async,
+  driver-loop-applied).
 - **1b-2 — per-VU driver loop.** `run_iteration` becomes the coroutine's own
   event loop (settle ops → drain jobs → yield). Convert sync-blocking host fns
   (`http.get`/`request`, `sleep`, sync `ws`/`grpc`) to yield; `asyncRequest`

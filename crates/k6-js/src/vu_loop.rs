@@ -292,6 +292,17 @@ async fn drive_vu(mut coro: VuCoroutine, shared: Shared) {
                 resume = Resume::SyncDone(val);
             }
             Yield::AwaitPending => {
+                // The coroutine only yields AwaitPending when it believes work is
+                // outstanding, and we just drained registered → pending above, so
+                // `pending` must be non-empty. If it isn't, `outstanding` has
+                // desynced from the queues — which (since termination now rides
+                // on the counter) would busy-spin: next() on an empty
+                // FuturesUnordered is Ready(None) → Progressed → not idle →
+                // AwaitPending → … . Make the desync a loud failure instead.
+                debug_assert!(
+                    !pending.is_empty(),
+                    "AwaitPending with no in-flight futures — outstanding desynced from queues"
+                );
                 if let Some((op, res)) = pending.next().await {
                     shared.0.borrow_mut().completed.push_back((op, res));
                 }

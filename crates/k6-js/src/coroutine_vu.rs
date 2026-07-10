@@ -513,10 +513,53 @@ mod tests {
             Some(IterationOutcome::Completed { value: "200,7,7".into() }),
             "both asyncRequests resolved WRAPPED responses (res.json())"
         );
-        // Overlap: two 100 ms requests in flight together, not serialized.
+        // Bracket both: >=90ms proves the requests actually took ~100ms (not
+        // resolved instantly / mock bypassed), <180ms proves they overlapped
+        // (serialized would be ~200ms).
         assert!(
-            elapsed < Duration::from_millis(180),
-            "two in-VU asyncRequests should overlap (~100 ms), got {elapsed:?} — serialized"
+            elapsed >= Duration::from_millis(90) && elapsed < Duration::from_millis(180),
+            "two in-VU asyncRequests should both take ~100 ms AND overlap, got {elapsed:?}"
+        );
+    }
+
+    /// Regression-lock the async path's `__wrap_response` application: iteration
+    /// 1's `asyncRequest` gets a Set-Cookie (extracted into the jar BY the
+    /// resolver's `__wrap_response`), iteration 2's `asyncRequest` sends it. If a
+    /// future change dropped `__wrap_response` from the async resolver, iter 1
+    /// wouldn't extract → iter 2 sends nothing → this fails (the sync-only cookie
+    /// test wouldn't catch it).
+    #[test]
+    fn async_request_participates_in_cookie_jar_both_directions() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let seen = LocalSet::new().block_on(&rt, async {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let client = Arc::new(CookieMock {
+                set_cookie: "sid=xyz; Path=/".into(),
+                seen_cookie: seen.clone(),
+            });
+            let script = r#"
+                export default async function () {
+                    const r = await http.asyncRequest('GET', 'http://example.test/');
+                    return r.status;
+                }
+            "#;
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro =
+                build_coroutine_vu(script.to_string(), shared.clone(), None, result);
+            spawn_vu(coro, shared.clone(), client, Backpressure::new(8), |n| n < 2)
+                .await
+                .unwrap();
+            let s = seen.lock().unwrap().clone();
+            s
+        });
+        assert_eq!(
+            seen.as_deref(),
+            Some("sid=xyz"),
+            "async request sent the jar cookie extracted from a prior async response"
         );
     }
 

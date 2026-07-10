@@ -745,8 +745,11 @@ pub fn prepare_script_with_dir(source: &str, script_dir: Option<&Path>) -> Strin
             output.push_str("// ");
             output.push_str(line);
             output.push('\n');
-        } else if trimmed.starts_with("export default function") {
-            // export default function() { ... } → globalThis.__k6_default = function() { ... }
+        } else if trimmed.starts_with("export default function")
+            || trimmed.starts_with("export default async function")
+        {
+            // export default [async] function() {...} → globalThis.__k6_default = [async] function() {...}
+            // (async default fns are needed for await http.asyncRequest / Promise.all.)
             let rest = trimmed.strip_prefix("export default ").unwrap();
             output.push_str("globalThis.__k6_default = ");
             output.push_str(rest);

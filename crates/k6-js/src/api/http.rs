@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use rquickjs::prelude::Async;
 use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
-use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, ResponseBody, Timings};
+use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
 
 enum ResponseCallback {
     Default,
@@ -564,6 +565,195 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
         globalThis.http = __http;
     "##)?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Async http surface — the ALREADY-AWAITED path (asyncRequest, and later
+// promise-returning timers). This is the part of Phase 1 that is genuinely
+// mechanical: scripts already `await` it, so no suspension mechanism is needed.
+//
+// SYNC `http.get()` is deliberately NOT handled here. Making a synchronous,
+// un-awaited JS call yield a shared loop is unsolved and gated on the B2
+// stackful-coroutine spike (see ASYNC_RUNTIME_PLAN.md). Converting it via a
+// forced-await transpile (B1) is unsound in general (map(http.get) needs
+// whole-program dataflow), so it is explicitly out of this increment.
+//
+// The two helpers below are shared by this async path. The sync `__http_request`
+// closure keeps its own inline twin this increment (left untouched to bound
+// blast radius); both collapse onto the coroutine-yielding version at cutover.
+// ---------------------------------------------------------------------------
+
+/// Build an owned `HttpRequest` from the JS-side arguments. Runs synchronously
+/// (it reads the `Value`s), so an async host fn can call it up front and then
+/// move the owned request into its future.
+fn build_http_request(
+    method: &str,
+    url: String,
+    body: &Value<'_>,
+    headers_val: &Value<'_>,
+    timeout_ms: f64,
+) -> HttpRequest {
+    let headers = object_entries_to_pairs(headers_val);
+    let timeout = if timeout_ms > 0.0 {
+        Some(std::time::Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    };
+    let body_bytes = if body.is_null() || body.is_undefined() {
+        None
+    } else if let Some(s) = body.as_string() {
+        Some(s.to_string().unwrap_or_default().into_bytes())
+    } else {
+        None
+    };
+    let http_method = match method {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        "PUT" => HttpMethod::Put,
+        "PATCH" => HttpMethod::Patch,
+        "DELETE" => HttpMethod::Delete,
+        "HEAD" => HttpMethod::Head,
+        "OPTIONS" => HttpMethod::Options,
+        _ => HttpMethod::Get,
+    };
+    HttpRequest {
+        method: http_method,
+        url,
+        headers,
+        body: body_bytes,
+        timeout,
+    }
+}
+
+/// Turn a client `send` result into the `JsHttpResponse` the JS layer sees,
+/// recording metrics with the same tag/failure semantics as the sync path
+/// (CG-3 system+user tags, data_sent/received, status=0 on transport failure).
+/// Plain data in/out — no `Ctx` — so it can run inside the host fn's future.
+fn finish_http_response(
+    result: anyhow::Result<HttpResponse>,
+    method: &str,
+    user_tags: Vec<(String, String)>,
+    response_callback: &ResponseCallback,
+    metrics: Option<&BuiltinMetrics>,
+) -> JsHttpResponse {
+    match result {
+        Ok(mut resp) => {
+            if let Some(m) = metrics {
+                let expected = response_callback.expected(resp.status);
+                let mut all_tags: Vec<(String, String)> = user_tags.clone();
+                all_tags.push(("status".to_string(), resp.status.to_string()));
+                all_tags.push(("method".to_string(), method.to_string()));
+                if let Some(expected) = expected {
+                    all_tags.push(("expected_response".to_string(), expected.to_string()));
+                }
+                m.record_http_request_tagged_with_failure(
+                    &resp.timings,
+                    expected.map(|ok| !ok),
+                    &all_tags,
+                );
+                m.record_data_sent(resp.data_sent);
+                m.record_data_received(resp.data_received);
+            }
+
+            let body_str = match std::mem::replace(&mut resp.body, ResponseBody::Discarded) {
+                ResponseBody::Buffered(b) => String::from_utf8(b)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+                ResponseBody::Discarded => String::new(),
+            };
+
+            JsHttpResponse {
+                status: resp.status,
+                body: body_str,
+                headers: resp.headers,
+                timings: resp.timings,
+                url: resp.url,
+                error: String::new(),
+                error_code: 0,
+            }
+        }
+        Err(e) => {
+            if let Some(m) = metrics {
+                let timings = Timings::default();
+                let expected = response_callback.expected(0);
+                let mut all_tags: Vec<(String, String)> = user_tags.clone();
+                all_tags.push(("status".to_string(), "0".to_string()));
+                all_tags.push(("method".to_string(), method.to_string()));
+                if let Some(expected) = expected {
+                    all_tags.push(("expected_response".to_string(), expected.to_string()));
+                }
+                m.record_http_request_tagged_with_failure(
+                    &timings,
+                    expected.map(|ok| !ok),
+                    &all_tags,
+                );
+            }
+
+            let error_code = classify_error(&e);
+            JsHttpResponse {
+                status: 0,
+                body: String::new(),
+                headers: Vec::new(),
+                timings: Timings::default(),
+                url: String::new(),
+                error: e.to_string(),
+                error_code,
+            }
+        }
+    }
+}
+
+/// Register `__http_request_async` — the async counterpart of `__http_request`,
+/// for VUs running on an `AsyncRuntime`. Same request/response semantics, but it
+/// **awaits** the client on the VU's own loop (no `block_on`) and resolves a JS
+/// promise. Intended to back `http.asyncRequest` (and `http.batch` later).
+///
+/// Registered on an async context only: on a sync `Runtime` the returned
+/// future would never be driven (no async executor), so the promise would hang.
+pub fn register_async_request<C: HttpClient + 'static>(
+    ctx: &Ctx<'_>,
+    client: Arc<C>,
+    backpressure: Backpressure,
+    metrics: Option<BuiltinMetrics>,
+) -> Result<()> {
+    ctx.globals().set(
+        "__http_request_async",
+        Function::new(
+            ctx.clone(),
+            Async(
+                move |method: String,
+                      url: String,
+                      body: Value<'_>,
+                      headers_val: Value<'_>,
+                      timeout_ms: f64,
+                      tags_val: Value<'_>,
+                      response_callback_val: Value<'_>| {
+                    // Sync prep: read the JS Values into owned data up front...
+                    let req = build_http_request(&method, url, &body, &headers_val, timeout_ms);
+                    let user_tags = object_entries_to_pairs(&tags_val);
+                    let response_callback = parse_response_callback(&response_callback_val);
+                    // ...clone per-call captures so the future is 'static...
+                    let client = Arc::clone(&client);
+                    let bp = backpressure.clone();
+                    let metrics = metrics.clone();
+                    // ...then the future holds nothing borrowed from `'js`.
+                    async move {
+                        let result = {
+                            let _permit = bp.acquire().await;
+                            client.send(req).await
+                        };
+                        finish_http_response(
+                            result,
+                            &method,
+                            user_tags,
+                            &response_callback,
+                            metrics.as_ref(),
+                        )
+                    }
+                },
+            ),
+        )?,
+    )?;
     Ok(())
 }
 
@@ -1284,6 +1474,72 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn async_http_request_resolves_on_async_loop() {
+        // The already-awaited http surface as a TRUE async host fn on the async
+        // VU foundation: __http_request_async awaits the client across an
+        // `.await`, driven by spawn_driver, and resolves a JS promise that
+        // `await http.asyncRequest(...)` unwraps. This is the !Send-across-await
+        // proof end-to-end on the pool-of-loops runtime.
+        //
+        // Sync http.get is intentionally NOT exercised here — it needs the B2
+        // stackful-coroutine suspension mechanism, out of this increment.
+        use crate::runtime;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let qjs = runtime::create_async_runtime().await.unwrap();
+            let ctx = runtime::create_async_context(&qjs).await.unwrap();
+            let client = Arc::new(MockHttpClient::new(201, r#"{"ok":true}"#));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register_async_request(&ctx, client, bp, None).unwrap();
+                // Minimal asyncRequest wrapper over the async native fn — the
+                // shape the production wrapper takes once the http object moves
+                // onto the async runtime at cutover.
+                ctx.eval::<(), _>(
+                    r#"
+                    globalThis.http = {
+                        asyncRequest: function(method, url, body, params) {
+                            return __http_request_async(
+                                method, url, body || null,
+                                (params && params.headers) || {},
+                                (params && params.timeout) || 0,
+                                (params && params.tags) || null,
+                                undefined);
+                        }
+                    };
+                    "#,
+                )
+                .unwrap();
+            })
+            .await;
+
+            let driver = runtime::spawn_driver(&qjs);
+
+            let status: i32 = ctx
+                .async_with(async |ctx| {
+                    let p: rquickjs::Promise = ctx
+                        .eval(
+                            r#"http.asyncRequest('POST', 'http://example.com/api',
+                                   { a: 'a', b: 2 },
+                                   { headers: { 'X-Test': '1' } })
+                               .then(r => r.status)"#,
+                        )
+                        .unwrap();
+                    p.into_future().await.unwrap()
+                })
+                .await;
+            assert_eq!(status, 201);
+
+            driver.abort();
+        });
     }
 
     #[tokio::test]

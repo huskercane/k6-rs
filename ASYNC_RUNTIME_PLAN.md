@@ -68,9 +68,11 @@ observations bear on this epic:
   while the single `tokio-rt-worker` performs the I/O and wakes it
   (`futex_wake`, ~10%). This is the per-request wait/wake pair inherent to
   running the VU on a `spawn_blocking` thread and marshaling the request to the
-  runtime. Running the VU *on* the async loop (this epic's Phase 1) removes the
-  handoff, and with it this cost. **This is the strongest quantitative
-  motivation for the migration to date.**
+  runtime. **Update (2026-07-10):** this handoff is capturable by **option A**
+  (co-locate I/O on the VU thread) *without* the loop migration — see the
+  suspension-mechanism section. So it is a strong motivation for **A as a
+  standalone optimization**, but it is **orthogonal to the north-star soak** and
+  must not be counted as soak progress; the memory win needs B2, not this.
 - The worker also spends ~14.6% parked in `epoll_wait`→`schedule_hrtimeout` —
   i.e. it is *not* CPU-saturated. Throughput on this bench is gated by handoff
   latency, not compute, which is exactly what the async model addresses.
@@ -148,6 +150,59 @@ synchronous** — the I/O host fns must go async *in the same step*. This collap
 the plan's old "Phase 1 = VU on async with sync-shimmed host APIs" gate, which is
 unreachable. See the revised phases below.
 
+### The deeper constraint: sync `http.get()` can't yield on a stackless engine (2026-07-10)
+
+Removing `block_on` is necessary but not sufficient. The load-bearing problem,
+found while starting the http conversion: **QuickJS is stackless, so a
+synchronous, un-awaited JS call (`const res = http.get(url)`) physically cannot
+suspend the VU and hand the loop to another VU.** Only an `await` point yields.
+So hosting many VUs per loop thread (the north star) forces a decision about how
+a *synchronous-looking* blocking call suspends. Three options, very different
+risk:
+
+- **A — co-locate I/O, keep sync VUs (orthogonal optimization, NOT the north
+  star).** Give each VU thread its own current-thread runtime + client and drive
+  the request locally (`local_rt.block_on(send)` on a non-worker thread — legal).
+  Removes the **futex handoff** (the measured ~17.8%) with sync `http.get`
+  preserved and zero script changes. But it keeps a thread per VU, so it does
+  **not** advance the fixed-memory soak. Ship it like the `max_blocking_threads`
+  band-aid — a real perf win, but stop it masquerading as soak progress.
+- **B1 — async VUs + AST await-transpile. REJECTED as the default.** Inject
+  `await` on `http.*`/`sleep`/… and async-ify exec fns. Beyond the chaining
+  hazard (`(await http.get(u)).json()`), it is **unsound in general**:
+  `arr.map(http.get)` / `forEach(u => http.get(u))` needs whole-program dataflow
+  ("does this callback transitively hit a blocking host fn?"), undecidable with
+  dynamic dispatch. Ship-able only as best-effort-with-silent-divergence — near
+  disqualifying for a **conformance-first** project. Upstream has no transpile.
+- **B2 — stackful coroutine per in-flight iteration. RECOMMENDED.** The faithful
+  port of upstream: k6 = each VU is a goroutine (stackful, M:N over threads);
+  `http.get()` blocks the goroutine, the scheduler runs others. Rust analog: run
+  each VU iteration on a stackful coroutine (`corosensei`/generator). The sync
+  host fn **yields the coroutine** to the loop scheduler instead of `block_on`;
+  the scheduler polls the future on tokio and resumes the coroutine when ready.
+  `http.get()` stays synchronous in the script — no `await`, no transpile, exact
+  k6 semantics — yet the thread yields to other VUs. That *is* pool-of-loops.
+  Cost: one userspace stack per concurrently-suspended iteration (tunable, lazily
+  committed, no kernel thread object, no 512 ceiling — far below thread-per-VU),
+  and one contained `unsafe` integration risk (switching C-stacks under QuickJS)
+  — vs B1's unbounded risk spread across every user script forever. For a
+  conformance-first project, contained-in-our-runtime wins decisively.
+
+  *(Degenerate B3 — keep sync VUs on `spawn_blocking` + the raised thread cap,
+  put only genuinely-async work on loops — helps async-heavy scripts but never
+  moves the reference soak, which uses sync `http.get`. Not a general answer.)*
+
+**Consequence for phasing.** The host-fn work splits into two buckets by whether
+the script already awaits it:
+
+- **Already-awaited (mechanical, do now):** `http.asyncRequest`, and later
+  promise-returning timers. Scripts `await` these, so a true async host fn (the
+  `Async` adaptor, driven by the per-VU `drive()` task) is a drop-in. No
+  suspension mechanism needed.
+- **Sync-blocking (gated on the suspension decision):** `http.get`/`request`,
+  `sleep`, sync `ws`/`grpc`. These do **not** move until B2 is proven. This is
+  where the north star lives; it is *not* a mechanical site conversion.
+
 ## Blast Radius
 
 - `runtime.rs`: `create_runtime`/`create_context` and `drain_pending_jobs`
@@ -168,13 +223,11 @@ unreachable. See the revised phases below.
 
 ## Migration Phases
 
-Revised 2026-07-10 after code review. **These are not four independently
-shippable landings.** The block_on constraint plus the "no `#[cfg]` fork —
-branch-wide switch" decision force Phase 1 to be **big-bang**: VU-on-loop + all
-four `block_on` host fns + every `.with(` site convert together, with no sync
-fallback in the tree. Phases 2–4 layer scale, timers, and conformance on top of
-that single cutover. Treat Phase 1 as the risk-bearing landing; the rest are
-follow-ups, not small increments.
+Revised 2026-07-10 (twice). The "convert 4 `block_on` sites, mostly mechanical"
+framing is **falsified**: only the already-awaited surface is mechanical; the
+sync-blocking calls (`http.get`, `sleep`) need a suspension mechanism that is an
+unmade architectural decision (A / B1 / B2 above), not a site conversion. So the
+cutover is now gated on a **B2 spike** and split by bucket.
 
 - **Phase 0 — Spike + decide (the real gate).** Behind a throwaway cargo
   feature, stand up `AsyncRuntime`/`AsyncContext` and prove: (a) a Rust async
@@ -193,13 +246,29 @@ follow-ups, not small increments.
   structurally can't); that validation is Phase 2's soak gate. The feature gate
   does **not** outlive this phase (`#[cfg]`-ing 87 `.with(` sites into sync+async
   variants is unmaintainable).
-- **Phase 1 — Big-bang cutover: VUs on loops + all four `block_on` host fns
-  async.** Move `run_iteration` async onto a current-thread runtime + `LocalSet`,
-  and convert **all four** blocking host fns in the same step: `http`
-  (`request`/`asyncRequest`), **`sleep`** (in nearly every k6 script — the gate
-  is unreachable without it), **`ws`**, and **`grpc`**. All `block_on` call sites
-  removed (http 3, sleep 3, grpc 2, ws 2 = 10). Gate: all existing VU / http /
-  sleep / ws / grpc / executor tests green with no sync runtime in the tree.
+- **Phase 0.5 — B2 suspension spike (the new real gate for the north star).**
+  Before any sync-blocking host fn moves: prove a stackful coroutine
+  (`corosensei` or similar) can run a QuickJS iteration such that a
+  synchronous-looking host fn **yields the loop to another VU on one thread** and
+  resumes correctly. Must verify: (i) rquickjs `set_max_stack_size` SP checks
+  survive a non-default stack base; (ii) panic-unwind soundness across the stack
+  switch; (iii) the `unsafe` blast radius is contained. Decide B1 vs B2 on the
+  result (B1 recorded as generally unsound — the default is B2). No production
+  wiring. **This is what to spike next, not a transpiler.**
+- **Phase 1a — Already-awaited surface (mechanical, in progress).** Make
+  `http.asyncRequest` a true async host fn (the `Async` adaptor) on the async
+  runtime, replacing the `Promise.resolve().then` stub; later, promise-returning
+  timers. No suspension mechanism needed — scripts already `await`. *Landed so
+  far:* `register_async_request` + `__http_request_async` + shared
+  `build_http_request`/`finish_http_response` helpers, proven end-to-end on the
+  async foundation (`async_http_request_resolves_on_async_loop`). Sync
+  `__http_request` and every `http.get` caller untouched; all tests green.
+- **Phase 1b — Sync-blocking cutover (gated on Phase 0.5).** With B2 proven, move
+  `run_iteration` onto the loop and convert the sync-blocking host fns
+  (`http.get`/`request`, `sleep`, sync `ws`/`grpc`) to coroutine-yielding — the
+  remaining `block_on` sites (http 3, sleep 3, grpc 2, ws 2). Gate: all existing
+  VU / http / sleep / ws / grpc / executor tests green with no sync runtime in
+  the tree. This is the risk-bearing landing.
 - **Phase 2 — Scale to N loops + wire all six executors.** Shard the VU pool
   across N current-thread runtimes; keep the arrival-curve integral and
   dropped-iteration accounting untouched. Gate: 7900-VU soak holds **bounded RSS

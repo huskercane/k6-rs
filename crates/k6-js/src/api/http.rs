@@ -135,156 +135,28 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
                       tags_val: rquickjs::Value<'_>,
                       response_callback_val: rquickjs::Value<'_>|
                       -> rquickjs::Result<JsHttpResponse> {
-                    // Headers and tags arrive as native JS objects and are
-                    // iterated directly, avoiding a per-request
-                    // `JSON.stringify` (JS side) + `serde_json::from_str`
-                    // (Rust side) round-trip that ran even for the common
-                    // no-headers/no-tags `http.get(url)` case.
-                    let headers = object_entries_to_pairs(&headers_val);
-                    // CG-3: user-provided `tags: { k: v }` flows through to
-                    // the metric sample tagging. Combined with the system
-                    // tags below (status, method) the engine can store one
-                    // submetric per unique full-tag combination, which
-                    // makes thresholds like `http_req_duration{name:X,
-                    // status:200}` work as users expect.
+                    // Same request-building + response/metrics mapping as the
+                    // async path — single source of truth via build_http_request
+                    // / finish_http_response (CG-3 tags, failure mapping,
+                    // data_sent/received, zero-copy body). Headers/tags are read
+                    // from the native JS objects into owned data here, avoiding a
+                    // per-request JSON.stringify + serde round-trip.
                     let user_tags = object_entries_to_pairs(&tags_val);
                     let response_callback = parse_response_callback(&response_callback_val);
-                    let timeout = if timeout_ms > 0.0 {
-                        Some(std::time::Duration::from_millis(timeout_ms as u64))
-                    } else {
-                        None
-                    };
-
-                    let body_bytes = if body.is_null() || body.is_undefined() {
-                        None
-                    } else if let Some(s) = body.as_string() {
-                        Some(s.to_string().unwrap_or_default().into_bytes())
-                    } else {
-                        None
-                    };
-
-                    let http_method = match method.as_str() {
-                        "GET" => HttpMethod::Get,
-                        "POST" => HttpMethod::Post,
-                        "PUT" => HttpMethod::Put,
-                        "PATCH" => HttpMethod::Patch,
-                        "DELETE" => HttpMethod::Delete,
-                        "HEAD" => HttpMethod::Head,
-                        "OPTIONS" => HttpMethod::Options,
-                        _ => HttpMethod::Get,
-                    };
-
-                    let req = HttpRequest {
-                        method: http_method,
-                        url,
-                        headers,
-                        body: body_bytes,
-                        timeout,
-                    };
+                    let req = build_http_request(&method, url, &body, &headers_val, timeout_ms);
 
                     let result = handle.block_on(async {
                         let _permit = bp.acquire().await;
                         client.send(req).await
                     });
 
-                    match result {
-                        Ok(mut resp) => {
-                            if let Some(ref m) = metrics {
-                                let expected = response_callback.expected(resp.status);
-                                // CG-3: combine system tags (status, method)
-                                // with user tags into one full-tag set. Order
-                                // doesn't matter — storage canonicalizes via
-                                // MetricSelector. The `status` system tag is
-                                // what makes thresholds like
-                                // `http_req_duration{status:200}` work; the
-                                // user `name` tag is what scripts use to
-                                // distinguish endpoints in summary output.
-                                let mut all_tags: Vec<(String, String)> = user_tags.clone();
-                                all_tags.push(("status".to_string(), resp.status.to_string()));
-                                all_tags.push(("method".to_string(), method.clone()));
-                                if let Some(expected) = expected {
-                                    all_tags.push((
-                                        "expected_response".to_string(),
-                                        expected.to_string(),
-                                    ));
-                                }
-                                m.record_http_request_tagged_with_failure(
-                                    &resp.timings,
-                                    expected.map(|ok| !ok),
-                                    &all_tags,
-                                );
-                                // data_sent/data_received are computed in
-                                // http_client.rs as full HTTP message bytes
-                                // (request/status line + headers + body),
-                                // matching upstream k6's data_* metric scope.
-                                m.record_data_sent(resp.data_sent);
-                                m.record_data_received(resp.data_received);
-                            }
-
-                            // Move the buffered bytes out and decode in place:
-                            // `String::from_utf8` consumes the Vec with no copy
-                            // on the valid-UTF-8 fast path (the overwhelming
-                            // common case), only falling back to a lossy copy
-                            // when the body contains invalid UTF-8.
-                            let body_str =
-                                match std::mem::replace(&mut resp.body, ResponseBody::Discarded) {
-                                    ResponseBody::Buffered(b) => String::from_utf8(b)
-                                        .unwrap_or_else(|e| {
-                                            String::from_utf8_lossy(e.as_bytes()).into_owned()
-                                        }),
-                                    ResponseBody::Discarded => String::new(),
-                                };
-
-                            Ok(JsHttpResponse {
-                                status: resp.status,
-                                body: body_str,
-                                headers: resp.headers,
-                                timings: resp.timings,
-                                url: resp.url,
-                                error: String::new(),
-                                error_code: 0,
-                            })
-                        }
-                        Err(e) => {
-                            if let Some(ref m) = metrics {
-                                let timings = Timings::default();
-                                let expected = response_callback.expected(0);
-                                // CG-3: on transport failure we still know
-                                // method + the user tags. status is "0"
-                                // (sentinel for no response received) so
-                                // failure-bucket thresholds like
-                                // `http_req_duration{status:0}` work.
-                                let mut all_tags: Vec<(String, String)> = user_tags.clone();
-                                all_tags.push(("status".to_string(), "0".to_string()));
-                                all_tags.push(("method".to_string(), method.clone()));
-                                if let Some(expected) = expected {
-                                    all_tags.push((
-                                        "expected_response".to_string(),
-                                        expected.to_string(),
-                                    ));
-                                }
-                                m.record_http_request_tagged_with_failure(
-                                    &timings,
-                                    expected.map(|ok| !ok),
-                                    &all_tags,
-                                );
-                                // Failed before the request hit the wire — no
-                                // bytes sent or received that we can measure
-                                // from reqwest's high-level error.
-                            }
-
-                            let error_code = classify_error(&e);
-                            Ok(JsHttpResponse {
-                                status: 0,
-                                body: String::new(),
-                                headers: Vec::new(),
-                                timings: Timings::default(),
-                                url: String::new(),
-                                error: e.to_string(),
-                                error_code,
-                            })
-                        }
-                    }
+                    Ok(finish_http_response(
+                        result,
+                        &method,
+                        user_tags,
+                        &response_callback,
+                        metrics.as_ref(),
+                    ))
                 },
             )?,
         )?;
@@ -710,6 +582,15 @@ fn finish_http_response(
 ///
 /// Registered on an async context only: on a sync `Runtime` the returned
 /// future would never be driven (no async executor), so the promise would hang.
+///
+/// TODO(cutover): this resolves a **raw** `JsHttpResponse`. When the production
+/// `http.asyncRequest` moves onto this at the sync-blocking cutover, its JS
+/// wrapper MUST re-apply `__wrap_response` (adds `.json()`/`.html()`/`.cookies`)
+/// AND the per-VU cookie jar (inject `Cookie` on request, extract `Set-Cookie`
+/// on response) — both of which the old `Promise.resolve().then(__http.request)`
+/// stub got for free by routing through `__http.request`. Skipping them silently
+/// regresses `res.json()` and cookies on the async path. Parity bar: the
+/// existing `http_async_request_resolves_response` test asserts `res.json().ok`.
 pub fn register_async_request<C: HttpClient + 'static>(
     ctx: &Ctx<'_>,
     client: Arc<C>,

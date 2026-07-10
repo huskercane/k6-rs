@@ -12,7 +12,9 @@ edition.workspace = true
 # deleted once the suspension mechanism is chosen.
 [features]
 async-spike = ["rquickjs/futures"]
-b2-spike = ["dep:corosensei"]
+# corosensei is now a base dep (the scheduler in vu_sched is production code);
+# b2-spike only gates the throwaway harness (vu_loop) + spike (b2_spike) modules.
+b2-spike = []
 
 [dependencies]
 k6-core = { workspace = true }
@@ -51,7 +53,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 webpki-roots = { workspace = true }
-corosensei = { version = "0.3.4", optional = true }
+corosensei = { version = "0.3.4" }
 
 [dev-dependencies]
 axum = { workspace = true }

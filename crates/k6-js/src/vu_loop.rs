@@ -93,12 +93,20 @@ enum Yield {
     AwaitOne(HostOp),
     /// Driver loop: wait for a registered async op to complete.
     AwaitPending,
+    /// One iteration finished + event loop drained. The long-lived coroutine
+    /// parks here between iterations — a clean cancel point (no borrow held, no
+    /// I/O in flight). The async driver resumes with `RunNext` or `Stop`.
+    IterationBoundary,
 }
 
 enum Resume {
     Start,
     One(OpDone),
     Progressed,
+    /// Run the next iteration (from the `IterationBoundary` park).
+    RunNext,
+    /// Tear down the VU (stop the iteration loop).
+    Stop,
 }
 
 /// `Send` newtype over the `Yielder` pointer captured by host-fn closures.
@@ -143,8 +151,9 @@ fn vu_coroutine(
     result: Rc<RefCell<String>>,
     probe: Option<(String, Rc<RefCell<String>>)>,
     metrics: Option<BuiltinMetrics>,
+    bootstrap_count: Rc<std::cell::Cell<u32>>,
 ) -> VuCoroutine {
-    Coroutine::new(move |yielder: &Yielder<Resume, Yield>, _start: Resume| {
+    Coroutine::new(move |yielder: &Yielder<Resume, Yield>, first: Resume| {
         let yp = YielderPtr(yielder as *const _);
         let rt = runtime::create_runtime().expect("rt");
         let ctx = runtime::create_context(&rt).expect("ctx");
@@ -294,112 +303,164 @@ fn vu_coroutine(
             .unwrap();
         });
 
-        // Run main to its first suspension (borrow spans any sync op's yield).
-        ctx.with(|ctx| {
-            let wrapped = format!(
-                r#"Promise.resolve((async function () {{ {script} }})())
-                       .then(function (v) {{ globalThis.__ret = String(v); globalThis.__done = true; }});"#
-            );
-            if let Err(e) = ctx.eval::<(), _>(wrapped.as_bytes()) {
-                eprintln!("[vu_loop] main error: {e:?}");
-            }
-        });
+        // Bootstrap happened once above (asserted by the test via this counter).
+        bootstrap_count.set(bootstrap_count.get() + 1);
 
-        // Driver loop: resolve completed (I2) + drain jobs + check event-loop
-        // drained, then yield for more async progress.
+        // Long-lived iteration loop. The Context/globals/cookie-jar/module-scope
+        // vars all PERSIST across iterations (upstream semantics); only the
+        // per-iteration driver bookkeeping is RESET each pass.
+        let mut sig = first;
         loop {
-            ctx.with(|ctx| {
-                let drained: Vec<(OpId, OpDone)> =
-                    shared.0.borrow_mut().completed.drain(..).collect();
-                if drained.is_empty() {
-                    return;
-                }
-                let resolvers: rquickjs::Object = ctx.globals().get("__resolvers").unwrap();
-                let n = drained.len() as u64;
-                for (op, done) in drained {
-                    let key = op.to_string();
-                    let resolver = resolvers.get::<_, Function>(key.as_str()).ok();
-                    match done {
-                        OpDone::Slept => {
-                            if let Some(f) = resolver {
-                                let _ = f.call::<_, ()>(("slept".to_string(),));
-                            }
-                        }
-                        OpDone::Http(result) => {
-                            // Async http metrics land HERE — driver-loop-side,
-                            // inside our own borrow, exactly once per op (each op
-                            // is queued once and drained once). finish_http_response
-                            // is pure Rust; the JS resolver wraps the response.
-                            let meta = shared
-                                .0
-                                .borrow_mut()
-                                .async_meta
-                                .remove(&op)
-                                .expect("async http op must have resolution meta");
-                            let resp = finish_http_response(
-                                result,
-                                &meta.method,
-                                meta.user_tags,
-                                &meta.response_callback,
-                                metrics.as_ref(),
-                            );
-                            if let Some(f) = resolver {
-                                let _ = f.call::<_, ()>((resp,));
-                            }
-                        }
-                    }
-                    let _ = resolvers.remove(key.as_str());
-                }
-                shared.0.borrow_mut().outstanding -= n;
-            });
-
-            runtime::drain_pending_jobs(&rt);
-
-            // Iteration ends only when main settled AND the event loop is drained
-            // (no outstanding async work) — a fire-and-forget asyncRequest still
-            // fires + settles first (matches upstream).
-            let settled = ctx.with(|ctx| ctx.globals().get::<_, bool>("__done").unwrap_or(false));
-            let idle = shared.0.borrow().outstanding == 0;
-            if settled && idle {
+            if matches!(sig, Resume::Stop) {
                 break;
             }
 
-            let _ = yp.suspend(Yield::AwaitPending);
-        }
-
-        ctx.with(|ctx| {
-            let r: String = ctx.globals().get("__ret").unwrap_or_default();
-            *result.borrow_mut() = r;
-            if let Some((name, slot)) = &probe {
-                let v: String = ctx.globals().get(name.as_str()).unwrap_or_default();
-                *slot.borrow_mut() = v;
+            // RESET (silent-if-wrong). Rust-side bookkeeping must already be empty
+            // at the boundary (the previous iteration ended event-loop-drained) —
+            // assert, then clear defensively. JS driver state is reset so
+            // iteration N+1 does not inherit N's __done/__ret/resolvers.
+            {
+                let mut s = shared.0.borrow_mut();
+                debug_assert!(
+                    s.outstanding == 0
+                        && s.registered.is_empty()
+                        && s.completed.is_empty()
+                        && s.async_meta.is_empty(),
+                    "driver bookkeeping bled across IterationBoundary"
+                );
+                s.outstanding = 0;
+                s.registered.clear();
+                s.completed.clear();
+                s.async_meta.clear();
             }
-        });
+
+            // Run this iteration's script with a CATCH BOUNDARY: a script/host
+            // error (sync throw → rejected promise) ends THIS iteration and the
+            // loop continues; it does NOT unwind the whole VU coroutine.
+            ctx.with(|ctx| {
+                let _ = ctx.eval::<(), _>(
+                    "globalThis.__done=false; globalThis.__ret=''; globalThis.__resolvers={};",
+                );
+                let wrapped = format!(
+                    r#"Promise.resolve((async function () {{ {script} }})()).then(
+                           function (v) {{ globalThis.__ret = String(v); globalThis.__done = true; }},
+                           function (e) {{ globalThis.__ret = 'ERR:' + e; globalThis.__done = true; }});"#
+                );
+                if let Err(e) = ctx.eval::<(), _>(wrapped.as_bytes()) {
+                    let _ = ctx.eval::<(), _>("globalThis.__done = true;");
+                    eprintln!("[vu_loop] iteration eval error: {e:?}");
+                }
+            });
+
+            // Per-iteration driver loop: resolve completed (I2) + drain jobs +
+            // check event-loop drained, then yield for more async progress.
+            loop {
+                ctx.with(|ctx| {
+                    let drained: Vec<(OpId, OpDone)> =
+                        shared.0.borrow_mut().completed.drain(..).collect();
+                    if drained.is_empty() {
+                        return;
+                    }
+                    let resolvers: rquickjs::Object = ctx.globals().get("__resolvers").unwrap();
+                    let n = drained.len() as u64;
+                    for (op, done) in drained {
+                        let key = op.to_string();
+                        let resolver = resolvers.get::<_, Function>(key.as_str()).ok();
+                        match done {
+                            OpDone::Slept => {
+                                if let Some(f) = resolver {
+                                    let _ = f.call::<_, ()>(("slept".to_string(),));
+                                }
+                            }
+                            OpDone::Http(result) => {
+                                // Async http metrics land HERE — driver-loop-side,
+                                // inside our own borrow, exactly once per op.
+                                let meta = shared
+                                    .0
+                                    .borrow_mut()
+                                    .async_meta
+                                    .remove(&op)
+                                    .expect("async http op must have resolution meta");
+                                let resp = finish_http_response(
+                                    result,
+                                    &meta.method,
+                                    meta.user_tags,
+                                    &meta.response_callback,
+                                    metrics.as_ref(),
+                                );
+                                if let Some(f) = resolver {
+                                    let _ = f.call::<_, ()>((resp,));
+                                }
+                            }
+                        }
+                        let _ = resolvers.remove(key.as_str());
+                    }
+                    shared.0.borrow_mut().outstanding -= n;
+                });
+
+                runtime::drain_pending_jobs(&rt);
+
+                let settled =
+                    ctx.with(|ctx| ctx.globals().get::<_, bool>("__done").unwrap_or(false));
+                let idle = shared.0.borrow().outstanding == 0;
+                if settled && idle {
+                    break;
+                }
+
+                let _ = yp.suspend(Yield::AwaitPending);
+            }
+
+            // Publish this iteration's result.
+            ctx.with(|ctx| {
+                let r: String = ctx.globals().get("__ret").unwrap_or_default();
+                *result.borrow_mut() = r;
+                if let Some((name, slot)) = &probe {
+                    // Coerce via String() so numeric/boolean globals read back too.
+                    let v: String = ctx
+                        .eval::<String, _>(format!("String(globalThis[{name:?}])"))
+                        .unwrap_or_default();
+                    *slot.borrow_mut() = v;
+                }
+            });
+
+            // Iteration done + event loop drained → park at the boundary (clean
+            // cancel point) and await the next signal from the async driver.
+            sig = yp.suspend(Yield::IterationBoundary);
+        }
     })
 }
 
 /// The ONLY sanctioned way to run a VU (I3): `spawn_local`. The `unsafe Send` on
-/// [`Shared`] would let `tokio::spawn` compile — and be UB.
+/// [`Shared`] would let `tokio::spawn` compile — and be UB. Drives `iters`
+/// iterations then signals `Stop` at the next `IterationBoundary`.
+///
+/// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
+/// coroutine — awaits tokio futures and services I/O yields. In #5 the executor
+/// spawns this per VU and the fixed `iters` becomes an arrival/duration signal.
 fn spawn_vu<C: HttpClient + 'static>(
     coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
+    iters: u32,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_local(drive_vu(coro, shared, client, bp))
+    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, iters))
 }
 
-/// Drive one VU coroutine to completion. Owns the VU's futures; never touches its
-/// `Context` (I1); metrics-free. Runs each op via [`run_op`].
+/// Drive a VU coroutine through `iters` iterations. Owns the VU's futures; never
+/// touches its `Context` (I1); metrics-free. Runs each op via [`run_op`].
 async fn drive_vu<C: HttpClient + 'static>(
     mut coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
+    iters: u32,
 ) {
     type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, OpDone)>>>;
     let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
-    let mut resume = Resume::Start;
+    // First resume runs iteration 0 (or Stop immediately if none requested).
+    let mut resume = if iters == 0 { Resume::Stop } else { Resume::RunNext };
+    let mut done_iters = 0u32;
     let home = std::thread::current().id();
 
     loop {
@@ -455,6 +516,17 @@ async fn drive_vu<C: HttpClient + 'static>(
                     shared.0.borrow_mut().completed.push_back((op, res));
                 }
                 resume = Resume::Progressed;
+            }
+            Yield::IterationBoundary => {
+                // Iteration complete + event loop drained — the clean cancel
+                // point (#5 prefers cancelling here over force_unwind). Run the
+                // next one, or stop.
+                done_iters += 1;
+                resume = if done_iters >= iters {
+                    Resume::Stop
+                } else {
+                    Resume::RunNext
+                };
             }
         }
     }
@@ -517,6 +589,19 @@ mod tests {
         metrics: Option<BuiltinMetrics>,
         probe: Option<&str>,
     ) -> (String, String) {
+        let (ret, extra, _boots) = run_vu_iters(script, client, metrics, probe, 1);
+        (ret, extra)
+    }
+
+    /// Run `iters` iterations of one long-lived VU coroutine. Returns
+    /// (last __ret, probe global, bootstrap count).
+    fn run_vu_iters<C: HttpClient + 'static>(
+        script: &str,
+        client: Arc<C>,
+        metrics: Option<BuiltinMetrics>,
+        probe: Option<&str>,
+        iters: u32,
+    ) -> (String, String, u32) {
         let rt = loop_runtime();
         let script = script.to_string();
         let probe = probe.map(|s| s.to_string());
@@ -524,12 +609,20 @@ mod tests {
             let shared = Shared(Rc::new(RefCell::new(VuShared::default())));
             let result = Rc::new(RefCell::new(String::new()));
             let extra = Rc::new(RefCell::new(String::new()));
+            let boots = Rc::new(std::cell::Cell::new(0u32));
             let probe_slot = probe.map(|name| (name, extra.clone()));
-            let coro = vu_coroutine(script, shared.clone(), result.clone(), probe_slot, metrics);
-            spawn_vu(coro, shared.clone(), client, Backpressure::new(64))
+            let coro = vu_coroutine(
+                script,
+                shared.clone(),
+                result.clone(),
+                probe_slot,
+                metrics,
+                boots.clone(),
+            );
+            spawn_vu(coro, shared.clone(), client, Backpressure::new(64), iters)
                 .await
                 .unwrap();
-            let out = (result.borrow().clone(), extra.borrow().clone());
+            let out = (result.borrow().clone(), extra.borrow().clone(), boots.get());
             out
         })
     }
@@ -669,6 +762,59 @@ mod tests {
             1,
             "fire-and-forget asyncRequest fired + recorded http_reqs before iteration end"
         );
+    }
+
+    // --- long-lived per-VU coroutine: bootstrap-once, reset-vs-persist, catch ---
+
+    #[test]
+    fn long_lived_bootstraps_once_and_persists_module_state() {
+        // Module-scope state persists across iterations (upstream semantics), and
+        // the API is bootstrapped exactly once — not per iteration.
+        let script = r#"
+            globalThis.__mod = (globalThis.__mod || 0) + 1;  // persists (same Context)
+            return __mod;
+        "#;
+        let (ret, _extra, boots) = run_vu_iters(script, dummy(), None, Some("__mod"), 3);
+        assert_eq!(boots, 1, "API bootstrap runs ONCE, not per iteration");
+        assert_eq!(ret, "3", "iteration 3 ran (proves __done was reset each pass)");
+        // If __done weren't reset, iterations 2/3 would terminate instantly and
+        // __mod would stay 1 — so ret == "3" is the reset proof.
+    }
+
+    #[test]
+    fn long_lived_resets_driver_state_but_persists_jar() {
+        // A "cookie jar" global persists across iterations; driver bookkeeping is
+        // reset. Iteration 2 both sees the persisted jar AND starts with a clean
+        // __resolvers/outstanding (asserted structurally by the debug_assert in
+        // the reset block, which would fire if bookkeeping bled).
+        let script = r#"
+            globalThis.__jar = globalThis.__jar || {};
+            __jar.n = (__jar.n || 0) + 1;
+            // exercise the async machinery so resolvers/meta are populated then
+            // must be cleared before the next iteration.
+            var r = await asyncGet('http://x/');
+            return String(__jar.n) + ':' + r.status;
+        "#;
+        let (ret, _extra, boots) = run_vu_iters(script, Arc::new(Mock200), None, None, 2);
+        assert_eq!(boots, 1);
+        assert_eq!(
+            ret, "2:200",
+            "jar persisted across iterations (n=2); async path clean each pass"
+        );
+    }
+
+    #[test]
+    fn long_lived_catch_boundary_contains_iteration_error() {
+        // A script error in iteration 1 must NOT kill the VU — iteration 2 runs.
+        let script = r#"
+            globalThis.__ran = (globalThis.__ran || 0) + 1;
+            if (__ran === 1) throw new Error('boom');
+            return __ran;
+        "#;
+        let (ret, ran, boots) = run_vu_iters(script, dummy(), None, Some("__ran"), 2);
+        assert_eq!(boots, 1);
+        assert_eq!(ran, "2", "both iterations ran — the VU survived iter 1's throw");
+        assert_eq!(ret, "2", "iteration 2 returned cleanly after iter 1's error");
     }
 
     #[test]

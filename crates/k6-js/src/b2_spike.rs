@@ -243,4 +243,108 @@ mod tests {
             "a panic in the coroutine body must unwind catchably across the switch"
         );
     }
+
+    // --- 1b-gate: m1/m2 — the sync-path promise substrate the unified model
+    // rests on. No AsyncContext. Separate `ctx.with` blocks MODEL the borrow
+    // release that a real coroutine yield produces (the QuickJS runtime state —
+    // pending promises + job queue — is untouched by parking the Rust stack,
+    // already shown by the stack-check test above).
+
+    /// (m1) On the SYNC path, an `async` default fn's top-level `await` returns
+    /// control to the caller with a *pending* promise (borrow released), and a
+    /// scheduler-held resolver + `execute_pending_job()` settles it later.
+    #[test]
+    fn m1_sync_async_fn_await_returns_pending_then_settles() {
+        let rt = runtime::create_runtime().unwrap();
+        let ctx = runtime::create_context(&rt).unwrap();
+
+        // Block 1: mint a promise we control from Rust, run an async fn that
+        // awaits it. eval RETURNS here (borrow released) with the fn suspended.
+        ctx.with(|ctx| {
+            let (trigger, resolve, _reject) = ctx.promise().unwrap();
+            ctx.globals().set("__trigger", trigger).unwrap();
+            ctx.globals().set("__resolve", resolve).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__result = null;
+                (async function () {
+                    let v = await __trigger;
+                    globalThis.__result = v + 1;
+                })();
+                "#,
+            )
+            .unwrap();
+        });
+
+        // Borrow released; the await has NOT settled yet.
+        ctx.with(|ctx| {
+            let pending: bool = ctx.eval("__result === null").unwrap();
+            assert!(pending, "top-level await must suspend, not block");
+        });
+
+        // Block 2: the "scheduler" settles the op via the stored resolver, then
+        // the driver drains microtasks — the async fn resumes to completion.
+        ctx.with(|ctx| {
+            let resolve: rquickjs::Function = ctx.globals().get("__resolve").unwrap();
+            resolve.call::<_, ()>((41,)).unwrap();
+        });
+        runtime::drain_pending_jobs(&rt);
+
+        ctx.with(|ctx| {
+            let result: i32 = ctx.globals().get("__result").unwrap();
+            assert_eq!(result, 42, "resolver + job drain must complete the awaited fn");
+        });
+    }
+
+    /// (m2) A sync `Context` mints promises (`ctx.promise()`), hands them to JS
+    /// (`Promise.all`), and scheduler-held resolvers settle them later — **out
+    /// of order, with a second op still in flight** — across borrow boundaries,
+    /// without corrupting the job queue.
+    #[test]
+    fn m2_two_inflight_promises_settle_out_of_order() {
+        let rt = runtime::create_runtime().unwrap();
+        let ctx = runtime::create_context(&rt).unwrap();
+
+        // Register two in-flight ops behind one Promise.all.
+        ctx.with(|ctx| {
+            let (p0, r0, _) = ctx.promise().unwrap();
+            let (p1, r1, _) = ctx.promise().unwrap();
+            let g = ctx.globals();
+            g.set("__p0", p0).unwrap();
+            g.set("__p1", p1).unwrap();
+            g.set("__r0", r0).unwrap();
+            g.set("__r1", r1).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__sum = null;
+                Promise.all([__p0, __p1]).then(function (vs) {
+                    globalThis.__sum = vs[0] + vs[1];
+                });
+                "#,
+            )
+            .unwrap();
+        });
+
+        // Settle op1 FIRST (out of order); op0 still in flight.
+        ctx.with(|ctx| {
+            let r1: rquickjs::Function = ctx.globals().get("__r1").unwrap();
+            r1.call::<_, ()>((20,)).unwrap();
+        });
+        runtime::drain_pending_jobs(&rt);
+        ctx.with(|ctx| {
+            let not_yet: bool = ctx.eval("__sum === null").unwrap();
+            assert!(not_yet, "Promise.all must NOT resolve while an op is in flight");
+        });
+
+        // Settle op0; now Promise.all completes, order-independent.
+        ctx.with(|ctx| {
+            let r0: rquickjs::Function = ctx.globals().get("__r0").unwrap();
+            r0.call::<_, ()>((22,)).unwrap();
+        });
+        runtime::drain_pending_jobs(&rt);
+        ctx.with(|ctx| {
+            let sum: i32 = ctx.globals().get("__sum").unwrap();
+            assert_eq!(sum, 42, "both ops settled -> Promise.all resolves, job queue intact");
+        });
+    }
 }

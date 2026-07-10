@@ -57,3 +57,6 @@ ctr = "0.10.1"
 pbkdf2 = "0.13.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 axum = "0.8"
+
+[profile.bench]
+debug = true

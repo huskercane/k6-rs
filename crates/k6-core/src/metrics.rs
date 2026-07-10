@@ -212,6 +212,37 @@ fn split_canonical_for_sink(canonical: &str) -> (String, BTreeMap<String, String
     (name, tags)
 }
 
+/// Build the canonical `{k1:v1,...}` tag suffix from a `(k, v)` slice,
+/// byte-for-byte identical to `MetricSelector::canonical()`'s tag portion:
+/// keys alphabetical, duplicate keys resolved last-wins (BTreeMap semantics),
+/// no whitespace. Returns `""` for an empty slice (untagged → bare name).
+///
+/// Hot-path rationale: a single HTTP request records 9 tagged metrics that all
+/// share the *same* tag set. Computing this suffix once and appending each
+/// metric name to it replaces 9× (owned-`BTreeMap` build + `MetricSelector`
+/// clone + `canonical()` format) with one borrowed-map pass, cutting the
+/// per-request allocation churn that dominated the VU thread in profiles.
+fn canonical_tag_suffix(tags: &[(String, String)]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    // Borrowed keys/values: no per-tag String clone. BTreeMap gives the same
+    // alphabetical order and last-wins dedup as the original owned map.
+    let map: BTreeMap<&str, &str> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let inner: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    format!("{{{}}}", inner.join(","))
+}
+
+/// Append a precomputed canonical tag suffix to a metric name. `suffix` must
+/// come from [`canonical_tag_suffix`] (or be empty).
+fn canonical_key(name: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}{suffix}")
+    }
+}
+
 /// A monotonically increasing counter (e.g., http_reqs, iterations, data_sent).
 #[derive(Debug)]
 pub struct CounterMetric {
@@ -564,21 +595,15 @@ impl MetricsRegistry {
     // full-tag map and route through the new APIs.
 
     pub fn trend_add_tagged(&self, name: &str, value_ms: f64, tags: &[(String, String)]) {
-        let map: BTreeMap<String, String> =
-            tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.trend_add_with_tags(name, value_ms, &map);
+        self.trend_add(&canonical_key(name, &canonical_tag_suffix(tags)), value_ms);
     }
 
     pub fn rate_add_tagged(&self, name: &str, passed: bool, tags: &[(String, String)]) {
-        let map: BTreeMap<String, String> =
-            tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.rate_add_with_tags(name, passed, &map);
+        self.rate_add(&canonical_key(name, &canonical_tag_suffix(tags)), passed);
     }
 
     pub fn counter_add_tagged(&self, name: &str, value: u64, tags: &[(String, String)]) {
-        let map: BTreeMap<String, String> =
-            tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.counter_add_with_tags(name, value, &map);
+        self.counter_add(&canonical_key(name, &canonical_tag_suffix(tags)), value);
     }
 
     // --- Counter operations ---
@@ -1034,30 +1059,37 @@ impl BuiltinMetrics {
         failed: Option<bool>,
         tags: &[(String, String)],
     ) {
-        self.registry.counter_add_tagged("http_reqs", 1, tags);
+        // All 9 metrics below share one tag set. Canonicalize it once and
+        // append each name, instead of rebuilding a BTreeMap + reformatting
+        // the tag string per metric (the per-request allocation hotspot).
+        let suffix = canonical_tag_suffix(tags);
+        let reg = &self.registry;
+
+        reg.counter_add(&canonical_key("http_reqs", &suffix), 1);
         // Upstream k6 semantic for http_req_failed: record the failure bool
         // directly. `passes` in the summary then = count of failed requests,
         // `fails` = count of non-failed, `rate` = failed/total (the failure
         // rate). Reversing this (recording !failed) inverts the rate and swaps
         // the passes/fails fields in --summary-export, breaking parity.
         if let Some(failed) = failed {
-            self.registry
-                .rate_add_tagged("http_req_failed", failed, tags);
+            reg.rate_add(&canonical_key("http_req_failed", &suffix), failed);
         }
-        self.registry
-            .trend_add_tagged("http_req_duration", timings.duration, tags);
-        self.registry
-            .trend_add_tagged("http_req_blocked", timings.blocked, tags);
-        self.registry
-            .trend_add_tagged("http_req_connecting", timings.connecting, tags);
-        self.registry
-            .trend_add_tagged("http_req_tls_handshaking", timings.tls_handshaking, tags);
-        self.registry
-            .trend_add_tagged("http_req_sending", timings.sending, tags);
-        self.registry
-            .trend_add_tagged("http_req_waiting", timings.waiting, tags);
-        self.registry
-            .trend_add_tagged("http_req_receiving", timings.receiving, tags);
+        reg.trend_add(&canonical_key("http_req_duration", &suffix), timings.duration);
+        reg.trend_add(&canonical_key("http_req_blocked", &suffix), timings.blocked);
+        reg.trend_add(
+            &canonical_key("http_req_connecting", &suffix),
+            timings.connecting,
+        );
+        reg.trend_add(
+            &canonical_key("http_req_tls_handshaking", &suffix),
+            timings.tls_handshaking,
+        );
+        reg.trend_add(&canonical_key("http_req_sending", &suffix), timings.sending);
+        reg.trend_add(&canonical_key("http_req_waiting", &suffix), timings.waiting);
+        reg.trend_add(
+            &canonical_key("http_req_receiving", &suffix),
+            timings.receiving,
+        );
     }
 
     // --- Network metrics ---
@@ -1114,6 +1146,89 @@ impl Default for BuiltinMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Hot-path canonicalization (perf optimization guardrails) ---
+    //
+    // record_http_request_* was rewritten to canonicalize the shared tag set
+    // ONCE per request instead of per metric. These tests lock that the fast
+    // path yields byte-for-byte the SAME storage keys as the original
+    // `MetricSelector::canonical()` path — downstream (sink split, threshold
+    // matching, summary derivation) parses stored keys back, so any drift in
+    // ordering/dedup/format silently breaks parity.
+
+    #[test]
+    fn canonical_key_matches_selector_output() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("status", "200")],
+            &[("status", "200"), ("method", "GET")], // input not alphabetical
+            &[("z", "1"), ("a", "2"), ("m", "3")],   // reordered
+            &[("k", "v1"), ("k", "v2")],             // duplicate key: last wins
+        ];
+        for case in cases {
+            let tags: Vec<(String, String)> = case
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let owned: BTreeMap<String, String> =
+                tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let expected = MetricSelector {
+                name: "http_req_duration".into(),
+                tags: owned,
+            }
+            .canonical();
+            let got = canonical_key("http_req_duration", &canonical_tag_suffix(&tags));
+            assert_eq!(got, expected, "canonical drift for input {case:?}");
+        }
+    }
+
+    #[test]
+    fn record_http_stores_metrics_under_canonical_keys() {
+        let m = BuiltinMetrics::new();
+        let timings = crate::traits::Timings {
+            blocked: 1.0,
+            connecting: 2.0,
+            tls_handshaking: 3.0,
+            sending: 4.0,
+            waiting: 5.0,
+            receiving: 6.0,
+            duration: 21.0,
+        };
+        // Tags deliberately NOT in alphabetical order.
+        let tags = vec![
+            ("status".to_string(), "200".to_string()),
+            ("method".to_string(), "GET".to_string()),
+        ];
+        m.record_http_request_tagged_with_failure(&timings, Some(false), &tags);
+
+        // Counter recorded once, retrievable by bare name AND by the exact
+        // canonical tag combination (proves the key is `{method:GET,status:200}`).
+        assert_eq!(m.registry.counter_get("http_reqs"), 1);
+        assert_eq!(m.registry.counter_get("http_reqs{method:GET,status:200}"), 1);
+
+        // failed=false → passes(=failed count)=0, total=1.
+        let (_rate, passes, total) = m.registry.rate_get("http_req_failed");
+        assert_eq!((passes, total), (0, 1));
+
+        // All seven trends stored under their canonical key (a histogram
+        // exists for that exact key in the snapshot).
+        let snap = m.registry.snapshot(1.0);
+        for name in [
+            "http_req_duration",
+            "http_req_blocked",
+            "http_req_connecting",
+            "http_req_tls_handshaking",
+            "http_req_sending",
+            "http_req_waiting",
+            "http_req_receiving",
+        ] {
+            let key = format!("{name}{{method:GET,status:200}}");
+            assert!(
+                snapshot_percentile_ms(&snap, &key, 50.0).is_some(),
+                "expected a trend stored under {key}"
+            );
+        }
+    }
 
     #[test]
     fn counter_basic() {

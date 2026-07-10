@@ -3,6 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 use rquickjs::{Ctx, Function};
 
+use crate::vu_sched::{HostOp, YielderPtr};
+
 /// Register the k6 `sleep(seconds)` function.
 ///
 /// Bridges to `tokio::time::sleep` via `Handle::block_on`.
@@ -19,6 +21,21 @@ pub fn register(ctx: &Ctx<'_>, handle: tokio::runtime::Handle) -> Result<()> {
         })?,
     )?;
 
+    Ok(())
+}
+
+/// Register a **yielding** `sleep(seconds)` for the coroutine VU: it YIELDS the
+/// coroutine (`AwaitOne(Sleep)`) so other VUs on the loop run during the sleep,
+/// instead of `block_on` (which panics on a loop thread). The scheduler owns the
+/// `tokio::time` timer. This is the `block_on`→yield conversion for `sleep`.
+pub(crate) fn register_yielding(ctx: &Ctx<'_>, yp: YielderPtr) -> Result<()> {
+    ctx.globals().set(
+        "sleep",
+        Function::new(ctx.clone(), move |seconds: f64| {
+            let dur = Duration::from_secs_f64(seconds.max(0.0));
+            let _ = yp.await_one(HostOp::Sleep(dur));
+        })?,
+    )?;
     Ok(())
 }
 

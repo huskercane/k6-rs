@@ -79,8 +79,9 @@ fn bootstrap_api(
     crate::api::streams::register(ctx)?;
     crate::api::webcrypto::register(ctx)?;
 
-    // Yielding http (native fn yields; JS jar + __wrap_response reused).
+    // Yielding http + sleep (native fns yield instead of block_on).
     register_yielding_http(ctx, yp, metrics.clone())?;
+    crate::api::sleep::register_yielding(ctx, yp)?;
 
     // check + group + custom metric constructors.
     crate::api::check::register_with_metrics(ctx, metrics.clone())?;
@@ -476,6 +477,39 @@ mod tests {
         "#;
         let out = run_script(script, 2);
         assert_eq!(out, Some(IterationOutcome::Completed { value: "ok2".into() }));
+    }
+
+    /// `sleep` yields the coroutine (not `block_on`): two VUs each `sleep(0.1)`
+    /// on ONE thread overlap (~100 ms), not serialize (~200 ms). This is the
+    /// block_on→yield conversion doing its job — non-blocking cross-VU.
+    #[test]
+    fn sleep_yields_so_two_vus_overlap_on_one_thread() {
+        use std::time::{Duration, Instant};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&rt, async {
+            let mk = || {
+                let shared = Shared::new();
+                let result = Rc::new(RefCell::new(None));
+                let coro = build_coroutine_vu(
+                    "export default function () { sleep(0.1); }".to_string(),
+                    shared.clone(),
+                    None,
+                    result,
+                );
+                spawn_vu(coro, shared, Arc::new(NoHttp), Backpressure::new(4), |n| n < 1)
+            };
+            let start = Instant::now();
+            let (a, b) = (mk(), mk());
+            let _ = tokio::join!(a, b);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(180),
+                "two VUs' sleep(0.1) should overlap on one thread (~100 ms), got {elapsed:?} — sleep didn't yield"
+            );
+        });
     }
 
     /// The VU_MAX_STACK ↔ COROUTINE_STACK_SIZE coupling at the tuned size: deep JS

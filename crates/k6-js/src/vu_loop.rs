@@ -46,6 +46,14 @@ type OpId = u64;
 #[derive(Default)]
 struct VuShared {
     next_op: OpId,
+    /// Async ops registered but not yet fully resolved — counts every op across
+    /// all three states (registered / in-flight on the scheduler / completed but
+    /// not yet resolved). The iteration ends only when this is 0 AND `main` has
+    /// settled: an `asyncRequest` with no `await` (fire-and-forget) must still
+    /// fire and settle before the iteration ends, matching upstream's
+    /// "default fn resolved AND event loop drained". Ending on `main` alone would
+    /// strand it (never fires, no `http_reqs`) — an observable conformance bug.
+    outstanding: u64,
     /// Async ops registered by a host fn, awaiting the scheduler to make futures.
     registered: Vec<(OpId, Duration)>,
     /// Completed async results — drained ONLY by the driver loop (I2).
@@ -97,7 +105,12 @@ type VuCoroutine = Coroutine<Resume, Yield, ()>;
 /// wrapped in the driver loop that IS this VU's event loop. The final `__ret` is
 /// written into `result` (the coroutine owns the `Context`, so the caller reads
 /// the outcome through this slot).
-fn vu_coroutine(script: String, shared: Shared, result: Rc<RefCell<String>>) -> VuCoroutine {
+fn vu_coroutine(
+    script: String,
+    shared: Shared,
+    result: Rc<RefCell<String>>,
+    probe: Option<(String, Rc<RefCell<String>>)>,
+) -> VuCoroutine {
     Coroutine::new(move |yielder: &Yielder<Resume, Yield>, _start: Resume| {
         let yp = YielderPtr(yielder as *const _);
         let rt = runtime::create_runtime().expect("rt");
@@ -129,6 +142,7 @@ fn vu_coroutine(script: String, shared: Shared, result: Rc<RefCell<String>>) -> 
                     let mut s = sh.0.borrow_mut();
                     let id = s.next_op;
                     s.next_op += 1;
+                    s.outstanding += 1; // counted until the driver loop resolves it
                     s.registered.push((id, Duration::from_millis(ms as u64)));
                     id as f64
                 })
@@ -167,32 +181,41 @@ fn vu_coroutine(script: String, shared: Shared, result: Rc<RefCell<String>>) -> 
         // borrows), then yield to let async ops progress. Resolvers are called
         // ONLY here (I2), never by the scheduler. ---
         loop {
-            let done = ctx.with(|ctx| -> bool {
+            // 1. Resolve completed ops inside our own borrow (I2), decrementing
+            //    `outstanding` per resolution.
+            ctx.with(|ctx| {
                 let drained: Vec<(OpId, String)> =
                     shared.0.borrow_mut().completed.drain(..).collect();
-                if !drained.is_empty() {
-                    let resolvers: rquickjs::Object =
-                        ctx.globals().get("__resolvers").unwrap();
-                    for (op, val) in drained {
-                        let key = op.to_string();
-                        if let Ok(f) = resolvers.get::<_, Function>(key.as_str()) {
-                            let _ = f.call::<_, ()>((val,));
-                        }
-                        let _ = resolvers.remove(key.as_str());
-                    }
+                if drained.is_empty() {
+                    return;
                 }
-                ctx.globals().get::<_, bool>("__done").unwrap_or(false)
+                let resolvers: rquickjs::Object = ctx.globals().get("__resolvers").unwrap();
+                for (op, val) in &drained {
+                    let key = op.to_string();
+                    if let Ok(f) = resolvers.get::<_, Function>(key.as_str()) {
+                        let _ = f.call::<_, ()>((val.clone(),));
+                    }
+                    let _ = resolvers.remove(key.as_str());
+                }
+                shared.0.borrow_mut().outstanding -= drained.len() as u64;
             });
 
+            // 2. Drain microtasks — fires .then callbacks (may settle main, may
+            //    register new ops).
             runtime::drain_pending_jobs(&rt);
 
-            let done = done
-                || ctx.with(|ctx| ctx.globals().get::<_, bool>("__done").unwrap_or(false));
-            if done {
+            // 3. Iteration ends only when main has settled AND the event loop is
+            //    drained (no registered / in-flight / completed async work). A
+            //    fire-and-forget asyncRequest keeps `outstanding > 0` here until
+            //    it has actually fired and settled — matching upstream.
+            let settled = ctx.with(|ctx| ctx.globals().get::<_, bool>("__done").unwrap_or(false));
+            let idle = shared.0.borrow().outstanding == 0;
+            if settled && idle {
                 break;
             }
 
-            // Nothing more to run synchronously; wait for an async op.
+            // 4. Work still outstanding — hand control to the scheduler so an
+            //    in-flight op can complete (or a registered one get launched).
             let _ = yp.suspend(Yield::AwaitPending);
         }
 
@@ -200,19 +223,42 @@ fn vu_coroutine(script: String, shared: Shared, result: Rc<RefCell<String>>) -> 
         ctx.with(|ctx| {
             let r: String = ctx.globals().get("__ret").unwrap_or_default();
             *result.borrow_mut() = r;
+            if let Some((name, slot)) = &probe {
+                let v: String = ctx.globals().get(name.as_str()).unwrap_or_default();
+                *slot.borrow_mut() = v;
+            }
         });
     })
 }
 
+/// The ONLY sanctioned way to run a VU (I3). VU futures are `spawn_local`-only:
+/// the coroutine, its `Rc`-shared state, and its `!Send` QuickJS `Context` are
+/// thread-pinned, and the `unsafe impl Send` on [`Shared`] (a lie needed for the
+/// `parallel` feature's host-fn bound) would let `tokio::spawn` *compile* — and
+/// be UB. Funnel all VU spawning through here; never `tokio::spawn` a VU. The
+/// `debug_assert` in [`drive_vu`] is the runtime backstop if someone tries.
+fn spawn_vu(coro: VuCoroutine, shared: Shared) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_local(drive_vu(coro, shared))
+}
+
 /// Drive one VU coroutine to completion on the scheduler. Owns the VU's futures
 /// (`pending`); never touches its `Context` (I1). On completion it only pushes
-/// results to the shared queue (I2) — the driver loop resolves them.
+/// results to the shared queue (I2) — the driver loop resolves them. Must run on
+/// one thread for its whole life (I3) — see [`spawn_vu`].
 async fn drive_vu(mut coro: VuCoroutine, shared: Shared) {
     type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, String)>>>;
     let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
     let mut resume = Resume::Start;
+    // I3 backstop: this task must never migrate threads (the coroutine + Context
+    // are pinned). Trips loudly in debug/tests if a stray tokio::spawn moved it.
+    let home = std::thread::current().id();
 
     loop {
+        debug_assert_eq!(
+            std::thread::current().id(),
+            home,
+            "VU driver migrated threads — VUs are spawn_local-only (I3)"
+        );
         let y = match coro.resume(resume) {
             CoroutineResult::Return(()) => return,
             CoroutineResult::Yield(y) => y,
@@ -274,8 +320,8 @@ mod tests {
         LocalSet::new().block_on(&rt, async {
             let shared = Shared(Rc::new(RefCell::new(VuShared::default())));
             let result = Rc::new(RefCell::new(String::new()));
-            let coro = vu_coroutine(script.to_string(), shared.clone(), result.clone());
-            drive_vu(coro, shared.clone()).await;
+            let coro = vu_coroutine(script.to_string(), shared.clone(), result.clone(), None);
+            spawn_vu(coro, shared.clone()).await.unwrap();
             let out = result.borrow().clone();
             out
         })
@@ -322,5 +368,49 @@ mod tests {
         "#;
         let out = run_vu_capturing(script);
         assert_eq!(out, "a40,a40");
+    }
+
+    /// Iteration-end = event-loop-drained (the conformance-critical case). A
+    /// fire-and-forget asyncRequest — registered but NEVER awaited — must still
+    /// fire and settle before the iteration ends, exactly as upstream drains the
+    /// event loop after the default fn resolves. Ending on `main` alone would
+    /// strand it (never fires, no `http_reqs`). We assert the op actually ran by
+    /// having its resolver record into a global the iteration outlives.
+    #[test]
+    fn fire_and_forget_async_still_fires_before_iteration_end() {
+        let script = r#"
+            globalThis.__fired = 'no';
+            asyncFetch(10).then(function (v) { globalThis.__fired = v; });
+            return 5;
+        "#;
+        // main returns 5 immediately (no await), but the iteration must not end
+        // until the fire-and-forget op has fired and its .then has run.
+        let (ret, fired) = run_vu_capturing_with(script, "__fired");
+        assert_eq!(ret, "5", "main's own return value is unchanged");
+        assert_eq!(
+            fired, "a10",
+            "fire-and-forget async op must fire + settle before iteration end"
+        );
+    }
+
+    /// Like `run_vu_capturing` but also reads a second global after the run, to
+    /// observe fire-and-forget effects that outlive `main`.
+    fn run_vu_capturing_with(script: &str, extra_global: &str) -> (String, String) {
+        let rt = loop_runtime();
+        let extra = extra_global.to_string();
+        LocalSet::new().block_on(&rt, async move {
+            let shared = Shared(Rc::new(RefCell::new(VuShared::default())));
+            let result = Rc::new(RefCell::new(String::new()));
+            let extra_out = Rc::new(RefCell::new(String::new()));
+            let coro = vu_coroutine(
+                script.to_string(),
+                shared.clone(),
+                result.clone(),
+                Some((extra, extra_out.clone())),
+            );
+            spawn_vu(coro, shared.clone()).await.unwrap();
+            let out = (result.borrow().clone(), extra_out.borrow().clone());
+            out
+        })
     }
 }

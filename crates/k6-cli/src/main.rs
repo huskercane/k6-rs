@@ -191,8 +191,36 @@ struct CliOverrides {
     out_buffer_size: Option<usize>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    build_runtime()?.block_on(async_main())
+}
+
+/// Build the multi-threaded tokio runtime the whole test runs on.
+///
+/// STOPGAP (tracked in `ASYNC_RUNTIME_PLAN.md`): the stock `#[tokio::main]`
+/// leaves `max_blocking_threads` at tokio's default of **512**. Every VU runs on
+/// a `spawn_blocking` task, and each in-flight iteration holds its blocking
+/// thread for the *whole* iteration (the `handle.block_on` I/O wait included).
+/// So above 512 concurrent VUs the excess never start (constant/ramping-vus,
+/// which spawn one long-lived blocking loop per VU) or iteration throughput is
+/// silently capped (arrival-rate). At the reference soak's 7900 VUs that means
+/// the run is broken today. We raise the cap well past any realistic maxVUs so
+/// the VU pool — not this ceiling — bounds concurrency.
+///
+/// The cap is a lazy ceiling (threads spawn on demand, not up front), but each
+/// blocking thread that *is* spawned costs a full stack (~2 MB × N). That memory
+/// is inherent to the current synchronous model and is precisely why the real
+/// fix is the async-runtime migration to pool-of-loops (many VUs per loop
+/// thread, no stack-per-VU), not this number.
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(16_384)
+        .build()
+        .context("failed to build tokio runtime")
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -1029,6 +1057,65 @@ fn replace_default_scenario(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Regression lock for the tokio default `max_blocking_threads = 512`
+    /// ceiling. constant/ramping-vus spawn one long-lived `spawn_blocking` loop
+    /// per VU that holds its thread for the whole run; with the stock
+    /// `#[tokio::main]` cap, every VU past the 512th never gets a thread and so
+    /// never starts. This drives >512 VUs on the runtime `main` actually builds
+    /// (`build_runtime`) and asserts all of them run at least once. It FAILS on
+    /// the default-512 runtime (only 512 start) and passes with the raised cap.
+    #[test]
+    fn runtime_starts_more_than_512_concurrent_vus() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        use k6_core::traits::{IterationResult, VirtualUser};
+
+        const N: u32 = 600; // > 512
+
+        struct StartVu {
+            started: Arc<AtomicU32>,
+            counted: bool,
+        }
+
+        impl VirtualUser for StartVu {
+            fn run_iteration(&mut self) -> Result<IterationResult> {
+                if !self.counted {
+                    self.counted = true;
+                    self.started.fetch_add(1, Ordering::Relaxed);
+                }
+                // Hold the blocking thread like a real VU iteration would, so a
+                // 512-capped pool cannot recycle threads to the queued VUs.
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(IterationResult {
+                    duration: Duration::from_millis(20),
+                })
+            }
+            fn reset(&mut self) {}
+        }
+
+        let started = Arc::new(AtomicU32::new(0));
+        let vus: Vec<StartVu> = (0..N)
+            .map(|_| StartVu {
+                started: Arc::clone(&started),
+                counted: false,
+            })
+            .collect();
+
+        let rt = build_runtime().unwrap();
+        rt.block_on(async {
+            let executor = ConstantVusExecutor::new(vus, Duration::from_millis(500));
+            executor.run(CancellationToken::new()).await.unwrap();
+        });
+
+        assert_eq!(
+            started.load(Ordering::Relaxed),
+            N,
+            "all {N} VUs must start; the default 512-thread blocking pool caps this"
+        );
+    }
 
     fn empty_overrides() -> CliOverrides {
         CliOverrides {

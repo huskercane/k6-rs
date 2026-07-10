@@ -27,10 +27,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use k6_core::backpressure::Backpressure;
 use k6_core::traits::{HttpClient, HttpRequest, HttpResponse};
@@ -222,11 +224,32 @@ pub(crate) async fn run_op<C: HttpClient + 'static>(
     }
 }
 
+/// The hard-cancellation tier (the second of the two-tier stop). When `token`
+/// fires — the executor raises it once the graceful-stop deadline (`gracefulStop`,
+/// default 30s) expires — a VU still parked mid-op is `force_unwind`-ed and its
+/// in-flight iteration counted as **interrupted** (a shutdown artifact, distinct
+/// from `errored`). Graceful stop (at an `IterationBoundary`) never touches this;
+/// it's only for VUs that can't reach a boundary because their I/O is hung.
+#[derive(Clone)]
+pub(crate) struct HardStop {
+    pub(crate) token: CancellationToken,
+    pub(crate) interrupted: Arc<AtomicU64>,
+}
+
+impl HardStop {
+    /// A `HardStop` that never fires — for callers with no hard deadline (tests,
+    /// the harness). Its interrupted counter is discarded.
+    pub(crate) fn never() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            interrupted: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 /// The ONLY sanctioned way to run a VU (I3): `spawn_local`. The `unsafe Send` on
-/// [`Shared`] would let `tokio::spawn` compile — and be UB.
-///
-/// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
-/// coroutine — awaits tokio futures and services I/O yields.
+/// [`Shared`] would let `tokio::spawn` compile — and be UB. Graceful-only variant
+/// (no hard deadline); production paths use [`spawn_vu_hard`].
 pub(crate) fn spawn_vu<C, K>(
     coro: VuCoroutine,
     shared: Shared,
@@ -238,7 +261,26 @@ where
     C: HttpClient + 'static,
     K: IterationControl + 'static,
 {
-    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control))
+    spawn_vu_hard(coro, shared, client, bp, control, HardStop::never())
+}
+
+/// [`spawn_vu`] with the hard-cancellation tier wired in.
+///
+/// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
+/// coroutine — awaits tokio futures and services I/O yields.
+pub(crate) fn spawn_vu_hard<C, K>(
+    coro: VuCoroutine,
+    shared: Shared,
+    client: Arc<C>,
+    bp: Backpressure,
+    control: K,
+    hard: HardStop,
+) -> tokio::task::JoinHandle<()>
+where
+    C: HttpClient + 'static,
+    K: IterationControl + 'static,
+{
+    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control, hard))
 }
 
 /// Drive a VU coroutine's iteration loop. Owns the VU's futures; never touches
@@ -255,6 +297,7 @@ pub(crate) async fn drive_vu<C, K>(
     client: Arc<C>,
     bp: Backpressure,
     mut control: K,
+    hard: HardStop,
 ) where
     C: HttpClient + 'static,
     K: IterationControl,
@@ -265,6 +308,19 @@ pub(crate) async fn drive_vu<C, K>(
     let mut resume = if control.next(0).await { Resume::RunNext } else { Resume::Stop };
     let mut done_iters = 0u32;
     let home = std::thread::current().id();
+
+    // Hard-cancel handler: the coroutine is suspended at a yield (we're in a select
+    // between resumes), so `force_unwind` is safe — it unwinds the parked stack,
+    // dropping the in-flight iteration + the Context cleanly (validated through the
+    // QuickJS C frames on the soak platform). The interrupted iteration is counted
+    // as interrupted, NOT errored. Returns `true` when it fired (caller returns).
+    macro_rules! on_hard_cancel {
+        () => {{
+            coro.force_unwind();
+            hard.interrupted.fetch_add(1, Ordering::Relaxed);
+            return;
+        }};
+    }
 
     loop {
         debug_assert_eq!(
@@ -306,6 +362,7 @@ pub(crate) async fn drive_vu<C, K>(
                         Some((op, res)) = pending.next(), if !pending.is_empty() => {
                             shared.0.borrow_mut().completed.push_back((op, res));
                         }
+                        _ = hard.token.cancelled() => on_hard_cancel!(),
                     }
                 };
                 resume = Resume::One(done);
@@ -333,6 +390,7 @@ pub(crate) async fn drive_vu<C, K>(
                         Some((op, res)) = pending.next(), if !pending.is_empty() => {
                             shared.0.borrow_mut().completed.push_back((op, res));
                         }
+                        _ = hard.token.cancelled() => on_hard_cancel!(),
                     }
                 }
                 resume = Resume::All(results.into_iter().map(|r| r.expect("all batch ops done")).collect());
@@ -342,8 +400,11 @@ pub(crate) async fn drive_vu<C, K>(
                     !pending.is_empty(),
                     "AwaitPending with no in-flight futures — outstanding desynced from queues"
                 );
-                if let Some((op, res)) = pending.next().await {
-                    shared.0.borrow_mut().completed.push_back((op, res));
+                tokio::select! {
+                    Some((op, res)) = pending.next() => {
+                        shared.0.borrow_mut().completed.push_back((op, res));
+                    }
+                    _ = hard.token.cancelled() => on_hard_cancel!(),
                 }
                 resume = Resume::Progressed;
             }

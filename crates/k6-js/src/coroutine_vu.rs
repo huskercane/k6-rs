@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use anyhow::Result;
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, Yielder};
 
@@ -44,6 +45,51 @@ pub(crate) enum IterationOutcome {
     Errored { message: String },
 }
 
+/// Bootstrap the k6 API surface into the coroutine's context — ONCE per VU. Only
+/// modules that fit the yield model (or need no I/O) go here: the dependency-free
+/// APIs (all `&Ctx`, no `block_on`), yielding http (jar + `__wrap_response`),
+/// check, and custom metrics.
+///
+/// Deliberately NOT here: `sleep`/`ws`/`grpc`/timers — they `block_on` a client
+/// at call time, which panics on the loop; each gets its own yield conversion.
+fn bootstrap_api(
+    ctx: &rquickjs::Ctx<'_>,
+    yp: YielderPtr,
+    metrics: Option<BuiltinMetrics>,
+) -> Result<()> {
+    // Minimal console/fail/randomSeed (the sync VU's richer console-output
+    // capture is shared in at cleanup, not duplicated in anger here).
+    ctx.eval::<(), _>(
+        r#"
+        globalThis.console = { log: function () {}, warn: function () {}, error: function () {} };
+        globalThis.fail = function (msg) { throw new Error('fail: ' + (msg || 'test aborted')); };
+        globalThis.randomSeed = function () {};
+    "#,
+    )?;
+
+    // Dependency-free k6 API (all &Ctx, no block_on — safe in the coroutine).
+    crate::api::encoding::register(ctx)?;
+    crate::api::crypto::register(ctx)?;
+    crate::api::execution::register(ctx)?;
+    crate::api::html::register(ctx)?;
+    crate::api::secrets::register(ctx)?;
+    crate::api::csv::register(ctx)?;
+    crate::api::fs::register(ctx)?;
+    crate::api::streams::register(ctx)?;
+    crate::api::webcrypto::register(ctx)?;
+
+    // Yielding http (native fn yields; JS jar + __wrap_response reused).
+    register_yielding_http(ctx, yp, metrics.clone())?;
+
+    // check + group + custom metric constructors.
+    crate::api::check::register_with_metrics(ctx, metrics.clone())?;
+    crate::api::check::register_group_with_metrics(ctx, metrics.clone())?;
+    if let Some(ref m) = metrics {
+        crate::api::metrics::register(ctx, m.registry.clone())?;
+    }
+    Ok(())
+}
+
 /// Build a long-lived coroutine VU for `script`. Bootstrap runs once; each
 /// `RunNext` calls the default fn (the sync body yields for `http.get`), drives
 /// the JS event loop to drained, then parks at `IterationBoundary`. The last
@@ -64,7 +110,7 @@ pub(crate) fn build_coroutine_vu(
         // --- bootstrap ONCE: real yielding http (jar + __wrap_response) + the
         // user module scope (defines __k6_default). Real API surface grows here.
         ctx.with(|ctx| {
-            register_yielding_http(&ctx, yp, metrics.clone()).expect("register http");
+            bootstrap_api(&ctx, yp, metrics.clone()).expect("bootstrap k6 API");
             ctx.eval::<(), _>(
                 "globalThis.__resolvers = {}; globalThis.__done = false; globalThis.__ret = '';",
             )
@@ -333,6 +379,56 @@ mod tests {
             let out = result.borrow().clone();
             out
         })
+    }
+
+    /// Full API bootstrap: a script exercising several `api::*` modules
+    /// (crypto, encoding, check) alongside http runs through the coroutine — the
+    /// whole surface is bootstrapped ONCE and reachable each iteration.
+    #[test]
+    fn multi_api_script_runs_through_coroutine() {
+        let metrics = BuiltinMetrics::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = LocalSet::new().block_on(&rt, async {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let client = Arc::new(CookieMock {
+                set_cookie: "s=1".into(),
+                seen_cookie: seen,
+            });
+            let script = r#"
+                export default function () {
+                    const h = crypto.sha256('hello', 'hex');
+                    const b = b64encode('x');
+                    const r = http.get('http://example.test/');
+                    const ok = check(r, { 'status 200': (res) => res.status === 200 });
+                    return h.slice(0, 4) + ':' + b + ':' + ok;
+                }
+            "#;
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(
+                script.to_string(),
+                shared.clone(),
+                Some(metrics.clone()),
+                result.clone(),
+            );
+            spawn_vu(coro, shared.clone(), client, Backpressure::new(8), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        // sha256('hello') starts "2cf2", b64encode('x') = "eA==", check passes.
+        // check() returning true (the trailing ":true") proves it ran + recorded
+        // into the check tree; crypto/encoding produced their values.
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "2cf2:eA==:true".into() }),
+            "crypto + encoding + http + check all work in the bootstrapped coroutine"
+        );
+        let _ = metrics; // http_reqs etc. covered by the dedicated http tests.
     }
 
     /// bar (b): a thrown iteration is a TYPED `Errored`, not a `"ERR:"` string a

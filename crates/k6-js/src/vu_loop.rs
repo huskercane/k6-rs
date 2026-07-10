@@ -18,125 +18,32 @@
 //!
 //! Run: `cargo test -p k6-js --features b2-spike vu_loop -- --nocapture`
 
-#![allow(dead_code)]
+// Throwaway harness: scheduler primitives now live in crate::vu_sched; several
+// imports here are test-only. Deleted wholesale at #6.
+#![allow(dead_code, unused_imports)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use corosensei::{Coroutine, CoroutineResult, Yielder};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use corosensei::{Coroutine, Yielder};
 use rquickjs::Function;
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
-use k6_core::traits::{HttpClient, HttpResponse, HttpRequest};
+use k6_core::traits::{HttpClient, HttpRequest, HttpResponse};
 
 use crate::api::http::{
-    ResponseCallback, build_http_request, finish_http_response, object_entries_to_pairs,
-    parse_response_callback,
+    build_http_request, finish_http_response, object_entries_to_pairs, parse_response_callback,
 };
 use crate::runtime;
-
-type OpId = u64;
-
-/// Per-request info an async http op needs at *resolution* time (driver-loop
-/// side), carried in a side-map keyed by op id so the scheduler stays ignorant of
-/// it (I1) — it only moves the owned request/response.
-struct AsyncMeta {
-    method: String,
-    user_tags: Vec<(String, String)>,
-    response_callback: ResponseCallback,
-}
-
-/// A blocking op the scheduler runs on the VU's behalf. The scheduler is the ONLY
-/// place futures are created (I1).
-enum HostOp {
-    Http(HttpRequest),
-    Sleep(Duration),
-}
-
-/// The owned outcome of a `HostOp`. Carries `Result` so a transport failure
-/// reaches `finish_http_response`'s Err path (status:0 / classify_error /
-/// failure-tagged metric) — the bucket that silently rots if only the happy path
-/// is tested.
-enum OpDone {
-    Http(anyhow::Result<HttpResponse>),
-    Slept,
-}
-
-#[derive(Default)]
-struct VuShared {
-    next_op: OpId,
-    /// Async ops registered but not yet resolved — see the fire-and-forget /
-    /// event-loop-drained iteration-end rule in the driver loop.
-    outstanding: u64,
-    /// Async ops awaiting the scheduler to make futures.
-    registered: Vec<(OpId, HostOp)>,
-    /// Completed async results — drained ONLY by the driver loop (I2).
-    completed: VecDeque<(OpId, OpDone)>,
-    /// Resolution-time metadata for async http ops (see [`AsyncMeta`]).
-    async_meta: HashMap<OpId, AsyncMeta>,
-}
-
-/// `Send` newtype over the per-VU `Rc` (I3 FFI lie; single-threaded in practice).
-#[derive(Clone)]
-struct Shared(Rc<RefCell<VuShared>>);
-unsafe impl Send for Shared {}
-unsafe impl Sync for Shared {}
-
-enum Yield {
-    /// Sync `http.get`/`sleep`: park (borrow held), run this op, resume directly.
-    AwaitOne(HostOp),
-    /// Driver loop: wait for a registered async op to complete.
-    AwaitPending,
-    /// One iteration finished + event loop drained. The long-lived coroutine
-    /// parks here between iterations — a clean cancel point (no borrow held, no
-    /// I/O in flight). The async driver resumes with `RunNext` or `Stop`.
-    IterationBoundary,
-}
-
-enum Resume {
-    Start,
-    One(OpDone),
-    Progressed,
-    /// Run the next iteration (from the `IterationBoundary` park).
-    RunNext,
-    /// Tear down the VU (stop the iteration loop).
-    Stop,
-}
-
-/// `Send` newtype over the `Yielder` pointer captured by host-fn closures.
-#[derive(Clone, Copy)]
-struct YielderPtr(*const Yielder<Resume, Yield>);
-unsafe impl Send for YielderPtr {}
-unsafe impl Sync for YielderPtr {}
-impl YielderPtr {
-    fn suspend(self, y: Yield) -> Resume {
-        // SAFETY: same-thread, during this coroutine's own execution.
-        unsafe { &*self.0 }.suspend(y)
-    }
-}
-
-type VuCoroutine = Coroutine<Resume, Yield, ()>;
-
-/// Run one op to its owned result. The ENTIRE I/O surface of the scheduler, and
-/// the only place metrics MUST NOT appear (I1).
-async fn run_op<C: HttpClient + 'static>(op: HostOp, client: &Arc<C>, bp: &Backpressure) -> OpDone {
-    match op {
-        HostOp::Http(req) => {
-            let _permit = bp.acquire().await;
-            OpDone::Http(client.send(req).await)
-        }
-        HostOp::Sleep(d) => {
-            tokio::time::sleep(d).await;
-            OpDone::Slept
-        }
-    }
-}
+// The scheduler primitives are production code now (crate::vu_sched); this module
+// keeps only the throwaway harness (`vu_coroutine` with sim host fns + tests).
+use crate::vu_sched::{
+    AsyncMeta, HostOp, OpDone, OpId, Resume, Shared, VuShared, VuCoroutine, Yield, YielderPtr,
+    spawn_vu,
+};
 
 /// Build one VU: a sync QuickJS context running `script` (an async fn body) with
 /// `httpGet`/`sleepMs` (sync, yielding) and `asyncSleep` (registers, returns a
@@ -430,121 +337,6 @@ fn vu_coroutine(
     })
 }
 
-/// The ONLY sanctioned way to run a VU (I3): `spawn_local`. The `unsafe Send` on
-/// [`Shared`] would let `tokio::spawn` compile — and be UB. Drives `iters`
-/// iterations then signals `Stop` at the next `IterationBoundary`.
-///
-/// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
-/// coroutine — awaits tokio futures and services I/O yields. In #5 the executor
-/// spawns this per VU and the fixed `iters` becomes an arrival/duration signal.
-fn spawn_vu<C, F>(
-    coro: VuCoroutine,
-    shared: Shared,
-    client: Arc<C>,
-    bp: Backpressure,
-    control: F,
-) -> tokio::task::JoinHandle<()>
-where
-    C: HttpClient + 'static,
-    F: FnMut(u32) -> bool + 'static,
-{
-    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control))
-}
-
-/// Drive a VU coroutine's iteration loop. Owns the VU's futures; never touches
-/// its `Context` (I1); metrics-free. Runs each op via [`run_op`].
-///
-/// `control(completed_iters) -> bool` is the RunNext/Stop hook, consulted at each
-/// `IterationBoundary` (and once up front). This is deliberately a *hook*, not a
-/// baked count: in #5 the executor supplies it (arrival curve / duration /
-/// graceful stop), and the two-tier cancellation plugs in here — prefer stopping
-/// at the boundary (`control` returns false), reserving `force_unwind` mid-op for
-/// a hard deadline. The harness passes `|n| n < iters`.
-async fn drive_vu<C, F>(
-    mut coro: VuCoroutine,
-    shared: Shared,
-    client: Arc<C>,
-    bp: Backpressure,
-    mut control: F,
-) where
-    C: HttpClient + 'static,
-    F: FnMut(u32) -> bool,
-{
-    type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, OpDone)>>>;
-    let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
-    // First resume runs iteration 0 unless control declines it up front.
-    let mut resume = if control(0) { Resume::RunNext } else { Resume::Stop };
-    let mut done_iters = 0u32;
-    let home = std::thread::current().id();
-
-    loop {
-        debug_assert_eq!(
-            std::thread::current().id(),
-            home,
-            "VU driver migrated threads — VUs are spawn_local-only (I3)"
-        );
-        let y = match coro.resume(resume) {
-            CoroutineResult::Return(()) => return,
-            CoroutineResult::Yield(y) => y,
-        };
-
-        // Pull newly-registered async ops into our own FuturesUnordered.
-        {
-            let mut s = shared.0.borrow_mut();
-            let ops: Vec<(OpId, HostOp)> = s.registered.drain(..).collect();
-            drop(s);
-            for (op, hop) in ops {
-                let client = Arc::clone(&client);
-                let bp = bp.clone();
-                pending.push(Box::pin(async move { (op, run_op(hop, &client, &bp).await) }));
-            }
-        }
-
-        match y {
-            Yield::AwaitOne(op) => {
-                // Park on the sync op. While parked, KEEP draining async
-                // completions — but only QUEUE them (I2), never resolve.
-                //
-                // #5 cancellation seam: this stays a `select!` loop precisely so
-                // a `_ = cancel.cancelled() => { coro.force_unwind(); return }`
-                // arm threads in here without a retrofit — the sync op future is
-                // simply dropped, and the coroutine unwinds cleanly.
-                let sync = run_op(op, &client, &bp);
-                tokio::pin!(sync);
-                let done = loop {
-                    tokio::select! {
-                        r = &mut sync => break r,
-                        Some((op, res)) = pending.next(), if !pending.is_empty() => {
-                            shared.0.borrow_mut().completed.push_back((op, res));
-                        }
-                    }
-                };
-                resume = Resume::One(done);
-            }
-            Yield::AwaitPending => {
-                debug_assert!(
-                    !pending.is_empty(),
-                    "AwaitPending with no in-flight futures — outstanding desynced from queues"
-                );
-                if let Some((op, res)) = pending.next().await {
-                    shared.0.borrow_mut().completed.push_back((op, res));
-                }
-                resume = Resume::Progressed;
-            }
-            Yield::IterationBoundary => {
-                // Iteration complete + event loop drained — the clean cancel
-                // point (#5 prefers cancelling here over force_unwind). Run the
-                // next one, or stop.
-                done_iters += 1;
-                resume = if control(done_iters) {
-                    Resume::RunNext
-                } else {
-                    Resume::Stop
-                };
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

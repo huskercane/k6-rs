@@ -505,9 +505,12 @@ mod tests {
             let (a, b) = (mk(), mk());
             let _ = tokio::join!(a, b);
             let elapsed = start.elapsed();
+            // Bracket BOTH: >=90ms proves sleep actually sleeps (a no-op-sleep
+            // regression would be ~0ms), <180ms proves overlap (serialized would
+            // be ~200ms).
             assert!(
-                elapsed < Duration::from_millis(180),
-                "two VUs' sleep(0.1) should overlap on one thread (~100 ms), got {elapsed:?} — sleep didn't yield"
+                elapsed >= Duration::from_millis(90) && elapsed < Duration::from_millis(180),
+                "two VUs' sleep(0.1) should both actually sleep AND overlap (~100 ms), got {elapsed:?}"
             );
         });
     }

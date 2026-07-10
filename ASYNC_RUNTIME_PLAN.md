@@ -246,15 +246,38 @@ cutover is now gated on a **B2 spike** and split by bucket.
   structurally can't); that validation is Phase 2's soak gate. The feature gate
   does **not** outlive this phase (`#[cfg]`-ing 87 `.with(` sites into sync+async
   variants is unmaintainable).
-- **Phase 0.5 — B2 suspension spike (the new real gate for the north star).**
-  Before any sync-blocking host fn moves: prove a stackful coroutine
-  (`corosensei` or similar) can run a QuickJS iteration such that a
-  synchronous-looking host fn **yields the loop to another VU on one thread** and
-  resumes correctly. Must verify: (i) rquickjs `set_max_stack_size` SP checks
-  survive a non-default stack base; (ii) panic-unwind soundness across the stack
-  switch; (iii) the `unsafe` blast radius is contained. Decide B1 vs B2 on the
-  result (B1 recorded as generally unsound — the default is B2). No production
-  wiring. **This is what to spike next, not a transpiler.**
+- **Phase 0.5 — B2 suspension spike. DONE ✅ (2026-07-10) — B2 CONFIRMED VIABLE.**
+  `crates/k6-js/src/b2_spike.rs` behind the throwaway `b2-spike` feature
+  (`corosensei 0.3.4`). 4 proofs green:
+  - **mechanism** — a sync host fn (`__host_fetch`) called from plain sync JS (no
+    `await`) yields the coroutine; the async scheduler awaits a tokio future and
+    resumes; the script uses the value synchronously. Yielder reached via a
+    pointer captured in the host-fn closure (no thread-local → no cross-coroutine
+    staleness).
+  - **cross-VU concurrency on ONE thread** — two VUs' sync fetches overlap.
+  - **(i) stack checks intact** — deep JS recursion on the coroutine stack trips
+    QuickJS `RangeError`, **no segfault**. Works because sync `Context::with`
+    calls `update_stack_top()` on entry (`context/base.rs:122`), re-anchoring the
+    256 KB limit onto the 1 MB coroutine stack. **No custom FFI needed.**
+  - **(ii) panic-unwind** — a panic in the coroutine propagates through `resume`,
+    catchable, no abort/UB.
+  - **(iii) contained unsafe** — the entire `unsafe` surface is one `YielderPtr`
+    newtype (`Send`/`Sync` asserted for the same-thread pointer, needed only
+    because the `parallel` feature requires host-fn closures `Send`).
+  **Decision locked: B2** (B1 stays rejected as generally unsound).
+
+  **Architecture implication for Phase 1b (important):** under B2 the VU body
+  stays **sync QuickJS (`Context`, not `AsyncContext`)**, wrapped in a coroutine;
+  blocking host fns *yield* instead of `block_on`. So the Phase 1a
+  `AsyncRuntime`/`create_async_*`/`spawn_driver` machinery is **not** the VU body
+  path — it is only for the async-promise surface (`asyncRequest`). **Open Phase
+  1b design question:** how a single VU that uses *both* sync `http.get` (needs
+  coroutine yield) *and* `Promise.all([asyncRequest,…])` (needs in-VU event-loop
+  overlap) reconciles the two. A pure coroutine yields the *whole* VU, so it does
+  not give in-VU promise overlap by itself; unifying B2 with the async-promise
+  event loop (e.g. coroutine hosting a sync context whose job queue the scheduler
+  also drives) is the first thing Phase 1b must design. Not resolved by the
+  spike — the spike proved sync-`http.get` yield (the dominant path + the soak).
 - **Phase 1a — Already-awaited surface (mechanical, in progress).** Make
   `http.asyncRequest` a true async host fn (the `Async` adaptor) on the async
   runtime, replacing the `Promise.resolve().then` stub; later, promise-returning

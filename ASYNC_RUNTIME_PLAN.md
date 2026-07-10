@@ -818,3 +818,15 @@ frames, but this is platform-fragile and has NEVER been exercised here. So:
   lane + ws `JoinHandle::abort` + four-way conservation. If UNSAFE → redesign: the
   hard deadline is END-OF-RUN, so abandon still-in-flight VUs (count interrupted,
   stop joining, summary, process-exit reclaims) rather than unwind through C.
+
+### #5 slice 3b — force_unwind spike RESULT (2026-07-10): SAFE on soak platform
+
+Ran two `#[ignore]` spikes (`coroutine_vu` tests): resume a coroutine until it
+parks mid `http.get` / mid `sleep` (QuickJS C frames live on the coroutine stack),
+then `coro.force_unwind()`. BOTH reach `coro.done()` cleanly — the Rust unwind
+panic passes through the cleanup-free QuickJS C frames and drops the Context
+without aborting. Holds in **debug and release**, stable across repeated runs, on
+Linux x86-64 (the soak platform). Conclusion: the hard-cancellation tier CAN use
+`force_unwind`; no redesign needed. Kept as regression locks (`#[ignore]`, run
+explicitly) — flip to non-ignored only if we ever gain a non-x86-64/Windows target
+where SEH/DWARF differences could reintroduce the risk.

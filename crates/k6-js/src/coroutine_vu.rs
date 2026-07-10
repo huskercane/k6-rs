@@ -178,6 +178,10 @@ pub(crate) fn build_coroutine_vu(
                         let resolver = resolvers.get::<_, rquickjs::Function>(key.as_str()).ok();
                         match done {
                             OpDone::Slept => {}
+                            // Streaming ops (ws/grpc) are consumed synchronously via
+                            // AwaitOne inside the recv loop, never registered async —
+                            // so they never reach this driver-loop drain.
+                            OpDone::Stream(_) => unreachable!("streaming op in async drain"),
                             OpDone::Http(res) => {
                                 let meta = shared
                                     .0

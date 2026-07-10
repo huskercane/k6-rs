@@ -20,8 +20,10 @@
 // item surfaces instead of being masked.
 #![allow(dead_code)]
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -51,6 +53,13 @@ pub(crate) struct AsyncMeta {
 pub(crate) enum HostOp {
     Http(HttpRequest),
     Sleep(Duration),
+    /// A protocol-specific streaming op (ws/grpc): the op **carries its own
+    /// future + I/O resource** (e.g. a `Receiver<WsEvent>`), so `run_op` just
+    /// awaits it and NEVER learns the protocol or grows a registry param — the
+    /// hard invariant. Output is type-erased; the consumer host fn downcasts. No
+    /// backpressure permit (only `Http` gates on HTTP concurrency). Keeps
+    /// `vu_sched` a generic yield engine with no compile edge on `api::ws`/`grpc`.
+    Streaming(Pin<Box<dyn Future<Output = Box<dyn Any>>>>),
 }
 
 /// The owned outcome of a `HostOp`. Carries `Result` so a transport failure
@@ -60,6 +69,9 @@ pub(crate) enum HostOp {
 pub(crate) enum OpDone {
     Http(anyhow::Result<HttpResponse>),
     Slept,
+    /// Type-erased streaming result (ws/grpc); the consumer downcasts to its own
+    /// event/message type. Matching is inherently consumer-side.
+    Stream(Box<dyn Any>),
 }
 
 #[derive(Default)]
@@ -183,6 +195,9 @@ pub(crate) async fn run_op<C: HttpClient + 'static>(
             tokio::time::sleep(d).await;
             OpDone::Slept
         }
+        // The op carries its own future + resource; the scheduler just awaits it.
+        // No backpressure (only Http gates HTTP concurrency).
+        HostOp::Streaming(fut) => OpDone::Stream(fut.await),
     }
 }
 
@@ -321,6 +336,53 @@ pub(crate) async fn drive_vu<C, F>(
                     Resume::Stop
                 };
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k6_core::traits::{HttpClient, HttpRequest, HttpResponse, ResponseBody, Timings};
+
+    struct Dummy;
+    impl HttpClient for Dummy {
+        fn send(
+            &self,
+            _r: HttpRequest,
+        ) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+            async {
+                Ok(HttpResponse {
+                    status: 0,
+                    headers: vec![],
+                    body: ResponseBody::Buffered(vec![]),
+                    timings: Timings::default(),
+                    url: String::new(),
+                    data_sent: 0,
+                    data_received: 0,
+                })
+            }
+        }
+    }
+
+    /// The generic Streaming primitive (ws/grpc): the op carries its OWN future +
+    /// I/O resource (here a channel, standing in for a ws `Receiver<WsEvent>`);
+    /// `run_op` just awaits it — no registry param (the hard invariant) and no
+    /// backpressure permit. The result is type-erased; the consumer downcasts.
+    #[tokio::test]
+    async fn run_op_streaming_carries_its_own_resource_and_type_erases_result() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tx.send("hello".to_string()).unwrap();
+        let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> = Box::pin(async move {
+            Box::new(rx.recv().await.unwrap()) as Box<dyn Any>
+        });
+        let client = Arc::new(Dummy);
+        let bp = Backpressure::new(4);
+        match run_op(HostOp::Streaming(fut), &client, &bp).await {
+            OpDone::Stream(b) => {
+                assert_eq!(*b.downcast::<String>().expect("downcast"), "hello")
+            }
+            _ => panic!("expected Stream"),
         }
     }
 }

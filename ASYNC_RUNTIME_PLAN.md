@@ -860,3 +860,29 @@ Slice 3 COMPLETE. Remaining before soak: remaining VU-based executors
 coroutine model, the `main.rs` cutover, fat-frame stack measurement, 7900 soak.
 Task #9 (general loop-thread-panic undercount, distinct from the startup deadlock
 closed in 3a) still open for the soak slice.
+
+### #5 slice 3b — review findings (scope corrections + soak gates)
+
+- **CLAIM SCOPE (finding 1): the hard tier reclaims I/O-hung VUs, NOT CPU-hung.**
+  `force_unwind` needs a suspend point; a CPU-bound iteration (`while(true){}`, long
+  compute with no `await`/`http`/`sleep`) never yields, so `drive_vu` is blocked
+  inside `coro.resume()`, never reaches a select, never sees the hard token —
+  `token.cancel()` fires into the void and the loop-thread join hangs forever
+  (wedging that thread + all VUs sharded onto it). Neither tier can recover it:
+  corosensei can't preempt a running coroutine and the graceful hook is only
+  consulted at a boundary the spin never reaches. So "a hung VU can't hang the
+  join" holds **only for I/O-hung VUs**. Complete fix = QuickJS
+  `Ctx::set_interrupt_handler` at JS back-edges → throw on the hard token (k6/goja's
+  approach). **SOAK-CRITICAL, task #11 — resolve or document as an explicit
+  limitation before the 7900 soak.**
+- **SPIKE RE-VERIFICATION (finding 2):** the `force_unwind_*` spikes are `#[ignore]`
+  ⇒ CI never runs them ⇒ a corosensei/rquickjs/toolchain bump that regresses
+  unwind-through-C stays green and surfaces as a soak abort at the first hard-stop.
+  **Pre-soak gate, task #12** — isolated subprocess CI job (`-- --ignored`
+  fail-loud) or a re-run-on-bump checklist.
+- **Acknowledged (no block):** grpc force_unwind-mid-invoke untested but lower risk
+  (unary, no background tasks to orphan; Context drop closes the tonic channel).
+  The ws-abort test proves clean teardown but doesn't isolate abort-wired-vs-not
+  (end-of-run runtime drop closes the socket anyway); the true lock would
+  force_unwind a ws VU MID-run with other VUs live and assert the read task is gone
+  while the runtime survives — low priority, the `Drop` is obviously correct.

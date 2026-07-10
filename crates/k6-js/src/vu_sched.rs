@@ -179,6 +179,27 @@ impl YielderPtr {
 
 pub(crate) type VuCoroutine = Coroutine<Resume, Yield, ()>;
 
+/// The RunNext/Stop decision at each `IterationBoundary` (and once up front) — the
+/// executor's control port. `next` MAY await: constant-vus returns a ready bool
+/// (deadline/cancel check), while the arrival-rate coordinator path parks here
+/// awaiting its per-VU dispatch channel (hence `&mut self` across `.await`, which
+/// a bare `FnMut(u32) -> impl Future` signature cannot express).
+///
+/// A blanket impl covers every `FnMut(u32) -> bool` (constant-vus + tests), so
+/// only the coordinator supplies a real struct.
+pub(crate) trait IterationControl {
+    /// `completed_iters` is the number of iterations finished so far (0 on the
+    /// first, up-front call). Return `true` to run the next iteration, `false` to
+    /// stop the VU.
+    fn next(&mut self, completed_iters: u32) -> impl Future<Output = bool>;
+}
+
+impl<F: FnMut(u32) -> bool> IterationControl for F {
+    async fn next(&mut self, completed_iters: u32) -> bool {
+        self(completed_iters)
+    }
+}
+
 /// Run one op to its owned result. The ENTIRE I/O surface of the scheduler, and
 /// the only place metrics MUST NOT appear (I1).
 pub(crate) async fn run_op<C: HttpClient + 'static>(
@@ -206,16 +227,16 @@ pub(crate) async fn run_op<C: HttpClient + 'static>(
 ///
 /// This is the ASYNC driver (R1): it — not the sync per-iteration body inside the
 /// coroutine — awaits tokio futures and services I/O yields.
-pub(crate) fn spawn_vu<C, F>(
+pub(crate) fn spawn_vu<C, K>(
     coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
-    control: F,
+    control: K,
 ) -> tokio::task::JoinHandle<()>
 where
     C: HttpClient + 'static,
-    F: FnMut(u32) -> bool + 'static,
+    K: IterationControl + 'static,
 {
     tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control))
 }
@@ -223,25 +244,25 @@ where
 /// Drive a VU coroutine's iteration loop. Owns the VU's futures; never touches
 /// its `Context` (I1); metrics-free. Runs each op via [`run_op`].
 ///
-/// `control(completed_iters) -> bool` is the RunNext/Stop hook, consulted at each
-/// `IterationBoundary` (and once up front). A *hook*, not a baked count: #5's
-/// executor supplies arrival/duration/graceful-stop, and the two-tier
-/// cancellation plugs in here — prefer stopping at the boundary, reserving
-/// `force_unwind` mid-op for a hard deadline.
-pub(crate) async fn drive_vu<C, F>(
+/// `control` (an [`IterationControl`]) is the RunNext/Stop hook, consulted at each
+/// `IterationBoundary` (and once up front). A *port*, not a baked count: #5's
+/// constant-vus supplies a deadline check, the arrival-rate coordinator parks here
+/// awaiting dispatch, and the two-tier cancellation plugs in — prefer stopping at
+/// the boundary, reserving `force_unwind` mid-op for a hard deadline.
+pub(crate) async fn drive_vu<C, K>(
     mut coro: VuCoroutine,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,
-    mut control: F,
+    mut control: K,
 ) where
     C: HttpClient + 'static,
-    F: FnMut(u32) -> bool,
+    K: IterationControl,
 {
     type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, OpDone)>>>;
     let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
     // First resume runs iteration 0 unless control declines it up front.
-    let mut resume = if control(0) { Resume::RunNext } else { Resume::Stop };
+    let mut resume = if control.next(0).await { Resume::RunNext } else { Resume::Stop };
     let mut done_iters = 0u32;
     let home = std::thread::current().id();
 
@@ -330,7 +351,7 @@ pub(crate) async fn drive_vu<C, F>(
                 // Iteration complete + event loop drained — the clean cancel
                 // point (#5 prefers cancelling here over force_unwind).
                 done_iters += 1;
-                resume = if control(done_iters) {
+                resume = if control.next(done_iters).await {
                     Resume::RunNext
                 } else {
                     Resume::Stop

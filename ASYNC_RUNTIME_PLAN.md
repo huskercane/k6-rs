@@ -718,3 +718,52 @@ green; (2) remaining executors; (3) cancellation (two-tier + 4 gates + ws-abort)
   and surfaces the error separately). Two paths agreeing ≠ correct. Route through
   the conformance harness (sometimes-throwing default fn) as a field-level
   known_drift candidate. (task #10)
+
+### #5 slice 2 — design note: arrival-rate coordinator (the teeth)
+
+**Async control seam — a port, not a closure signature.** `drive_vu`'s control
+becomes a trait `IterationControl { async fn next(&mut self, completed: u32) ->
+bool }` (native async-fn-in-trait; the returned future may borrow `&mut self`
+across `.await`, which a `FnMut(u32) -> impl Future` signature cannot express).
+A **blanket impl for `FnMut(u32) -> bool`** keeps constant-vus + every existing
+test caller unchanged (a ready future). The coordinator path gets a struct
+`ArrivalControl` whose `next` awaits its per-VU RunNext channel. Two real adapters
++ a test seam ⇒ the abstraction earns its keep (not a one-impl trait).
+
+**Curve reuse, not re-derivation.** Extract the arrival integral into a JS-free
+`k6_core::executor::arrival::ArrivalCurve` (timeline + `expected_arrivals` +
+`interpolate_rate`), and refactor the sync `RampingArrivalRateExecutor` to consume
+it (its tests stay green ⇒ reuse proven, zero behavior change). The coroutine
+coordinator consumes the SAME `ArrivalCurve`, so the k-th arrival's scheduled
+position (the integral-crossing point) is identical by construction — arrival-
+instant parity is structural, not re-implemented. Constant-arrival-rate is just
+`ArrivalCurve::constant` (one flat stage), so ONE coordinator serves both.
+
+**The coordinator (one, global — single-writer idle set).**
+- Channels: a shared `idle_tx` (tokio unbounded; every VU clones it) → coordinator's
+  `idle_rx`; per-VU `run_next` (tokio unbounded, unit message = RunNext, channel
+  close = Stop) — coordinator holds the `Vec<Sender>` by id, each VU its own rx.
+- `ArrivalControl::next`: `(if n>=1 tally the just-finished iteration); idle_tx.send(my_id);
+  run_next_rx.recv().await.is_some()`. The VU is in the idle set **iff** parked here
+  = available; dispatched (RunNext) ⇒ removed = busy; re-enters only on the next
+  park. The VU only ever SENDS its id — it never touches the queue.
+- Coordinator loop (its own thread; sync + `blocking_recv`): FIRST collect all N
+  startup idles so the "pool full at t=0" equivalence holds (no startup skew), THEN
+  start the clock. Each pass: drain `idle_rx.try_recv()` into the idle `VecDeque`
+  (sole writer); `target = curve.expected_arrivals(elapsed)`; catch-up
+  `while dispatched+1 <= target { dispatched+=1; match idle.pop_front() { Some(id)
+  => run_next[id].send(()), None => dropped+=1 } }`; sleep to ≈ next arrival; break
+  at `total_duration`/cancel; on exit drop the `Vec<Sender>` ⇒ every VU's recv
+  returns None ⇒ graceful Stop at its next boundary.
+- **Drop-accounting equivalence:** the catch-up loop is structurally identical to
+  the sync executor's `while … { try_acquire → run | record_dropped }` —
+  `idle.pop_front()==None` ⟺ `try_acquire_owned()==None` ⟺ pool exhausted ⟺ drop,
+  at the SAME integral instants. That correspondence IS the correctness proof.
+- Join order: coordinator thread (returns having dropped senders) → loop threads
+  (VUs see None, finish current iteration, stop). No force-unwind yet (slice 3).
+
+**Tests (the review bars):** (a) drop-accounting — slow VUs ⇒ drops, fast VUs +
+ample pool ⇒ zero drops; (b) integral parity — fast VUs, completed lands on the
+curve integral, mirroring the sync `ramp_matches_integral_count`; (c) completed vs
+dropped divergence (finding #2 at arrival-rate — the three counts pull apart);
+(d) ArrivalCurve extraction regression-lock (identical `expected_arrivals` values).

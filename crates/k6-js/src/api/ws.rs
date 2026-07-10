@@ -1,10 +1,18 @@
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::metrics::BuiltinMetrics;
+
+use crate::vu_sched::{HostOp, OpDone, YielderPtr};
 
 /// Register WebSocket low-level functions for the k6/ws JS shim.
 ///
@@ -353,6 +361,251 @@ async fn ws_open_impl(
     }
 
     Ok(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// Yielding ws for the coroutine VU (async-runtime graduation). __ws_open /
+// __ws_recv YIELD via the generic `HostOp::Streaming` primitive — the op carries
+// its own future + I/O resource (a `Receiver<WsEvent>`), so the scheduler
+// (`run_op`) never learns ws and never sees the registry. The session registry is
+// a SIBLING Rc owned here (NOT `VuShared`) — keeps ws out of the scheduler core.
+// The `ws.connect` recv loop (ws_shim.js) is the nested JS driver loop; a
+// `socket.on` handler that itself yields (`http.get` in `on('message')`) is a
+// nested `AwaitOne` on the coroutine stack.
+// ---------------------------------------------------------------------------
+
+/// Sibling per-VU ws session registry. Send-newtype per I3 (single-thread; the
+/// `parallel` feature needs host-fn closures `Send`).
+#[derive(Clone, Default)]
+pub(crate) struct WsRegistry(Rc<RefCell<HashMap<String, WsSession>>>);
+unsafe impl Send for WsRegistry {}
+unsafe impl Sync for WsRegistry {}
+
+impl WsRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Type-erased (through `OpDone::Stream`) result of a coroutine ws connect.
+enum WsOpen {
+    Ok {
+        id: String,
+        session: WsSession,
+        connecting_ms: f64,
+    },
+    Err(String),
+}
+
+/// Connect on the SCHEDULER (run via `HostOp::Streaming`), spawning the read/write
+/// tasks with `spawn_local` (I3 — socket I/O co-located on the VU's loop thread,
+/// no cross-thread handoff). Returns the session; the coroutine stores it + records
+/// the connecting metric after resume (keeps the scheduler metrics-free).
+async fn ws_connect_coro(url: String, timeout_ms: f64) -> WsOpen {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let connect_start = std::time::Instant::now();
+    let timeout = if timeout_ms > 0.0 {
+        Duration::from_millis(timeout_ms as u64)
+    } else {
+        Duration::from_secs(60)
+    };
+
+    let ws_stream = match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(&url)).await
+    {
+        Ok(Ok((stream, _))) => stream,
+        Ok(Err(e)) => return WsOpen::Err(format!("WebSocket connection failed: {e}")),
+        Err(_) => return WsOpen::Err("WebSocket connection timed out".to_string()),
+    };
+    let connecting_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
+
+    let (mut write, mut read) = ws_stream.split();
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WsCommand>();
+    let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<WsEvent>();
+    let id = format!("ws_{}", rand::random::<u64>());
+
+    // Read task (socket -> evt_tx), on the loop thread.
+    let evt_tx2 = evt_tx.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = read.next().await {
+            let event = match msg {
+                Ok(Message::Text(t)) => WsEvent::Message(t.to_string()),
+                Ok(Message::Binary(d)) => WsEvent::BinaryMessage(d.to_vec()),
+                Ok(Message::Ping(_)) => WsEvent::Ping,
+                Ok(Message::Pong(_)) => WsEvent::Pong,
+                Ok(Message::Close(_)) => {
+                    let _ = evt_tx2.send(WsEvent::Close);
+                    break;
+                }
+                Err(e) => {
+                    let _ = evt_tx2.send(WsEvent::Error(e.to_string()));
+                    break;
+                }
+                _ => continue,
+            };
+            if evt_tx2.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Write task (cmd_rx -> socket), on the loop thread.
+    tokio::task::spawn_local(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                WsCommand::Send(t) => {
+                    if write.send(Message::Text(t.into())).await.is_err() {
+                        break;
+                    }
+                }
+                WsCommand::Ping => {
+                    if write.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
+                WsCommand::Close => {
+                    let _ = write.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    WsOpen::Ok {
+        id,
+        session: WsSession {
+            cmd_tx,
+            evt_rx: Arc::new(tokio::sync::Mutex::new(evt_rx)),
+        },
+        connecting_ms,
+    }
+}
+
+/// Register the yielding ws API for the coroutine VU.
+pub(crate) fn register_yielding_ws(
+    ctx: &Ctx<'_>,
+    yp: YielderPtr,
+    registry: WsRegistry,
+    metrics: Option<BuiltinMetrics>,
+) -> Result<()> {
+    // __ws_open(url, timeout) -> session_id (yields the connect)
+    {
+        let reg = registry.clone();
+        let m = metrics.clone();
+        ctx.globals().set(
+            "__ws_open",
+            Function::new(
+                ctx.clone(),
+                move |url: String, timeout_ms: f64| -> rquickjs::Result<String> {
+                    let url_tag = url.clone();
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> =
+                        Box::pin(async move { Box::new(ws_connect_coro(url, timeout_ms).await) as Box<dyn Any> });
+                    let open = match yp.await_one(HostOp::Streaming(fut)) {
+                        OpDone::Stream(b) => *b.downcast::<WsOpen>().expect("WsOpen"),
+                        _ => unreachable!("ws open must resolve as Stream"),
+                    };
+                    match open {
+                        WsOpen::Ok { id, session, connecting_ms } => {
+                            // Metric recorded coroutine-side (scheduler stays metrics-free).
+                            if let Some(m) = &m {
+                                m.record_ws_connecting(connecting_ms, &[("url".to_string(), url_tag)]);
+                            }
+                            reg.0.borrow_mut().insert(id.clone(), session);
+                            Ok(id)
+                        }
+                        WsOpen::Err(e) => {
+                            Err(rquickjs::Error::new_from_js_message("string", "string", &e))
+                        }
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // __ws_recv(id, timeout) -> event (yields until the next event; the op carries
+    // its OWN evt_rx — run_op never sees the registry).
+    {
+        let reg = registry.clone();
+        ctx.globals().set(
+            "__ws_recv",
+            Function::new(
+                ctx.clone(),
+                move |id: String, timeout_ms: f64| -> rquickjs::Result<JsWsEvent> {
+                    let evt_rx = match reg.0.borrow().get(&id) {
+                        Some(s) => s.evt_rx.clone(),
+                        None => return Ok(JsWsEvent(WsEvent::Close)),
+                    };
+                    let timeout = if timeout_ms > 0.0 {
+                        Duration::from_millis(timeout_ms as u64)
+                    } else {
+                        Duration::from_secs(60)
+                    };
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> = Box::pin(async move {
+                        let mut rx = evt_rx.lock().await;
+                        let evt = match tokio::time::timeout(timeout, rx.recv()).await {
+                            Ok(Some(e)) => e,
+                            Ok(None) => WsEvent::Close,
+                            Err(_) => WsEvent::Timeout,
+                        };
+                        Box::new(evt) as Box<dyn Any>
+                    });
+                    let evt = match yp.await_one(HostOp::Streaming(fut)) {
+                        OpDone::Stream(b) => *b.downcast::<WsEvent>().expect("WsEvent"),
+                        _ => unreachable!("ws recv must resolve as Stream"),
+                    };
+                    Ok(JsWsEvent(evt))
+                },
+            )?,
+        )?;
+    }
+
+    // __ws_send / __ws_ping / __ws_close: coroutine-side, non-yielding (push a
+    // command on cmd_tx). __ws_cleanup: drop the session.
+    for (name, cmd) in [("__ws_send", None), ("__ws_ping", Some(WsCommandKind::Ping)), ("__ws_close", Some(WsCommandKind::Close))] {
+        let reg = registry.clone();
+        if name == "__ws_send" {
+            ctx.globals().set(
+                name,
+                Function::new(ctx.clone(), move |id: String, data: String| {
+                    if let Some(s) = reg.0.borrow().get(&id) {
+                        let _ = s.cmd_tx.send(WsCommand::Send(data));
+                    }
+                })?,
+            )?;
+        } else {
+            let kind = cmd.unwrap();
+            ctx.globals().set(
+                name,
+                Function::new(ctx.clone(), move |id: String| {
+                    if let Some(s) = reg.0.borrow().get(&id) {
+                        let _ = s.cmd_tx.send(match kind {
+                            WsCommandKind::Ping => WsCommand::Ping,
+                            WsCommandKind::Close => WsCommand::Close,
+                        });
+                    }
+                })?,
+            )?;
+        }
+    }
+    {
+        let reg = registry.clone();
+        ctx.globals().set(
+            "__ws_cleanup",
+            Function::new(ctx.clone(), move |id: String| {
+                reg.0.borrow_mut().remove(&id);
+            })?,
+        )?;
+    }
+
+    ctx.eval::<(), _>(include_str!("ws_shim.js"))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WsCommandKind {
+    Ping,
+    Close,
 }
 
 #[cfg(test)]

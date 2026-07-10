@@ -8,7 +8,7 @@ use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, HttpMethod, HttpRequest, HttpResponse, ResponseBody, Timings};
 
-enum ResponseCallback {
+pub(crate) enum ResponseCallback {
     Default,
     Disabled,
     ExpectedStatuses(Vec<(u16, u16)>),
@@ -30,7 +30,7 @@ impl ResponseCallback {
 
 /// HTTP response data that converts directly into a native JS object via `IntoJs`,
 /// bypassing JSON serialization/parsing on the hot path.
-struct JsHttpResponse {
+pub(crate) struct JsHttpResponse {
     status: u16,
     body: String,
     headers: Vec<(String, String)>,
@@ -67,7 +67,7 @@ impl<'js> IntoJs<'js> for JsHttpResponse {
 /// - 1200: request timeout
 /// - 1300: connection reset
 /// - 1400: blocked by policy
-fn classify_error(err: &anyhow::Error) -> u32 {
+pub(crate) fn classify_error(err: &anyhow::Error) -> u32 {
     let msg = err.to_string().to_lowercase();
 
     if msg.contains("blocked by") {
@@ -459,7 +459,7 @@ pub fn register_with_metrics<C: HttpClient + 'static>(
 /// Build an owned `HttpRequest` from the JS-side arguments. Runs synchronously
 /// (it reads the `Value`s), so an async host fn can call it up front and then
 /// move the owned request into its future.
-fn build_http_request(
+pub(crate) fn build_http_request(
     method: &str,
     url: String,
     body: &Value<'_>,
@@ -502,7 +502,7 @@ fn build_http_request(
 /// recording metrics with the same tag/failure semantics as the sync path
 /// (CG-3 system+user tags, data_sent/received, status=0 on transport failure).
 /// Plain data in/out — no `Ctx` — so it can run inside the host fn's future.
-fn finish_http_response(
+pub(crate) fn finish_http_response(
     result: anyhow::Result<HttpResponse>,
     method: &str,
     user_tags: Vec<(String, String)>,
@@ -638,7 +638,7 @@ pub fn register_async_request<C: HttpClient + 'static>(
     Ok(())
 }
 
-fn parse_response_callback(value: &Value<'_>) -> ResponseCallback {
+pub(crate) fn parse_response_callback(value: &Value<'_>) -> ResponseCallback {
     if value.is_null() {
         return ResponseCallback::Disabled;
     }
@@ -687,7 +687,7 @@ fn parse_response_callback(value: &Value<'_>) -> ResponseCallback {
 /// `serde_json::from_str::<Vec<(String, String)>>(...).unwrap_or_default()`
 /// contract (where a non-string value made the whole parse fail) while
 /// avoiding the `JSON.stringify` + parse round-trip entirely.
-fn object_entries_to_pairs(value: &Value<'_>) -> Vec<(String, String)> {
+pub(crate) fn object_entries_to_pairs(value: &Value<'_>) -> Vec<(String, String)> {
     match value.as_object() {
         Some(obj) => obj.props::<String, String>().flatten().collect(),
         None => Vec::new(),

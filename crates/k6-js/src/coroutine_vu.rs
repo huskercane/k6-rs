@@ -594,6 +594,45 @@ mod tests {
         );
     }
 
+    /// Object-keyed http.batch parity: `http.batch({ a: url, b: url })` returns
+    /// `{ a: resp, b: resp }` (keyed), NOT an array — so `responses.a.status`
+    /// works, matching upstream. Locks the object-form (array-only tests missed
+    /// this silent divergence, same class as randomSeed).
+    #[test]
+    fn object_keyed_http_batch_returns_keyed_object() {
+        let out = LocalSet::new().block_on(
+            &tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(),
+            async {
+                let script = r#"
+                    export default function () {
+                        const rs = http.batch({
+                            first: ['GET', 'http://x/'],
+                            second: ['GET', 'http://y/'],
+                        });
+                        return rs.first.status + ',' + rs.second.json().ok;
+                    }
+                "#;
+                let client = Arc::new(CookieMock {
+                    set_cookie: "x=1".into(),
+                    seen_cookie: Arc::new(std::sync::Mutex::new(None)),
+                });
+                let shared = Shared::new();
+                let result = Rc::new(RefCell::new(None));
+                let coro = build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+                spawn_vu(coro, shared.clone(), client, Backpressure::new(8), |n| n < 1)
+                    .await
+                    .unwrap();
+                let out = result.borrow().clone();
+                out
+            },
+        );
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "200,true".into() }),
+            "object-keyed batch returns a keyed object (responses.first.status), not an array"
+        );
+    }
+
     /// Regression-lock the async path's `__wrap_response` application: iteration
     /// 1's `asyncRequest` gets a Set-Cookie (extracted into the jar BY the
     /// resolver's `__wrap_response`), iteration 2's `asyncRequest` sends it. If a

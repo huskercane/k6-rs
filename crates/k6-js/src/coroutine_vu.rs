@@ -85,6 +85,7 @@ fn bootstrap_api(
     register_yielding_http(ctx, yp, shared, metrics.clone())?;
     crate::api::sleep::register_yielding(ctx, yp)?;
     crate::api::ws::register_yielding_ws(ctx, yp, crate::api::ws::WsRegistry::new(), metrics.clone())?;
+    crate::api::grpc::register_yielding_grpc(ctx, yp, metrics.clone())?;
 
     // check + group + custom metric constructors.
     crate::api::check::register_with_metrics(ctx, metrics.clone())?;
@@ -719,6 +720,27 @@ mod tests {
             out,
             Some(IterationOutcome::Completed { value: "hello-ws:200".into() }),
             "outer socket loop delivered the message AND the inner http.get (nested yield) completed"
+        );
+    }
+
+    /// grpc (unary, same Streaming mold as ws): `grpc.connect` to a closed port
+    /// YIELDS (no block_on panic on the loop) and the failure propagates as a
+    /// caught JS error — not a crash. Proves the grpc yield path. (A full invoke
+    /// needs a tonic server fixture — follow-up.)
+    #[test]
+    fn grpc_connect_yields_and_errors_gracefully() {
+        let script = r#"
+            export default function () {
+                var c = new grpc.Client();
+                try { c.connect('127.0.0.1:1', { plaintext: true }); return 'connected'; }
+                catch (e) { return 'error'; }
+            }
+        "#;
+        let out = run_script(script, 1);
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "error".into() }),
+            "grpc.connect to a closed port yields + errors gracefully (no loop panic)"
         );
     }
 

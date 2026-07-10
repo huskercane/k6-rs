@@ -784,18 +784,22 @@ pub(crate) fn register_yielding_http(
             });
         };
         globalThis.http.batch = function (requests) {
-            // Normalize array | object-of-requests to an array; _prep each. (Object
-            // key preservation on the concurrent path is follow-up debt.)
-            var list = Array.isArray(requests)
-                ? requests
-                : Object.keys(requests).map(function (k) { return requests[k]; });
             var http = globalThis.http;
+            var isArray = Array.isArray(requests);
+            var keys = isArray ? null : Object.keys(requests);
+            var list = isArray ? requests : keys.map(function (k) { return requests[k]; });
             var preps = list.map(function (req) {
                 if (typeof req === 'string') return http._prep('GET', req, null, undefined);
                 if (Array.isArray(req)) return http._prep(req[0], req[1], req[2] || null, req[3]);
                 return http._prep(req.method || 'GET', req.url, req.body || null, req.params);
             });
-            return __http_batch(preps).map(__wrap_response);
+            var raws = __http_batch(preps).map(__wrap_response);
+            if (isArray) return raws;
+            // Object input -> object output keyed the same (upstream parity):
+            // responses.a.status must work, not responses[0].status.
+            var out = {};
+            for (var i = 0; i < keys.length; i++) out[keys[i]] = raws[i];
+            return out;
         };
     "#,
     )?;

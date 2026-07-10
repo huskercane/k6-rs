@@ -268,7 +268,18 @@ cutover is now gated on a **B2 spike** and split by bucket.
   (`http.get`/`request`, `sleep`, sync `ws`/`grpc`) to coroutine-yielding — the
   remaining `block_on` sites (http 3, sleep 3, grpc 2, ws 2). Gate: all existing
   VU / http / sleep / ws / grpc / executor tests green with no sync runtime in
-  the tree. This is the risk-bearing landing.
+  the tree. This is the risk-bearing landing. **Cutover checklist:**
+  - **`asyncRequest` parity (silent-divergence trap):** `__http_request_async`
+    resolves a *raw* `JsHttpResponse`. The production `http.asyncRequest` wrapper
+    must re-apply `__wrap_response` (`.json()`/`.html()`/`.cookies`) **and** the
+    per-VU cookie jar — the old stub got both free via `__http.request`. Parity
+    bar: `http_async_request_resolves_response` asserts `res.json().ok`. (Pinned
+    as `TODO(cutover)` at `register_async_request`.)
+  - **Canonical async host-fn pattern (copy for #2/#3):** read every `Value<'js>`
+    into **owned** data *before* the `.await`, so the future captures nothing
+    borrowed from `'js` and nothing `!Send` (see `__http_request_async`). Holding
+    a `Ctx`/`Value` across the await is the mistake that makes the borrow checker
+    fight the conversion.
 - **Phase 2 — Scale to N loops + wire all six executors.** Shard the VU pool
   across N current-thread runtimes; keep the arrival-curve integral and
   dropped-iteration accounting untouched. Gate: 7900-VU soak holds **bounded RSS

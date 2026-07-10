@@ -266,43 +266,104 @@ cutover is now gated on a **B2 spike** and split by bucket.
     because the `parallel` feature requires host-fn closures `Send`).
   **Decision locked: B2** (B1 stays rejected as generally unsound).
 
-  **Architecture implication for Phase 1b (important):** under B2 the VU body
-  stays **sync QuickJS (`Context`, not `AsyncContext`)**, wrapped in a coroutine;
-  blocking host fns *yield* instead of `block_on`. So the Phase 1a
-  `AsyncRuntime`/`create_async_*`/`spawn_driver` machinery is **not** the VU body
-  path — it is only for the async-promise surface (`asyncRequest`). **Open Phase
-  1b design question:** how a single VU that uses *both* sync `http.get` (needs
-  coroutine yield) *and* `Promise.all([asyncRequest,…])` (needs in-VU event-loop
-  overlap) reconciles the two. A pure coroutine yields the *whole* VU, so it does
-  not give in-VU promise overlap by itself; unifying B2 with the async-promise
-  event loop (e.g. coroutine hosting a sync context whose job queue the scheduler
-  also drives) is the first thing Phase 1b must design. Not resolved by the
-  spike — the spike proved sync-`http.get` yield (the dominant path + the soak).
-- **Phase 1a — Already-awaited surface (mechanical, in progress).** Make
-  `http.asyncRequest` a true async host fn (the `Async` adaptor) on the async
-  runtime, replacing the `Promise.resolve().then` stub; later, promise-returning
-  timers. No suspension mechanism needed — scripts already `await`. *Landed so
-  far:* `register_async_request` + `__http_request_async` + shared
-  `build_http_request`/`finish_http_response` helpers, proven end-to-end on the
-  async foundation (`async_http_request_resolves_on_async_loop`). Sync
-  `__http_request` and every `http.get` caller untouched; all tests green.
-- **Phase 1b — Sync-blocking cutover (gated on Phase 0.5).** With B2 proven, move
-  `run_iteration` onto the loop and convert the sync-blocking host fns
-  (`http.get`/`request`, `sleep`, sync `ws`/`grpc`) to coroutine-yielding — the
-  remaining `block_on` sites (http 3, sleep 3, grpc 2, ws 2). Gate: all existing
-  VU / http / sleep / ws / grpc / executor tests green with no sync runtime in
-  the tree. This is the risk-bearing landing. **Cutover checklist:**
-  - **`asyncRequest` parity (silent-divergence trap):** `__http_request_async`
-    resolves a *raw* `JsHttpResponse`. The production `http.asyncRequest` wrapper
-    must re-apply `__wrap_response` (`.json()`/`.html()`/`.cookies`) **and** the
-    per-VU cookie jar — the old stub got both free via `__http.request`. Parity
-    bar: `http_async_request_resolves_response` asserts `res.json().ok`. (Pinned
-    as `TODO(cutover)` at `register_async_request`.)
-  - **Canonical async host-fn pattern (copy for #2/#3):** read every `Value<'js>`
-    into **owned** data *before* the `.await`, so the future captures nothing
-    borrowed from `'js` and nothing `!Send` (see `__http_request_async`). Holding
-    a `Ctx`/`Value` across the await is the mistake that makes the borrow checker
-    fight the conversion.
+## The unified Phase 1b model (decided 2026-07-10) — coroutine-hosts-its-own-loop
+
+Resolves the open question above. The two suspensions have **opposite borrow
+behaviour**, and that asymmetry *is* the design:
+
+- **Sync `http.get()` yield** parks the coroutine **holding** the `ctx.with`
+  borrow — the Rust stack is suspended *inside* the `with` closure (the host fn
+  runs there).
+- **JS `await asyncRequest`** does the opposite: QuickJS unwinds its stack back
+  to the `eval` caller and returns a *pending promise*, so `ctx.with` **returns
+  and releases** the borrow. Multiple ops can be in flight; the promise settles
+  later.
+
+**The load-bearing invariant** (a scheduler that borrowed a VU's `Context` to
+settle a promise while that VU is parked mid-`http.get` would be a re-entrant
+`with` = double borrow = UB):
+
+> **The scheduler owns only `(coroutines, futures)`. It NEVER borrows a VU's
+> `Context`. Each coroutine drives its own job queue, inside its own `ctx.with`
+> borrows.**
+
+Under that rule `run_iteration` (inside the coroutine) *is* the event loop for
+its own VU:
+
+```
+let script_promise = ctx.with(|ctx| eval(default_fn));   // returns pending promise, borrow RELEASED
+loop {
+    ctx.with(|ctx| { settle_completed_ops(); drain_pending_jobs(); }); // borrow released each pass
+    if settled(script_promise) { break; }
+    yield_to_scheduler();   // between with-blocks: borrow NOT held → clean
+}
+```
+
+Everything falls out of this one loop:
+
+- **Sync `http.get()`** = the **one-op degenerate case**: yield holding the
+  borrow, scheduler awaits the single future, resumes. Nobody else ever touches
+  that `Context` while parked, so borrow-held is harmless.
+- **`Promise.all([asyncRequest, asyncRequest])` overlap** = the **multi-op
+  case**: both futures registered before the `await`, both progress on the
+  scheduler, settled by the driver loop when it regains control.
+- **Cross-VU concurrency** is automatic: VU-A parked mid-`http.get` (borrow on
+  Context-A) never impedes VU-B's coroutine on Context-B.
+- **Faithful to goja:** an `asyncRequest()` then a sync `http.get()` — the async
+  I/O progresses during the park, but its promise callback doesn't run until the
+  coroutine returns to its driver loop. Exactly "separate goroutine does the I/O,
+  callback waits for the loop to turn."
+
+**Substrate exists on the sync path** (verified): `Ctx::promise() -> (Promise,
+resolve, reject)` mints a promise whose resolver the scheduler holds;
+`Runtime::execute_pending_job()` drains the `.then` callbacks. No `AsyncContext`.
+
+**This supersedes Phase 1a's substrate.** The production VU body is a **sync
+`Context`**, so `AsyncContext`/`create_async_*`/`spawn_driver` are **not** the VU
+path — `asyncRequest` becomes a plain sync host fn that mints a promise
+(`ctx.promise()`) and registers its future with the scheduler. What Phase 1a
+*earned* survives: the **sync-prep-then-owned-future** discipline and the
+`build_http_request`/`finish_http_response` helpers. `register_async_request` on
+`AsyncContext` + `spawn_driver` are now spike-scaffolding, folded into cleanup.
+**Phase 1a (done):** `http.asyncRequest` as a true async host fn +
+`build_http_request`/`finish_http_response` helpers. Under the unified model the
+`AsyncContext` substrate is superseded (see above); the helpers + discipline are
+what carry forward.
+
+### Phase 1b — the unified cutover (critical path)
+
+Delivered **north-star-first**: sync `http.get` (which the reference soak uses)
+lands before in-VU `asyncRequest` overlap, all on **one** driver-loop code path
+(sync `http.get` is its one-op degenerate case, so deferring overlap is *not* a
+shortcut — it would build a special case you later rip out).
+
+- **1b-gate — m1/m2 mini-spike. DONE ✅ (2026-07-10) — substrate CONFIRMED.**
+  In `b2_spike` (6 proofs green). **(m1)** an `async` fn's top-level `await` on
+  the sync path returns a *pending* promise (borrow released); a scheduler-held
+  resolver + `drain_pending_jobs` settles it to completion. **(m2)** two promises
+  minted via `ctx.promise()` behind one `Promise.all` settle **out of order, with
+  the second op still in flight**, across borrow boundaries, job queue intact.
+  Confirms the unified model is buildable on a sync `Context` — no `AsyncContext`.
+- **1b-1 — yield primitive + scheduler.** The scheduler owns only
+  `(coroutines, futures)` and **never borrows a `Context`** (the invariant).
+- **1b-2 — per-VU driver loop.** `run_iteration` becomes the coroutine's own
+  event loop (settle ops → drain jobs → yield). Convert sync-blocking host fns
+  (`http.get`/`request`, `sleep`, sync `ws`/`grpc`) to yield; `asyncRequest`
+  becomes a sync host fn that mints a promise + registers its future. Remaining
+  `block_on` sites removed (http 3, sleep 3, grpc 2, ws 2).
+- **1b-3 — executors: spawn-model swap.** `spawn_blocking` → spawn/drive VU
+  coroutines on the loop thread(s). *Not* an await-cascade through 87 `.with(`
+  sites — the VU body stays sync `Context`, so those stay `.with`. This is the
+  scope that **shrank** under B2.
+- **Cutover checklist (carried forward):**
+  - **`asyncRequest` parity (silent-divergence trap):** re-apply `__wrap_response`
+    (`.json()`/`.html()`/`.cookies`) **and** the per-VU cookie jar — the old stub
+    got both free via `__http.request`. Parity bar:
+    `http_async_request_resolves_response` asserts `res.json().ok`. (`TODO(cutover)`
+    pinned at `register_async_request`.)
+  - **Remove superseded scaffolding:** `AsyncContext`/`create_async_*`/
+    `spawn_driver` + the `async-spike`/`b2-spike` modules & features. Keep the
+    `build_http_request`/`finish_http_response` helpers + the sync-prep discipline.
 - **Phase 2 — Scale to N loops + wire all six executors.** Shard the VU pool
   across N current-thread runtimes; keep the arrival-curve integral and
   dropped-iteration accounting untouched. Gate: 7900-VU soak holds **bounded RSS

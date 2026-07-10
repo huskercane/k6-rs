@@ -80,9 +80,11 @@ fn bootstrap_api(
     crate::api::streams::register(ctx)?;
     crate::api::webcrypto::register(ctx)?;
 
-    // Yielding http + sleep (native fns yield instead of block_on).
+    // Yielding http + sleep + ws (native fns yield instead of block_on). ws gets
+    // a fresh per-VU sibling session registry (not on VuShared).
     register_yielding_http(ctx, yp, shared, metrics.clone())?;
     crate::api::sleep::register_yielding(ctx, yp)?;
+    crate::api::ws::register_yielding_ws(ctx, yp, crate::api::ws::WsRegistry::new(), metrics.clone())?;
 
     // check + group + custom metric constructors.
     crate::api::check::register_with_metrics(ctx, metrics.clone())?;
@@ -629,6 +631,94 @@ mod tests {
             seen.as_deref(),
             Some("sid=xyz"),
             "async request sent the jar cookie extracted from a prior async response"
+        );
+    }
+
+    /// HEADLINE ws regression lock: a `socket.on('message')` handler that itself
+    /// yields (`http.get` inside the handler) — a NESTED `AwaitOne` on the
+    /// coroutine stack. Asserts BOTH the outer socket loop delivered the message
+    /// AND the inner request completed. This is the one thing that silently breaks
+    /// if the coroutine frame didn't survive a nested yield; a flat-handler test
+    /// wouldn't catch it. (Real local WS server; mock http for the inner call.)
+    #[test]
+    fn ws_message_handler_can_nest_yield_http_get() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        struct Mock200;
+        impl HttpClient for Mock200 {
+            fn send(
+                &self,
+                _req: HttpRequest,
+            ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+                async {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: ResponseBody::Buffered(b"{}".to_vec()),
+                        timings: Timings::default(),
+                        url: "http://x/".into(),
+                        data_sent: 0,
+                        data_received: 0,
+                    })
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = LocalSet::new().block_on(&rt, async {
+            // WS server: accept one conn, send a text message, wait for the client
+            // to close.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::task::spawn_local(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        let _ = ws.send(Message::Text("hello-ws".into())).await;
+                        while let Some(Ok(m)) = ws.next().await {
+                            if m.is_close() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let script = format!(
+                r#"
+                export default function () {{
+                    globalThis.__got = '';
+                    globalThis.__inner = 0;
+                    ws.connect('ws://{addr}/', function (socket) {{
+                        socket.on('message', function (msg) {{
+                            globalThis.__got = msg;
+                            // NESTED YIELD: http.get inside the ws message handler.
+                            var r = http.get('http://x/');
+                            globalThis.__inner = r.status;
+                            socket.close();
+                        }});
+                    }});
+                    return globalThis.__got + ':' + globalThis.__inner;
+                }}
+            "#
+            );
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(script, shared.clone(), None, result.clone());
+            spawn_vu(coro, shared.clone(), Arc::new(Mock200), Backpressure::new(8), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "hello-ws:200".into() }),
+            "outer socket loop delivered the message AND the inner http.get (nested yield) completed"
         );
     }
 

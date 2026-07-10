@@ -22,9 +22,25 @@ pub trait VirtualUser: Send {
 }
 
 /// Summary returned when an executor finishes.
+///
+/// The four iteration lanes are conserved against the arrival integral for the
+/// arrival-rate executors: `completed + dropped + errored + interrupted` equals
+/// the number of scheduled arrivals. They are load-test-distinct signals:
+/// - `completed` — ran to a clean finish.
+/// - `dropped` — never dispatched (no idle VU at the arrival instant): a *capacity*
+///   signal, the whole point of the arrival-rate model.
+/// - `errored` — dispatched and ran, but the iteration threw: an *app-health*
+///   signal under load. Distinct from `dropped` (kept up but failing) and from
+///   `completed` (does not count toward it, matching the sync path).
+/// - `interrupted` — force-unwound at a hard shutdown deadline before finishing:
+///   a *shutdown artifact*, deliberately NOT `errored` so a graceful stop can't
+///   trip an error threshold in the run's final moments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
     pub iterations_completed: u64,
     pub iterations_dropped: u64,
+    pub iterations_errored: u64,
+    pub iterations_interrupted: u64,
     pub duration: Duration,
 }
 

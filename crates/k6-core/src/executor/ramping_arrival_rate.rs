@@ -123,6 +123,7 @@ impl<V: VirtualUser + 'static> RampingArrivalRateExecutor<V> {
             iterations_completed: iterations_completed.load(Ordering::Relaxed),
             iterations_dropped: self.pool.dropped_iterations(),
             duration: start.elapsed(),
+            ..Default::default()
         })
     }
 }

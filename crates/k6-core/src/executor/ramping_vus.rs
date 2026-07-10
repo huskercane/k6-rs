@@ -127,6 +127,7 @@ impl<V: VirtualUser + 'static> RampingVusExecutor<V> {
             iterations_completed: iterations_completed.load(Ordering::Relaxed),
             iterations_dropped: 0, // ramping-vus never drops
             duration: start.elapsed(),
+            ..Default::default()
         })
     }
 

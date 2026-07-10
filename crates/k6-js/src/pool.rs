@@ -43,6 +43,12 @@ use k6_core::traits::{HttpClient, RunSummary};
 use crate::coroutine_vu::{IterationOutcome, build_coroutine_vu};
 use crate::vu_sched::{IterationControl, Shared, spawn_vu};
 
+/// Max wait for VUs to report their initial idle at arrival-rate startup before
+/// the coordinator proceeds degraded. Idle reports are near-instant (a channel
+/// send before any Context init), so this only ever fires when a VU has died
+/// mid-construction — it converts a would-be deadlock into a logged degraded run.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Loop-thread count for `num_vus`: one per core, capped at the VU count (never
 /// more threads than VUs), floored at 1 when there are VUs at all.
 fn loop_thread_count(num_vus: usize) -> usize {
@@ -101,6 +107,7 @@ where
     let start = Instant::now();
     let deadline = start + duration;
     let completed = Arc::new(AtomicU64::new(0));
+    let errored = Arc::new(AtomicU64::new(0));
 
     let mut threads = Vec::with_capacity(num_threads);
     for t in 0..num_threads {
@@ -117,12 +124,13 @@ where
         let metrics = metrics.clone();
         let cancel = cancel.clone();
         let completed = Arc::clone(&completed);
+        let errored = Arc::clone(&errored);
 
         threads.push(
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
                 .spawn(move || {
-                    run_loop_thread(my_vus, script, deadline, client, bp, metrics, cancel, completed)
+                    run_loop_thread(my_vus, script, deadline, client, bp, metrics, cancel, completed, errored)
                 })
                 .expect("spawn loop thread"),
         );
@@ -135,7 +143,9 @@ where
     RunSummary {
         iterations_completed: completed.load(Ordering::Relaxed),
         iterations_dropped: 0, // constant-vus never drops (no arrival curve)
+        iterations_errored: errored.load(Ordering::Relaxed),
         duration: start.elapsed(),
+        ..Default::default()
     }
 }
 
@@ -151,6 +161,7 @@ fn run_loop_thread<C>(
     metrics: BuiltinMetrics,
     cancel: CancellationToken,
     completed: Arc<AtomicU64>,
+    errored: Arc<AtomicU64>,
 ) where
     C: HttpClient + 'static,
 {
@@ -175,6 +186,7 @@ fn run_loop_thread<C>(
 
             let cancel = cancel.clone();
             let completed = Arc::clone(&completed);
+            let errored = Arc::clone(&errored);
             // constant-vus control hook, consulted at each `IterationBoundary`
             // (and once up front at n==0). It reads the iteration that just
             // finished — published to `result` before this call — tallies it, then
@@ -183,11 +195,18 @@ fn run_loop_thread<C>(
             // hook arrives with the arrival-rate coordinator slice.)
             let control = move |n: u32| -> bool {
                 if n >= 1 {
-                    // n>=1 ⇒ iteration n-1 just completed; count only Completed
-                    // (an Errored iteration matches the sync path: not counted,
-                    // no iteration metric — recorded coroutine-side).
-                    if let Some(IterationOutcome::Completed { .. }) = result.borrow().as_ref() {
-                        completed.fetch_add(1, Ordering::Relaxed);
+                    // n>=1 ⇒ iteration n-1 just finished; classify it. Completed
+                    // and Errored are counted in separate lanes (parity with the
+                    // sync path: an Errored iteration is NOT a completion and
+                    // records no iteration metric — that's coroutine-side).
+                    match result.borrow().as_ref() {
+                        Some(IterationOutcome::Completed { .. }) => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(IterationOutcome::Errored { .. }) => {
+                            errored.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => {}
                     }
                 }
                 !cancel.is_cancelled() && Instant::now() < deadline
@@ -224,14 +243,25 @@ struct ArrivalControl {
     run_next_rx: UnboundedReceiver<()>,
     result: Rc<RefCell<Option<IterationOutcome>>>,
     completed: Arc<AtomicU64>,
+    errored: Arc<AtomicU64>,
 }
 
 impl IterationControl for ArrivalControl {
     async fn next(&mut self, completed_iters: u32) -> bool {
         if completed_iters >= 1 {
-            // Count only Completed (parity with the sync path — see constant-vus).
-            if let Some(IterationOutcome::Completed { .. }) = self.result.borrow().as_ref() {
-                self.completed.fetch_add(1, Ordering::Relaxed);
+            // Classify the finished iteration into its lane. A dispatched
+            // iteration that threw is `errored`, NOT a completion and NOT a drop —
+            // it consumed an arrival slot and ran, so conservation requires it be
+            // counted here (else completed+dropped silently under-sums the
+            // integral by the error count).
+            match self.result.borrow().as_ref() {
+                Some(IterationOutcome::Completed { .. }) => {
+                    self.completed.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(IterationOutcome::Errored { .. }) => {
+                    self.errored.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {}
             }
         }
         // Signal idle, then await dispatch. A send error (coordinator gone) or a
@@ -287,15 +317,12 @@ where
     C: HttpClient + 'static,
 {
     if num_vus == 0 || num_threads == 0 {
-        return RunSummary {
-            iterations_completed: 0,
-            iterations_dropped: 0,
-            duration: Duration::ZERO,
-        };
+        return RunSummary::default();
     }
 
     let completed = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
+    let errored = Arc::new(AtomicU64::new(0));
 
     // Per-VU dispatch channels: coordinator holds the senders (by id), each VU its
     // receiver. Idle channel: every VU clones `idle_tx` → coordinator's `idle_rx`.
@@ -322,10 +349,13 @@ where
         let metrics = metrics.clone();
         let idle_tx = idle_tx.clone();
         let completed = Arc::clone(&completed);
+        let errored = Arc::clone(&errored);
         loop_threads.push(
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
-                .spawn(move || run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed))
+                .spawn(move || {
+                    run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed, errored)
+                })
                 .expect("spawn loop thread"),
         );
     }
@@ -352,12 +382,15 @@ where
     RunSummary {
         iterations_completed: completed.load(Ordering::Relaxed),
         iterations_dropped: dropped.load(Ordering::Relaxed),
+        iterations_errored: errored.load(Ordering::Relaxed),
         duration,
+        ..Default::default()
     }
 }
 
 /// One arrival-rate loop thread: a current-thread runtime + `LocalSet` hosting its
 /// VUs, each with an [`ArrivalControl`] wired to its own dispatch receiver.
+#[allow(clippy::too_many_arguments)]
 fn run_arrival_loop_thread<C>(
     vus: Vec<(usize, UnboundedReceiver<()>)>,
     script: String,
@@ -366,6 +399,7 @@ fn run_arrival_loop_thread<C>(
     metrics: BuiltinMetrics,
     idle_tx: UnboundedSender<usize>,
     completed: Arc<AtomicU64>,
+    errored: Arc<AtomicU64>,
 ) where
     C: HttpClient + 'static,
 {
@@ -391,6 +425,7 @@ fn run_arrival_loop_thread<C>(
                 run_next_rx,
                 result,
                 completed: Arc::clone(&completed),
+                errored: Arc::clone(&errored),
             };
             handles.push(spawn_vu(coro, shared, Arc::clone(&client), bp.clone(), control));
         }
@@ -412,13 +447,40 @@ fn run_coordinator(
 ) -> Duration {
     let mut idle: VecDeque<usize> = VecDeque::with_capacity(num_vus);
 
-    // Startup: wait for all N VUs to report idle (the "pool full at t=0"
-    // equivalence — no startup skew), THEN start the arrival clock.
-    for _ in 0..num_vus {
-        match idle_rx.blocking_recv() {
-            Some(id) => idle.push_back(id),
-            None => return Duration::ZERO, // all VUs died before starting
+    // Startup: collect all N VUs' initial idle reports (the "pool full at t=0"
+    // equivalence — no startup skew) BEFORE starting the clock. Cancel- and
+    // timeout-aware by design: a VU that dies before its first report (e.g. a
+    // coroutine-stack alloc OOM at 7900 VUs — the soak condition) must NOT hang
+    // the whole run. On cancel or the startup deadline we proceed DEGRADED with
+    // whoever reported (logged); the un-reported VUs simply aren't in the idle set.
+    let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+    while idle.len() < num_vus {
+        if cancel.is_cancelled() {
+            break;
         }
+        match idle_rx.try_recv() {
+            Ok(id) => idle.push_back(id),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if Instant::now() >= startup_deadline {
+                    eprintln!(
+                        "warning: only {}/{num_vus} VUs ready at the startup deadline; \
+                         proceeding degraded (the rest failed to initialize)",
+                        idle.len()
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Every VU dropped its idle sender before we got N reports — nothing
+            // left to run.
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    if idle.is_empty() {
+        // No VU ever became ready (all died, or cancelled during startup). Drop the
+        // dispatch senders so any late survivor stops, and report a zero window.
+        drop(run_next_tx);
+        return Duration::ZERO;
     }
 
     let start = Instant::now();
@@ -632,6 +694,17 @@ mod tests {
             iterations_metric, summary.iterations_completed,
             "iterations metric (coroutine lane) counts completed only, == executor tally"
         );
+        // Conservation for constant-vus: every attempt did exactly one http.get and
+        // ended completed or errored (nothing dropped/interrupted), so the two lanes
+        // sum to http_reqs. This is where the errored lane earns its keep.
+        assert!(summary.iterations_errored > 0, "every 3rd iteration throws");
+        assert_eq!(
+            summary.iterations_completed + summary.iterations_errored,
+            http_reqs,
+            "completed {} + errored {} should equal http_reqs {http_reqs}",
+            summary.iterations_completed,
+            summary.iterations_errored
+        );
     }
 
     /// Cancellation (graceful, at the boundary): a token cancelled early stops the
@@ -744,9 +817,12 @@ mod tests {
             "2 slow VUs vs 100/s must drop, got 0 (completed {})",
             summary.iterations_completed
         );
-        // Every arrival is accounted for: completed + dropped ≈ integral (no error
-        // in this script, so nothing sits in the errored bucket). Small tail for
-        // the boundary tick.
+        // No throw in this script ⇒ the errored bucket is empty, and graceful stop
+        // interrupts nothing.
+        assert_eq!(summary.iterations_errored, 0);
+        assert_eq!(summary.iterations_interrupted, 0);
+        // Every arrival is accounted for: completed + dropped ≈ integral. Small
+        // tail for the boundary tick.
         let total = summary.iterations_completed + summary.iterations_dropped;
         let lo = (integral as u64).saturating_sub(3);
         let hi = integral as u64 + 3;
@@ -757,6 +833,80 @@ mod tests {
             summary.iterations_completed,
             summary.iterations_dropped
         );
+    }
+
+    /// Three-way conservation (slice-2 finding 1): a script that is BOTH slow
+    /// (drops) AND throws every 3rd iteration (errors). All three buckets are
+    /// non-empty and they conserve: completed + dropped + errored ≈ the integral.
+    /// If errored iterations fell out of the accounting (the gap this closes),
+    /// completed + dropped would under-sum the integral by the error count.
+    /// interrupted stays 0 — graceful stop force-unwinds nothing.
+    #[test]
+    fn arrival_rate_mixed_outcomes_conserve_three_ways() {
+        let curve = ArrivalCurve::constant(100, Duration::from_secs(1), Duration::from_millis(300));
+        let integral = curve.expected_arrivals(Duration::from_millis(300)); // ≈ 30
+        let script = r#"
+            export default function () {
+                globalThis.__n = (globalThis.__n || 0) + 1;
+                sleep(0.03);                       // 30 ms ⇒ 2 VUs can't sustain 100/s
+                if (globalThis.__n % 3 === 0) throw new Error('every third');
+            }
+        "#;
+        let summary = run_arrival_rate_on(
+            2,
+            script.to_string(),
+            2, // saturated
+            curve,
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+        );
+
+        assert!(summary.iterations_completed > 0, "some completed: {summary:?}");
+        assert!(summary.iterations_dropped > 0, "some dropped: {summary:?}");
+        assert!(summary.iterations_errored > 0, "some errored: {summary:?}");
+        assert_eq!(summary.iterations_interrupted, 0, "graceful stop interrupts nothing");
+
+        let total = summary.iterations_completed
+            + summary.iterations_dropped
+            + summary.iterations_errored;
+        let lo = (integral as u64).saturating_sub(3);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&total),
+            "completed {} + dropped {} + errored {} = {total} should conserve to the \
+             integral {integral:.1}",
+            summary.iterations_completed,
+            summary.iterations_dropped,
+            summary.iterations_errored
+        );
+    }
+
+    /// Startup robustness (slice-2 finding 3): a token already cancelled when the
+    /// coordinator reaches its startup collection must break out and return
+    /// cleanly — NOT block forever in the wait-for-N-idle loop. Same exit path a
+    /// VU dying before its first idle report takes (the deadlock this closes). The
+    /// run terminates; it does not hang.
+    #[test]
+    fn arrival_startup_cancelled_returns_without_hang() {
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // pre-cancelled
+        let summary = run_arrival_rate_on(
+            2,
+            "export default function () { http.get('http://x/'); }".to_string(),
+            4,
+            ArrivalCurve::constant(50, Duration::from_secs(1), Duration::from_secs(10)),
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            cancel,
+        );
+        // Cancelled before the clock started ⇒ no arrivals, an empty summary, and
+        // (the point) the call RETURNED rather than deadlocking.
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_dropped, 0);
+        assert!(summary.duration < Duration::from_secs(1));
     }
 
     /// Ramp integral parity (mirrors the sync `ramp_matches_integral_count`): a

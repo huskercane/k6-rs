@@ -119,6 +119,7 @@ impl<V: VirtualUser + 'static> ExternallyControlledExecutor<V> {
             iterations_completed: total_iterations.load(Ordering::Relaxed),
             iterations_dropped: 0,
             duration: elapsed,
+            ..Default::default()
         })
     }
 }

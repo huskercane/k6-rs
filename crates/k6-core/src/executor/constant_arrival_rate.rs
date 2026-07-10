@@ -90,6 +90,7 @@ impl<V: VirtualUser + 'static> ConstantArrivalRateExecutor<V> {
             iterations_completed: iterations_completed.load(Ordering::Relaxed),
             iterations_dropped: self.pool.dropped_iterations(),
             duration: elapsed,
+            ..Default::default()
         })
     }
 }

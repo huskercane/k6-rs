@@ -886,3 +886,25 @@ closed in 3a) still open for the soak slice.
   (end-of-run runtime drop closes the socket anyway); the true lock would
   force_unwind a ws VU MID-run with other VUs live and assert the read task is gone
   while the runtime survives — low priority, the `Drop` is obviously correct.
+
+### #5 slice 4 — remaining executors on the coroutine model
+
+- **4a — per-vu-iterations + shared-iterations** via a shared `run_vus_on_loops`
+  skeleton (extracted on the third VU-count executor). Policy lives in the control:
+  per-vu caps at `n < quota`; shared CAS-claims a shared `AtomicU32` budget. Both
+  reuse the HardStop watchdog + errored/interrupted lanes. dropped = never-started
+  iterations; four-lane conservation locked.
+- **4b — ramping-vus.** Active-count schedule extracted to `k6_core::executor::
+  vu_ramp::VuRampSchedule` (round-not-truncate; sync executor refactored onto it,
+  reuse proven). `RampingControl`: a VU is active iff `my_index < desired`; a
+  controller thread drives `desired` along the schedule then fires the graceful
+  stop. All `max_vus` coroutines pre-allocated (fixed memory); only `desired` run
+  at once, deactivating highest indices first (matches sync scale-down). The
+  index-aware control needed `run_vus_on_loops` to pass the global VU id to the
+  control factory (others ignore it).
+
+Coverage: constant-vus, constant/ramping-arrival-rate, per-vu, shared, ramping-vus
+all on the coroutine model. **externally-controlled** (runtime REST-API VU control)
+deferred — not used by the OOM-reference soak; slot it during the main.rs cutover
+or stub it. NEXT: main.rs cutover (wire pool.rs, retire the sync spawn_blocking
+path) + fat-frame stack measurement + 7900 soak. Pre-soak gates: tasks #9, #11, #12.

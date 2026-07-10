@@ -6,6 +6,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Stage;
+use crate::executor::vu_ramp::VuRampSchedule;
 use crate::traits::{RunSummary, VirtualUser};
 use crate::vu_pool::VuPool;
 
@@ -33,19 +34,10 @@ impl<V: VirtualUser + 'static> RampingVusExecutor<V> {
         let start = Instant::now();
         let iterations_completed = Arc::new(AtomicU64::new(0));
 
-        // Build timeline: (stage_end_time, from_vus, to_vus)
-        let mut timeline = Vec::with_capacity(self.stages.len());
-        let mut offset = Duration::ZERO;
-        let mut prev_target = self.start_vus;
-
-        for stage in &self.stages {
-            let stage_end = offset + stage.duration;
-            timeline.push((offset, stage_end, prev_target, stage.target));
-            prev_target = stage.target;
-            offset = stage_end;
-        }
-
-        let total_duration = offset;
+        // The active-VU-count curve lives in `VuRampSchedule` (shared, JS-free) —
+        // the same schedule the coroutine ramping-VUs executor consumes.
+        let schedule = VuRampSchedule::new(self.start_vus, &self.stages);
+        let total_duration = schedule.total_duration();
 
         // Track active VU handles
         let mut active_guards = Vec::new();
@@ -66,7 +58,7 @@ impl<V: VirtualUser + 'static> RampingVusExecutor<V> {
             }
 
             // Calculate desired VU count
-            let desired = Self::interpolate_vus(&timeline, elapsed);
+            let desired = schedule.interpolate(elapsed);
 
             let current = active_guards.len() as u32;
 
@@ -131,24 +123,6 @@ impl<V: VirtualUser + 'static> RampingVusExecutor<V> {
         })
     }
 
-    fn interpolate_vus(timeline: &[(Duration, Duration, u32, u32)], elapsed: Duration) -> u32 {
-        for &(stage_start, stage_end, from_vus, to_vus) in timeline {
-            if elapsed >= stage_start && elapsed < stage_end {
-                let stage_duration = (stage_end - stage_start).as_secs_f64();
-                let stage_elapsed = (elapsed - stage_start).as_secs_f64();
-                let progress = stage_elapsed / stage_duration;
-
-                // Round, don't truncate. `as u32` floors, so a 0→5 ramp held
-                // one VU short for almost the whole ramp (4.9 → 4), costing
-                // VU-seconds and systematically under-running iterations vs
-                // upstream (measured ~12% short). Rounding tracks the intended
-                // linear VU count symmetrically on the way up and down.
-                return (from_vus as f64 + (to_vus as f64 - from_vus as f64) * progress).round()
-                    as u32;
-            }
-        }
-        0
-    }
 }
 
 #[cfg(test)]
@@ -168,23 +142,8 @@ mod tests {
         fn reset(&mut self) {}
     }
 
-    #[test]
-    fn interpolate_vus_linear() {
-        let timeline = vec![(Duration::ZERO, Duration::from_secs(10), 0, 10)];
-
-        assert_eq!(
-            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::ZERO),
-            0
-        );
-        assert_eq!(
-            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(5)),
-            5
-        );
-        assert_eq!(
-            RampingVusExecutor::<MockVu>::interpolate_vus(&timeline, Duration::from_secs(10)),
-            0
-        ); // past stage
-    }
+    // VU-count interpolation is unit-tested in `executor::vu_ramp`; these tests
+    // exercise the executor's use of the shared schedule.
 
     #[tokio::test]
     async fn ramp_up_and_down() {

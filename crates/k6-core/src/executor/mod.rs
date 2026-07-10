@@ -6,3 +6,4 @@ pub mod per_vu_iterations;
 pub mod ramping_arrival_rate;
 pub mod ramping_vus;
 pub mod shared_iterations;
+pub mod vu_ramp;

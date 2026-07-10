@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use k6_core::backpressure::Backpressure;
 use k6_core::executor::arrival::ArrivalCurve;
+use k6_core::executor::vu_ramp::VuRampSchedule;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, RunSummary};
 
@@ -122,7 +123,7 @@ where
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
         let cancel = cancel.clone();
-        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+        move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
             let (completed, errored, cancel) =
                 (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
             move |n: u32| -> bool {
@@ -188,13 +189,16 @@ fn run_vus_on_loops<C, F, K>(
     make_control: F,
 ) where
     C: HttpClient + 'static,
-    F: Fn(Rc<RefCell<Option<IterationOutcome>>>) -> K + Clone + Send + 'static,
+    F: Fn(usize, Rc<RefCell<Option<IterationOutcome>>>) -> K + Clone + Send + 'static,
     K: IterationControl + 'static,
 {
     let mut threads = Vec::with_capacity(num_threads);
     for t in 0..num_threads {
-        let my_vus = (0..num_vus).filter(|id| id % num_threads == t).count();
-        if my_vus == 0 {
+        // The GLOBAL VU ids this thread owns (round-robin). Passed to the control
+        // factory so index-aware executors (ramping-vus) can threshold on identity;
+        // the others ignore it.
+        let my_ids: Vec<usize> = (0..num_vus).filter(|id| id % num_threads == t).collect();
+        if my_ids.is_empty() {
             continue;
         }
         let script = script.clone();
@@ -213,8 +217,8 @@ fn run_vus_on_loops<C, F, K>(
                         .build()
                         .expect("build loop-thread runtime");
                     LocalSet::new().block_on(&rt, async move {
-                        let mut handles = Vec::with_capacity(my_vus);
-                        for _ in 0..my_vus {
+                        let mut handles = Vec::with_capacity(my_ids.len());
+                        for id in my_ids {
                             let shared = Shared::new();
                             // Per-VU outcome cell: the coroutine writes the last
                             // iteration's outcome, the control reads it (same thread).
@@ -225,7 +229,7 @@ fn run_vus_on_loops<C, F, K>(
                                 Some(metrics.clone()),
                                 result.clone(),
                             );
-                            let control = make_control(result);
+                            let control = make_control(id, result);
                             handles.push(spawn_vu_hard(
                                 coro,
                                 shared,
@@ -283,7 +287,7 @@ where
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
         let cancel = cancel.clone();
-        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+        move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
             let (completed, errored, cancel) =
                 (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
             move |n: u32| -> bool {
@@ -354,7 +358,7 @@ where
         let errored = Arc::clone(&errored);
         let remaining = Arc::clone(&remaining);
         let cancel = cancel.clone();
-        move |result: Rc<RefCell<Option<IterationOutcome>>>| {
+        move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
             let (completed, errored, remaining, cancel) = (
                 Arc::clone(&completed),
                 Arc::clone(&errored),
@@ -400,6 +404,122 @@ where
         iterations_dropped: (total_iterations as u64).saturating_sub(c + e + i),
         iterations_errored: e,
         iterations_interrupted: i,
+        duration: start.elapsed(),
+    }
+}
+
+/// Ramping-VUs control: the VU is ACTIVE iff its global index is below the desired
+/// active count (`my_index < desired`), which a controller thread drives along the
+/// `VuRampSchedule`. Active ⇒ run the next iteration; inactive ⇒ park (poll) until
+/// it becomes active again or the run stops. So `max_vus` coroutines are all
+/// pre-allocated (fixed memory) but only `desired` run at any moment — deactivating
+/// the highest indices first, matching the sync executor's scale-down.
+struct RampingControl {
+    my_index: usize,
+    desired: Arc<AtomicU32>,
+    stop: CancellationToken,
+    result: Rc<RefCell<Option<IterationOutcome>>>,
+    completed: Arc<AtomicU64>,
+    errored: Arc<AtomicU64>,
+}
+
+impl IterationControl for RampingControl {
+    async fn next(&mut self, completed_iters: u32) -> bool {
+        if completed_iters >= 1 {
+            tally_outcome(&self.result, &self.completed, &self.errored);
+        }
+        loop {
+            if self.stop.is_cancelled() {
+                return false;
+            }
+            if (self.my_index as u32) < self.desired.load(Ordering::Relaxed) {
+                return true;
+            }
+            // Inactive: park briefly, then re-check (≈20 ms activation granularity).
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Ramp the number of ACTIVE VUs through `schedule` (up to `max_vus`, all
+/// pre-allocated). Like constant-vus but the active count follows the ramp; never
+/// drops (no arrival curve). A controller thread drives the desired count; a stuck
+/// VU is force_unwound by the watchdog.
+#[allow(clippy::too_many_arguments)]
+pub fn run_ramping_vus<C>(
+    script: String,
+    max_vus: usize,
+    schedule: VuRampSchedule,
+    client: Arc<C>,
+    bp: Backpressure,
+    metrics: BuiltinMetrics,
+    cancel: CancellationToken,
+    graceful_stop: Duration,
+) -> RunSummary
+where
+    C: HttpClient + 'static,
+{
+    let num_threads = loop_thread_count(max_vus);
+    if num_threads == 0 {
+        return RunSummary::default();
+    }
+    let start = Instant::now();
+    let total_duration = schedule.total_duration();
+    let deadline = start + total_duration;
+    let completed = Arc::new(AtomicU64::new(0));
+    let errored = Arc::new(AtomicU64::new(0));
+    let desired = Arc::new(AtomicU32::new(0));
+    // Graceful stop for the VUs, fired by the controller at schedule end / cancel.
+    let stop = CancellationToken::new();
+    let hard = HardStop {
+        token: CancellationToken::new(),
+        interrupted: Arc::new(AtomicU64::new(0)),
+    };
+
+    // Controller: drive `desired` along the schedule until the schedule ends (or
+    // cancel), then fire `stop` so every VU graceful-stops at its next boundary.
+    let controller = {
+        let desired = Arc::clone(&desired);
+        let stop = stop.clone();
+        let cancel = cancel.clone();
+        thread::Builder::new()
+            .name("k6-ramp-controller".into())
+            .spawn(move || {
+                while !cancel.is_cancelled() && start.elapsed() < total_duration {
+                    desired.store(schedule.interpolate(start.elapsed()), Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(50));
+                }
+                stop.cancel();
+            })
+            .expect("spawn ramp controller")
+    };
+
+    let make_control = {
+        let completed = Arc::clone(&completed);
+        let errored = Arc::clone(&errored);
+        let desired = Arc::clone(&desired);
+        let stop = stop.clone();
+        move |index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| RampingControl {
+            my_index: index,
+            desired: Arc::clone(&desired),
+            stop: stop.clone(),
+            result,
+            completed: Arc::clone(&completed),
+            errored: Arc::clone(&errored),
+        }
+    };
+
+    let watchdog =
+        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(num_threads, max_vus, script, client, bp, metrics, hard.clone(), make_control);
+    watchdog.finish();
+    let _ = controller.join();
+
+    RunSummary {
+        iterations_completed: completed.load(Ordering::Relaxed),
+        iterations_dropped: 0, // ramping-vus never drops
+        iterations_errored: errored.load(Ordering::Relaxed),
+        iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
         duration: start.elapsed(),
     }
 }
@@ -1493,6 +1613,73 @@ mod tests {
             summary.iterations_completed + summary.iterations_errored,
             20,
             "completed + errored == budget (an errored claim is an attempt): {summary:?}"
+        );
+    }
+
+    /// ramping-vus: ramp 0→4→0 over 100 ms + 100 ms with 4 pre-allocated VUs. The
+    /// active count follows the schedule (only `desired` VUs run at a time); the
+    /// run does real work, never drops, and finishes near the schedule end (200 ms)
+    /// — the controller fires the graceful stop, VUs stop at a boundary.
+    #[test]
+    fn ramping_vus_follows_the_schedule() {
+        use k6_core::config::Stage;
+        let schedule = VuRampSchedule::new(
+            0,
+            &[
+                Stage { duration: Duration::from_millis(100), target: 4 }, // ramp up
+                Stage { duration: Duration::from_millis(100), target: 0 }, // ramp down
+            ],
+        );
+        let summary = run_ramping_vus(
+            "export default function () { http.get('http://x/'); }".to_string(),
+            4,
+            schedule,
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        );
+        assert!(summary.iterations_completed > 0, "ramp did real work: {summary:?}");
+        assert_eq!(summary.iterations_dropped, 0, "ramping-vus never drops");
+        assert_eq!(summary.iterations_interrupted, 0, "graceful stop interrupts nothing");
+        assert!(
+            summary.duration >= Duration::from_millis(180)
+                && summary.duration < Duration::from_millis(800),
+            "run tracks the ~200 ms schedule then graceful-stops, got {:?}",
+            summary.duration
+        );
+    }
+
+    /// ramping-vus respects an early cancel: the controller fires the graceful stop
+    /// and the run ends well before the (long) schedule.
+    #[test]
+    fn ramping_vus_early_cancel_stops_promptly() {
+        use k6_core::config::Stage;
+        let schedule = VuRampSchedule::new(
+            0,
+            &[Stage { duration: Duration::from_secs(30), target: 4 }],
+        );
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            cancel2.cancel();
+        });
+        let summary = run_ramping_vus(
+            "export default function () { http.get('http://x/'); }".to_string(),
+            4,
+            schedule,
+            Arc::new(Mock200),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            cancel,
+            Duration::from_secs(5),
+        );
+        assert!(
+            summary.duration < Duration::from_secs(2),
+            "cancel should cut the 30 s ramp short, got {:?}",
+            summary.duration
         );
     }
 }

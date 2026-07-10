@@ -522,6 +522,71 @@ mod tests {
         );
     }
 
+    /// http.batch (bar c): a SYNCHRONOUS host fn that runs N requests
+    /// CONCURRENTLY (yield-and-wait-for-all). Two 100 ms requests overlap
+    /// (~100 ms, not ~200 ms serial), each resolves WRAPPED (res.json()), in
+    /// input order. The default fn is NOT async — batch returns responses
+    /// directly, proving it's a sync yield, not a promise.
+    #[test]
+    fn http_batch_runs_requests_concurrently_with_wrapper_parity() {
+        use std::time::{Duration, Instant};
+
+        struct DelayMock;
+        impl HttpClient for DelayMock {
+            fn send(
+                &self,
+                _req: HttpRequest,
+            ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/json".into())],
+                        body: ResponseBody::Buffered(br#"{"n":7}"#.to_vec()),
+                        timings: Timings { duration: 100.0, ..Default::default() },
+                        url: "http://x/".into(),
+                        data_sent: 20,
+                        data_received: 20,
+                    })
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (out, elapsed) = LocalSet::new().block_on(&rt, async {
+            let script = r#"
+                export default function () {
+                    const rs = http.batch([
+                        ['GET', 'http://x/'],
+                        ['GET', 'http://y/'],
+                    ]);
+                    return rs[0].status + ',' + rs[0].json().n + ',' + rs[1].json().n;
+                }
+            "#;
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+            let start = Instant::now();
+            spawn_vu(coro, shared.clone(), Arc::new(DelayMock), Backpressure::new(8), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            (out, start.elapsed())
+        });
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "200,7,7".into() }),
+            "batch resolved both WRAPPED responses in order"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(90) && elapsed < Duration::from_millis(180),
+            "two batched requests should both take ~100 ms AND overlap, got {elapsed:?}"
+        );
+    }
+
     /// Regression-lock the async path's `__wrap_response` application: iteration
     /// 1's `asyncRequest` gets a Set-Cookie (extracted into the jar BY the
     /// resolver's `__wrap_response`), iteration 2's `asyncRequest` sends it. If a

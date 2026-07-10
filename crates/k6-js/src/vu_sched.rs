@@ -106,6 +106,10 @@ impl Shared {
 pub(crate) enum Yield {
     /// Sync `http.get`/`sleep`: park (borrow held), run this op, resume directly.
     AwaitOne(HostOp),
+    /// Sync `http.batch`: park, run ALL these ops CONCURRENTLY, resume with all
+    /// results in input order. Neither AwaitOne (serializes) nor asyncRequest
+    /// (returns a promise) — a synchronous wait-for-all.
+    AwaitAll(Vec<HostOp>),
     /// Driver loop: wait for a registered async op to complete.
     AwaitPending,
     /// One iteration finished + event loop drained. The long-lived coroutine
@@ -117,6 +121,8 @@ pub(crate) enum Yield {
 pub(crate) enum Resume {
     Start,
     One(OpDone),
+    /// Results of an `AwaitAll`, in input order.
+    All(Vec<OpDone>),
     Progressed,
     /// Run the next iteration (from the `IterationBoundary` park).
     RunNext,
@@ -146,6 +152,15 @@ impl YielderPtr {
         match self.suspend(Yield::AwaitOne(op)) {
             Resume::One(done) => done,
             _ => panic!("driver returned a non-One resume for AwaitOne"),
+        }
+    }
+
+    /// `http.batch` consumer side: yield the coroutine to run all `ops`
+    /// concurrently, resume with all results in input order.
+    pub(crate) fn await_all(self, ops: Vec<HostOp>) -> Vec<OpDone> {
+        match self.suspend(Yield::AwaitAll(ops)) {
+            Resume::All(v) => v,
+            _ => panic!("driver returned a non-All resume for AwaitAll"),
         }
     }
 }
@@ -258,6 +273,33 @@ pub(crate) async fn drive_vu<C, F>(
                     }
                 };
                 resume = Resume::One(done);
+            }
+            Yield::AwaitAll(ops) => {
+                // Run all batch ops CONCURRENTLY (indexed to preserve input
+                // order). While parked, keep draining pending async completions
+                // into `completed` (I2) — same as AwaitOne.
+                let n = ops.len();
+                let mut batch: FuturesUnordered<Pin<Box<dyn std::future::Future<Output = (usize, OpDone)>>>> =
+                    FuturesUnordered::new();
+                for (i, op) in ops.into_iter().enumerate() {
+                    let client = Arc::clone(&client);
+                    let bp = bp.clone();
+                    batch.push(Box::pin(async move { (i, run_op(op, &client, &bp).await) }));
+                }
+                let mut results: Vec<Option<OpDone>> = (0..n).map(|_| None).collect();
+                let mut remaining = n;
+                while remaining > 0 {
+                    tokio::select! {
+                        Some((i, done)) = batch.next(), if remaining > 0 => {
+                            results[i] = Some(done);
+                            remaining -= 1;
+                        }
+                        Some((op, res)) = pending.next(), if !pending.is_empty() => {
+                            shared.0.borrow_mut().completed.push_back((op, res));
+                        }
+                    }
+                }
+                resume = Resume::All(results.into_iter().map(|r| r.expect("all batch ops done")).collect());
             }
             Yield::AwaitPending => {
                 debug_assert!(

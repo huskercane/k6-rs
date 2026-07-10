@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rquickjs::prelude::Async;
-use rquickjs::{Ctx, Function, IntoJs, Object, Value};
+use rquickjs::{Array, Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
@@ -729,11 +729,51 @@ pub(crate) fn register_yielding_http(
         )?,
     )?;
 
+    // http.batch: a SYNCHRONOUS host fn that runs N requests CONCURRENTLY. It
+    // takes an array of prepped request tuples and yields AwaitAll — neither
+    // AwaitOne (serializes) nor asyncRequest (returns a promise). Returns the raw
+    // responses in input order (the JS wrapper applies __wrap_response).
+    {
+        let metrics = metrics.clone();
+        ctx.globals().set(
+            "__http_batch",
+            Function::new(ctx.clone(), move |prepped: Array<'_>| -> rquickjs::Result<Vec<JsHttpResponse>> {
+                let mut ops = Vec::with_capacity(prepped.len());
+                // Per-request finishing meta kept on the coroutine stack across the yield.
+                let mut metas: Vec<(String, Vec<(String, String)>, ResponseCallback)> = Vec::with_capacity(prepped.len());
+                for i in 0..prepped.len() {
+                    let t: Array = prepped.get(i)?;
+                    let method: String = t.get(0)?;
+                    let url: String = t.get(1)?;
+                    let body: Value = t.get(2)?;
+                    let headers: Value = t.get(3)?;
+                    let timeout_ms: f64 = t.get(4)?;
+                    let tags: Value = t.get(5)?;
+                    let cb: Value = t.get(6)?;
+                    ops.push(HostOp::Http(build_http_request(&method, url, &body, &headers, timeout_ms)));
+                    metas.push((method, object_entries_to_pairs(&tags), parse_response_callback(&cb)));
+                }
+                let results = yp.await_all(ops);
+                // Owned Vec<JsHttpResponse> -> JS array via IntoJs (no 'js borrow
+                // across the yield, and no closure-lifetime unification).
+                let mut out = Vec::with_capacity(metas.len());
+                for (result, (method, user_tags, response_callback)) in results.into_iter().zip(metas) {
+                    let r = match result {
+                        OpDone::Http(r) => r,
+                        OpDone::Slept => unreachable!("batch op resolved as a sleep"),
+                    };
+                    out.push(finish_http_response(r, &method, user_tags, &response_callback, metrics.as_ref()));
+                }
+                Ok(out)
+            })?,
+        )?;
+    }
+
     register_http_object(ctx)?;
 
-    // Override the stub asyncRequest with the register-based concurrent one. It
-    // reuses __http._prep (cookie jar both directions) and __wrap_response (parity
-    // bar: res.json()/.cookies), and mints its promise via the driver-loop resolver.
+    // Override the stub asyncRequest + serial batch with the concurrent ones.
+    // Both reuse __http._prep (cookie jar both directions) and __wrap_response
+    // (parity: res.json()/.cookies).
     ctx.eval::<(), _>(
         r#"
         globalThis.http.asyncRequest = function (method, url, body, params) {
@@ -742,6 +782,20 @@ pub(crate) fn register_yielding_http(
             return new Promise(function (resolve) {
                 globalThis.__resolvers[id] = function (raw) { resolve(__wrap_response(raw)); };
             });
+        };
+        globalThis.http.batch = function (requests) {
+            // Normalize array | object-of-requests to an array; _prep each. (Object
+            // key preservation on the concurrent path is follow-up debt.)
+            var list = Array.isArray(requests)
+                ? requests
+                : Object.keys(requests).map(function (k) { return requests[k]; });
+            var http = globalThis.http;
+            var preps = list.map(function (req) {
+                if (typeof req === 'string') return http._prep('GET', req, null, undefined);
+                if (Array.isArray(req)) return http._prep(req[0], req[1], req[2] || null, req[3]);
+                return http._prep(req.method || 'GET', req.url, req.body || null, req.params);
+            });
+            return __http_batch(preps).map(__wrap_response);
         };
     "#,
     )?;

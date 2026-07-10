@@ -14,6 +14,10 @@
 //!   needs host-fn closures `Send`), not a license to move threads. Spawn only
 //!   via [`spawn_vu`]; a `debug_assert` backstops a stray `tokio::spawn`.
 
+// TRANSITIONAL: the whole graduation stack (this module → register_yielding_http
+// → coroutine_vu) is reachable only from tests until #5 wires the coroutine VU
+// into the executors. REMOVE this allow at #5 — then any genuinely dead scheduler
+// item surfaces instead of being masked.
 #![allow(dead_code)]
 
 use std::cell::RefCell;

@@ -11,14 +11,38 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, Yielder};
 
 use k6_core::metrics::BuiltinMetrics;
 
 use crate::api::http::register_yielding_http;
-use crate::runtime;
+use crate::runtime::{self, VU_MAX_STACK};
 use crate::vu::prepare_script;
 use crate::vu_sched::{OpDone, Resume, Shared, VuCoroutine, Yield, YielderPtr};
+
+/// Per-VU coroutine stack size — **the fixed-memory blast radius**: this × maxVUs
+/// (7900 at the soak target) is a first-order term in a fixed-memory tool.
+///
+/// It MUST exceed `VU_MAX_STACK` (the 256 KB QuickJS *JS* recursion limit) plus
+/// the deepest *native* frame beneath it (QuickJS C recursion + host-fn Rust
+/// frames on the coroutine stack — note `client.send` runs on the SCHEDULER, not
+/// here), so QuickJS trips its own `RangeError` BEFORE the native stack
+/// guard-page `SIGSEGV`s. corosensei defaults to 1 MiB; we set it explicitly and
+/// smaller. `quickjs_range_error_trips_before_native_overflow` guards the
+/// coupling at this size. **TUNE via measurement under the OOM-reference script
+/// before the soak (#5)** — do not inherit the default silently.
+const COROUTINE_STACK_SIZE: usize = VU_MAX_STACK + 256 * 1024; // 256 KB JS + 256 KB native headroom
+
+/// Typed per-iteration outcome. #5's executor reads this to count completed vs
+/// failed iterations and drive thresholds — a thrown iteration must be
+/// *type-distinct* from a script that legitimately returns a string, not a
+/// `"ERR:"` sentinel that a return value could collide with (bar b).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IterationOutcome {
+    Completed { value: String },
+    Errored { message: String },
+}
 
 /// Build a long-lived coroutine VU for `script`. Bootstrap runs once; each
 /// `RunNext` calls the default fn (the sync body yields for `http.get`), drives
@@ -28,10 +52,11 @@ pub(crate) fn build_coroutine_vu(
     script: String,
     shared: Shared,
     metrics: Option<BuiltinMetrics>,
-    result: Rc<RefCell<String>>,
+    result: Rc<RefCell<Option<IterationOutcome>>>,
 ) -> VuCoroutine {
     let prepared = prepare_script(&script);
-    Coroutine::new(move |yielder: &Yielder<Resume, Yield>, first: Resume| {
+    let stack = DefaultStack::new(COROUTINE_STACK_SIZE).expect("allocate coroutine stack");
+    Coroutine::with_stack(stack, move |yielder: &Yielder<Resume, Yield>, first: Resume| {
         let yp = YielderPtr::new(yielder);
         let rt = runtime::create_runtime().expect("rt");
         let ctx = runtime::create_context(&rt).expect("ctx");
@@ -77,14 +102,15 @@ pub(crate) fn build_coroutine_vu(
             // and resumes. Async work (asyncRequest) settles via the driver loop.
             ctx.with(|ctx| {
                 let _ = ctx.eval::<(), _>(
-                    "globalThis.__done=false; globalThis.__ret=''; globalThis.__resolvers={};",
+                    "globalThis.__done=false; globalThis.__ret=''; globalThis.__err='';
+                     globalThis.__failed=false; globalThis.__resolvers={};",
                 );
                 let _ = ctx.eval::<(), _>(
                     r#"Promise.resolve((async function () {
                            return (typeof __k6_default === 'function') ? __k6_default() : undefined;
                        })()).then(
                            function (v) { globalThis.__ret = String(v); globalThis.__done = true; },
-                           function (e) { globalThis.__ret = 'ERR:' + e; globalThis.__done = true; });"#,
+                           function (e) { globalThis.__err = String(e); globalThis.__failed = true; globalThis.__done = true; });"#,
                 );
             });
 
@@ -124,7 +150,8 @@ pub(crate) fn build_coroutine_vu(
                         }
                         let _ = resolvers.remove(key.as_str());
                     }
-                    shared.0.borrow_mut().outstanding -= n;
+                    let mut s = shared.0.borrow_mut();
+                    s.outstanding = s.outstanding.saturating_sub(n);
                 });
 
                 runtime::drain_pending_jobs(&rt);
@@ -138,9 +165,19 @@ pub(crate) fn build_coroutine_vu(
                 let _ = yp.suspend(Yield::AwaitPending);
             }
 
+            // Publish a TYPED outcome — a thrown iteration is Errored, distinct
+            // from a Completed value (bar b; #5's executor counts on this).
             ctx.with(|ctx| {
-                let r: String = ctx.globals().get("__ret").unwrap_or_default();
-                *result.borrow_mut() = r;
+                let failed: bool = ctx.globals().get("__failed").unwrap_or(false);
+                let outcome = if failed {
+                    let message: String = ctx.globals().get("__err").unwrap_or_default();
+                    // TODO(#5): surface to the run logger (folds in the init eprintln gap).
+                    IterationOutcome::Errored { message }
+                } else {
+                    let value: String = ctx.globals().get("__ret").unwrap_or_default();
+                    IterationOutcome::Completed { value }
+                };
+                *result.borrow_mut() = Some(outcome);
             });
 
             sig = yp.suspend(Yield::IterationBoundary);
@@ -223,7 +260,7 @@ mod tests {
                 }
             "#;
             let shared = Shared::new();
-            let result = Rc::new(RefCell::new(String::new()));
+            let result = Rc::new(RefCell::new(None));
             let coro = build_coroutine_vu(
                 script.to_string(),
                 shared.clone(),
@@ -235,7 +272,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(*result.borrow(), "200", "sync http.get resolved via __wrap_response");
+            assert_eq!(
+                *result.borrow(),
+                Some(IterationOutcome::Completed { value: "200".into() }),
+                "sync http.get resolved via __wrap_response"
+            );
             // Cookie jar, request side: iteration 2 sent the cookie set in iter 1.
             assert_eq!(
                 seen.lock().unwrap().as_deref(),
@@ -251,5 +292,90 @@ mod tests {
                 "http_reqs recorded per request, coroutine-side"
             );
         });
+    }
+
+    /// A client whose send is never expected to be called (scripts here don't
+    /// hit http); returns a trivial 200 if it is.
+    struct NoHttp;
+    impl HttpClient for NoHttp {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+            async {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: ResponseBody::Buffered(vec![]),
+                    timings: Timings::default(),
+                    url: String::new(),
+                    data_sent: 0,
+                    data_received: 0,
+                })
+            }
+        }
+    }
+
+    fn run_script(script: &str, iters: u32) -> Option<IterationOutcome> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&rt, async {
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+            spawn_vu(coro, shared.clone(), Arc::new(NoHttp), Backpressure::new(4), move |n| {
+                n < iters
+            })
+            .await
+            .unwrap();
+            let out = result.borrow().clone();
+            out
+        })
+    }
+
+    /// bar (b): a thrown iteration is a TYPED `Errored`, not a `"ERR:"` string a
+    /// return value could collide with.
+    #[test]
+    fn iteration_error_is_typed_not_swallowed() {
+        let out = run_script("export default function () { throw new Error('boom'); }", 1);
+        match out {
+            Some(IterationOutcome::Errored { message }) => {
+                assert!(message.contains("boom"), "message was: {message}")
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    /// The long-lived VU survives a thrown iteration: iter 1 throws, iter 2
+    /// returns cleanly (last outcome Completed).
+    #[test]
+    fn vu_survives_iteration_error() {
+        let script = r#"
+            export default function () {
+                globalThis.__n = (globalThis.__n || 0) + 1;
+                if (__n === 1) throw new Error('first');
+                return 'ok' + __n;
+            }
+        "#;
+        let out = run_script(script, 2);
+        assert_eq!(out, Some(IterationOutcome::Completed { value: "ok2".into() }));
+    }
+
+    /// The VU_MAX_STACK ↔ COROUTINE_STACK_SIZE coupling at the tuned size: deep JS
+    /// recursion trips QuickJS's `RangeError` (caught in JS), NOT a native
+    /// guard-page `SIGSEGV`. A crash here means the coroutine stack is too small
+    /// for the 256 KB JS limit + native frames.
+    #[test]
+    fn quickjs_range_error_trips_before_native_overflow() {
+        let script = r#"
+            export default function () {
+                function rec(n) { return rec(n + 1) + 1; }
+                try { rec(0); return 'no-error'; } catch (e) { return 'caught'; }
+            }
+        "#;
+        let out = run_script(script, 1);
+        assert_eq!(out, Some(IterationOutcome::Completed { value: "caught".into() }));
     }
 }

@@ -1,5 +1,8 @@
+use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -7,6 +10,8 @@ use anyhow::Result;
 use rquickjs::{Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::metrics::BuiltinMetrics;
+
+use crate::vu_sched::{HostOp, OpDone, YielderPtr};
 
 /// gRPC response data that converts directly into a native JS object via `IntoJs`.
 struct JsGrpcResponse {
@@ -172,11 +177,9 @@ pub fn register(
                 ctx.clone(),
                 move |address: String, params_json: String| -> rquickjs::Result<String> {
                     let conns = Arc::clone(&conns);
-                    let h2 = h.clone();
 
-                    let result = h.block_on(async {
-                        grpc_connect_impl(&address, &params_json, conns, h2).await
-                    });
+                    let result =
+                        h.block_on(async { grpc_connect_impl(&address, &params_json, conns).await });
 
                     match result {
                         Ok(id) => Ok(id),
@@ -261,11 +264,103 @@ struct GrpcConnection {
     metadata: HashMap<String, String>,
 }
 
+/// Yielding grpc for the coroutine VU. grpc is unary (connect + invoke + close —
+/// no recv loop), so both `__grpc_connect` and `__grpc_invoke` are one-op→one-
+/// result: they YIELD via the generic `HostOp::Streaming` (the future carries its
+/// own connect/invoke work). `run_op` never grows a registry param — the future
+/// captures the sibling `Arc<Mutex>` connection map (NOT `VuShared`). grpc metrics
+/// are recorded inside the invoke future (Context-free) — a small, documented I1
+/// relaxation vs http/ws which record coroutine-side; foldable at #6.
+pub(crate) fn register_yielding_grpc(
+    ctx: &Ctx<'_>,
+    yp: YielderPtr,
+    metrics: Option<BuiltinMetrics>,
+) -> Result<()> {
+    // Per-VU sibling connection registry (Arc<Mutex> is Send — no unsafe needed).
+    let conns: Arc<Mutex<HashMap<String, GrpcConnection>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    {
+        let conns = Arc::clone(&conns);
+        ctx.globals().set(
+            "__grpc_connect",
+            Function::new(
+                ctx.clone(),
+                move |address: String, params_json: String| -> rquickjs::Result<String> {
+                    let conns = Arc::clone(&conns);
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> = Box::pin(async move {
+                        Box::new(grpc_connect_impl(&address, &params_json, conns).await)
+                            as Box<dyn Any>
+                    });
+                    let res = match yp.await_one(HostOp::Streaming(fut)) {
+                        OpDone::Stream(b) => *b.downcast::<Result<String>>().expect("grpc connect"),
+                        _ => unreachable!("grpc connect must resolve as Stream"),
+                    };
+                    res.map_err(|e| {
+                        rquickjs::Error::new_from_js_message("string", "string", &e.to_string())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let conns = Arc::clone(&conns);
+        ctx.globals().set(
+            "__grpc_invoke",
+            Function::new(
+                ctx.clone(),
+                move |conn_id: String,
+                      method: String,
+                      request_json: String,
+                      metadata_json: String|
+                      -> rquickjs::Result<JsGrpcResponse> {
+                    let conns = Arc::clone(&conns);
+                    let m = metrics.clone();
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> = Box::pin(async move {
+                        Box::new(
+                            grpc_invoke_impl(
+                                &conn_id,
+                                &method,
+                                &request_json,
+                                &metadata_json,
+                                conns,
+                                m.as_ref(),
+                            )
+                            .await,
+                        ) as Box<dyn Any>
+                    });
+                    let res = match yp.await_one(HostOp::Streaming(fut)) {
+                        OpDone::Stream(b) => {
+                            *b.downcast::<Result<JsGrpcResponse>>().expect("grpc invoke")
+                        }
+                        _ => unreachable!("grpc invoke must resolve as Stream"),
+                    };
+                    res.map_err(|e| {
+                        rquickjs::Error::new_from_js_message("string", "string", &e.to_string())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let conns = Arc::clone(&conns);
+        ctx.globals().set(
+            "__grpc_close",
+            Function::new(ctx.clone(), move |conn_id: String| {
+                conns.lock().unwrap().remove(&conn_id);
+            })?,
+        )?;
+    }
+
+    ctx.eval::<(), _>(include_str!("grpc_shim.js"))?;
+    Ok(())
+}
+
 async fn grpc_connect_impl(
     address: &str,
     params_json: &str,
     connections: Arc<Mutex<HashMap<String, GrpcConnection>>>,
-    _handle: tokio::runtime::Handle,
 ) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(params_json).unwrap_or_default();
 

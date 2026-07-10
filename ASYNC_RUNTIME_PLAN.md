@@ -39,6 +39,54 @@ tasks scale to very high in-flight-request counts more cheaply than goroutine
 stacks. For a fixed-memory 8-hour soak (the project's north star) that is a real,
 if secondary, win. The primary value is faithful async behavior, not raw speed.
 
+## Profiling Evidence (2026-07-10)
+
+Profiled the `http_get_iteration/hyper` criterion bench (in-process Axum server,
+`perf record -F 997 --call-graph dwarf`, 60 s / 86k samples). Two independent
+observations bear on this epic:
+
+- **Sync→async bridge handoff ≈ 17.8% of on-CPU time in `futex`**, split across
+  both threads: the sync VU thread (`http_bridge`) blocks in `futex_wait` (~8%)
+  while the single `tokio-rt-worker` performs the I/O and wakes it
+  (`futex_wake`, ~10%). This is the per-request wait/wake pair inherent to
+  running the VU on a `spawn_blocking` thread and marshaling the request to the
+  runtime. Running the VU *on* the async loop (this epic's Phase 1) removes the
+  handoff, and with it this cost. **This is the strongest quantitative
+  motivation for the migration to date.**
+- The worker also spends ~14.6% parked in `epoll_wait`→`schedule_hrtimeout` —
+  i.e. it is *not* CPU-saturated. Throughput on this bench is gated by handoff
+  latency, not compute, which is exactly what the async model addresses.
+
+**Caveats — do not over-read this capture:**
+
+- The bench's server is **in-process**, so ~13% of the "send" cost is the
+  loopback RX softirq delivered inline under `writev`. That work leaves the box
+  against a real target; do **not** optimize the TCP path based on it.
+- This particular SVG was **poorly symbolized on the userspace side** (release
+  bench binary under DWARF unwinding — zero `hyper`/`quickjs`/`k6_*` frames
+  resolved; stacks bottom out in libc/kernel). Kernel-side costs (futex, epoll,
+  tcp) are reliable; *attribution to specific Rust code is not*. Before using a
+  flamegraph to justify or validate the migration, **rebuild the bench with
+  frame pointers / full debuginfo** (e.g. `RUSTFLAGS="-C force-frame-pointers=yes"`
+  and `debug = true` on the bench profile) and re-capture, or the userspace
+  hotspots stay invisible.
+
+### Landed independently (not blocked on this epic)
+
+Two per-iteration costs surfaced by earlier (well-symbolized) profiles were
+fixed 2026-07-10 and are **not** part of the async migration:
+
+- `vu.rs` `run_iteration` read setup data via `ctx.eval("<source string>")`
+  every iteration — re-parsing + re-compiling on each pass (a QuickJS
+  `js_parse_*`/`__JS_NewAtom` hotspot). Replaced with a direct `globals.get`.
+- `metrics.rs` `record_http_request_*` rebuilt a `BTreeMap` + reformatted the
+  canonical key for each of 9 tagged metrics per request. Now canonicalizes the
+  shared tag set once and appends each name.
+
+Combined, these cut the hyper iteration path **~20%** (criterion,
+p < 0.05). They reduce the *allocation/compile* share of the profile but do
+**not** touch the futex handoff above — that remains this epic's target.
+
 ## Target Architecture
 
 - `AsyncRuntime` + `AsyncContext` (rquickjs `futures` feature).

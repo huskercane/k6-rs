@@ -565,3 +565,133 @@ and the scheduler + coroutine both reach it same-thread); (d) whether `HostOp`
 grows ws/grpc variants or gains a generic `Boxed(future)` escape hatch to avoid
 `vu_sched` learning every protocol — the variant approach is simpler now, the
 generic one keeps `vu_sched` protocol-agnostic (decide at build).
+
+## #5 executor cutover — design note (2026-07-10, review-before-build)
+
+The last big structural piece: drive coroutine VUs from the executors on
+pool-of-loops threads. Two things to nail — the spawn model and the cancellation
+shape.
+
+### The mismatch
+
+Current executors (`ramping_arrival_rate.rs` etc.) hold `Arc<VuPool<QuickJsVu>>`
+and, per arrival, `pool.try_acquire_owned()` → `spawn_blocking(|| guard.vu_mut()
+.run_iteration())` — one sync iteration per blocking task, VU returned to pool.
+Under the coroutine model this is illegal: the VU body must run on a `LocalSet`
+(`spawn_local`), never `spawn_blocking` (its yielding host fns can't `block_on`).
+And the VU is a **long-lived coroutine** (bootstrap once), not a re-acquired
+per-iteration object.
+
+### Spawn model — proposed
+
+- **N loop threads** (N ≈ cores): each `std::thread` running a current-thread
+  tokio runtime + `LocalSet`. VUs are **sharded across loops** at startup and
+  pinned (`!Send` Ctx). Each VU is one long-lived `drive_vu` coroutine
+  `spawn_local`'d on its loop, parked at `IterationBoundary` between iterations.
+- **The `control` hook goes async.** Today it's `FnMut(u32)->bool` (a static
+  count). For arrival-rate a parked VU must *wait* for an arrival — an async wait,
+  not a sync predicate. So `drive_vu` at `IterationBoundary` does
+  `match next_action().await { RunNext, Stop }`, where `next_action` is fed by the
+  executor's scheduler (a per-VU channel or a shared arrival source).
+- **Arrival-curve + dropped-iteration accounting stays in the scheduler, intact.**
+  The executor keeps its expected-arrivals integral (the ~8%-bias fix). The
+  mapping: maintain an **idle-VU count** (++ when a VU parks at
+  `IterationBoundary`, -- when it starts an iteration). Per arrival: if idle > 0,
+  signal one idle VU `RunNext`; else `record_dropped()` — exactly the current
+  `try_acquire_owned() → None` semantics, just expressed over parked coroutines.
+- **The 6 executors map by their `next_action` source:** arrival-rate (permit per
+  arrival to an idle VU, drop if none); constant/ramping-vus (each VU loops
+  continuously until the deadline — `next_action` = RunNext until Stop);
+  per-vu/shared-iterations (a shared remaining-iterations counter — RunNext while
+  count-- > 0, else Stop).
+- **`IterationOutcome` → executor:** each iteration returns `Completed{value}` |
+  `Errored{message}`; the executor counts completed vs failed, drives thresholds,
+  and logs `Errored` (folding in the coroutine_vu init-`eprintln!`).
+- **`VirtualUser` trait:** likely dissolves for the coroutine path — the executor
+  spawns `drive_vu` + a `next_action` source, not a sync `run_iteration()`. The
+  arrival-curve logic (no Context, no VU body) can live on the scheduler thread
+  or a coordinator; only the VU bodies are loop-pinned.
+
+### Cancellation shape — two-tier (force_unwind is the exception)
+
+- **Tier 1 — graceful, at `IterationBoundary` (preferred, no `force_unwind`).**
+  Duration elapses / cancel fires → the scheduler feeds `Stop` at each VU's next
+  `IterationBoundary`. VUs finish their current iteration and stop between
+  iterations — the clean cancel point (no borrow held, no I/O in flight). This is
+  the common path.
+- **Tier 2 — hard deadline, `force_unwind` mid-op (rare).** Only if a VU is still
+  mid-iteration after a grace period. Gates: (a) the injected unwind runs the
+  `ctx.with` guard's `Drop` (releasing the borrow) and drops Context→Runtime in
+  order; (b) rquickjs `with` doesn't `catch_unwind`-swallow the injected unwind;
+  (c) the cancelled iteration is accounted **exactly once** (not both
+  completed-and-dropped). **ws specific:** a `force_unwind` mid-`__ws_recv` leaves
+  the read task parked in `read.next().await` holding the socket — store the two
+  `spawn_local` `JoinHandle`s in `WsSession` and `abort()` them in `__ws_cleanup`
+  (and on unwind), don't rely on drop-propagation. At 7900 VUs × per-iteration
+  connect/close over 8h a leaked reader is a fixed-memory regression.
+
+### Before the soak
+
+Tune `COROUTINE_STACK_SIZE` (512 KiB now) by measuring the deepest native frame
+under the OOM-reference script's **fat-frame** case (a JS frame near the 256 KB
+JS limit doing native-heavy work — deep `JSON.parse`/regex/host-fn chains), NOT
+the thin-recursion guard. Confirm rquickjs captures `stack_top` on the coroutine
+stack.
+
+### Open decisions for review
+- (i) **`next_action` transport:** per-VU `mpsc` (executor addresses a specific
+  idle VU) vs a shared MPMC arrival source (idle VUs compete). Per-VU is simpler
+  to reason about for drop accounting; shared is less bookkeeping. Leaning per-VU.
+- (ii) **Sharding:** static round-robin at startup vs work-stealing. Static keeps
+  `!Send` pinning trivial and matches the fixed-memory model; leaning static.
+- (iii) **Where the arrival scheduler runs:** on a loop thread (as a `spawn_local`
+  task) vs a dedicated coordinator thread. It touches no Context, so either works;
+  a coordinator keeps the loop threads purely VU-bodies.
+
+### #5 design — review resolution (sharpened, approved)
+
+- **Idle set is SINGLE-WRITER, coordinator-owned — not a shared atomic counter.**
+  Protocol: VU at `IterationBoundary` → send `{my_id}` on a shared idle-signal
+  channel, then await its per-VU `RunNext` channel. The **coordinator is the sole
+  owner** of the idle queue (adds on idle-signal, removes on dispatch). Per
+  arrival: pop an idle id → `RunNext` to that VU; queue empty → `record_dropped()`.
+  No atomic, no TOCTOU. **Drop-accounting is provably exact: drop iff the idle
+  queue is empty at the arrival instant = the old `try_acquire_owned() → None`.**
+  This is the highest-leverage correctness point of the cutover.
+- **Coordinator is REQUIRED (not a preference):** a single coordinator has the
+  GLOBAL idle view; the global view is what makes the arrival curve correct. A
+  per-loop scheduler only sees its shard → per-shard drops → arrival-curve bias
+  (reintroduces the ~8% the integral fix killed). Cost = one cross-thread wakeup
+  per iteration-START (per-iteration, not per-I/O — I/O stays local; acceptable).
+- **Sharding static because VUs are `!Send`** (work-stealing is impossible — can't
+  migrate a Ctx). Load-balancing happens at DISPATCH: the coordinator hands each
+  arrival to any globally-idle VU regardless of shard, so a hot loop's VUs stay
+  busy and stop receiving work — self-balancing without moving anything. FIFO idle
+  queue; round-robin pin at startup.
+- **Three separate lanes — do NOT route `IterationOutcome` through the
+  coordinator.** Coordinator owns ONLY arrivals + drops. Each VU records
+  completed/failed to the (Send+Sync) metrics registry LOCALLY on its loop thread;
+  the threshold engine reads the registry. Funneling outcomes through the
+  coordinator makes it a serial bottleneck for no reason.
+- **Preserve the integral fix by REUSE, not re-derivation.** The coordinator
+  drives arrivals off the SAME curve-integration code the sync executor uses; only
+  the per-arrival ACTION changes (signal-idle-VU vs acquire-permit). Test: arrival
+  instants identical to the sync path on a fixed curve.
+- **Cancellation — a FOURTH gate: interrupted ≠ errored.** A force-unwound
+  iteration never reaches the `IterationOutcome` publish; it must be accounted as
+  **interrupted** (a shutdown artifact), NOT script `Errored` (a real failure that
+  counts toward error thresholds). Else a passing run spuriously trips an
+  error-rate threshold in its final second. k6 counts interrupted iterations
+  separately — match that. Graceful-stop deadline maps to k6's
+  `gracefulStop`/`gracefulRampDown` (default 30s): `Stop` at boundaries until it
+  expires, `force_unwind` only VUs still mid-iteration past it. Gate (a)'s concrete
+  mechanism = the ws `JoinHandle::abort()` in `__ws_cleanup`; wire ws-abort + the
+  force_unwind gate test together.
+- **#5 resolves #7:** with the executor spawning `drive_vu` + a `next_action`
+  source, there is no `run_iteration()` and thus no `VirtualUser` trait on the
+  coroutine path. Do NOT design a thin sync trait — let the coroutine spawn model
+  make it dead and delete it at #6. Consider #5+#7 together.
+
+**Build in SLICES (each a review boundary):** (1) spawn model + ONE executor
+green; (2) remaining executors; (3) cancellation (two-tier + 4 gates + ws-abort);
+(4) fat-frame stack measurement + 7900 soak.

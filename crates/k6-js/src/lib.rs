@@ -9,6 +9,8 @@ pub mod b2_spike;
 pub mod vu_sched;
 /// Phase 1b: production coroutine VU (async-runtime graduation, step 3).
 pub mod coroutine_vu;
+/// #5: pool-of-loops spawn model (coroutine VUs on N loop threads).
+pub mod pool;
 /// Phase 1b (#2): yield primitive + scheduler + driver loop composition. Gated on `b2-spike`.
 #[cfg(feature = "b2-spike")]
 pub mod vu_loop;

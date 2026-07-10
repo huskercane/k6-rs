@@ -3,6 +3,12 @@ name = "k6-js"
 version.workspace = true
 edition.workspace = true
 
+# async-spike: Phase 0 of the async-runtime migration (ASYNC_RUNTIME_PLAN.md).
+# THROWAWAY — enables rquickjs AsyncRuntime/AsyncContext to prove the
+# pool-of-loops mechanism + per-VU isolation. Delete once Phase 1 lands.
+[features]
+async-spike = ["rquickjs/futures"]
+
 [dependencies]
 k6-core = { workspace = true }
 tokio = { workspace = true }

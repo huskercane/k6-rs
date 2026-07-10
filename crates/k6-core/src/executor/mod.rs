@@ -1,3 +1,4 @@
+pub mod arrival;
 pub mod constant_arrival_rate;
 pub mod constant_vus;
 pub mod externally_controlled;

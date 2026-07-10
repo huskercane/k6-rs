@@ -330,6 +330,29 @@ path — `asyncRequest` becomes a plain sync host fn that mints a promise
 `AsyncContext` substrate is superseded (see above); the helpers + discipline are
 what carry forward.
 
+### Graduation into `QuickJsVu` — coroutine/Context lifetime (decided 2026-07-10)
+
+**Long-lived per-VU coroutine — bootstrap ONCE, loop iterations inside, yield
+between them.** NOT per-iteration coroutines. The deciding constraint is one the
+`vu_loop` harness hides: **host fns capture the yielder pointer**, which is
+per-coroutine-run. A persistent `Context` with a per-iteration coroutine would
+force a *mutable* yielder slot — reintroducing exactly the cross-VU staleness the
+captured-pointer design eliminated. And bootstrapping the full k6 API per
+iteration is the per-iteration-re-eval regression class already fixed once —
+catastrophic at 7900 VUs. So: bootstrap (runtime + context + whole API) at
+coroutine start; then `loop { run one iteration (driver loop, yielding for I/O);
+yield IterationBoundary }`. `run_iteration` = resume the persistent coroutine,
+service its I/O yields on the scheduler, return at `IterationBoundary`;
+Context/globals/cookie-jar persist across iterations by construction. Three more
+graduation gates: (2) the async path must run the **request-side cookie merge**
+(`__buildCookieHeader`) + `Set-Cookie` extract, not just `__wrap_response` —
+`asyncGet` bypasses `__http.request` today; (3) `http.batch` needs a
+**yield-and-wait-for-all** variant (register N ops, park until all complete) — it
+is neither `AwaitOne` nor `asyncRequest`; (4) watch **native stack** — full
+bootstrap + deep script + Rust frames now run on the 1 MB coroutine stack (B2
+proved re-anchoring with a trivial script only); stack size becomes a tuning knob
++ a per-VU memory line at 7900.
+
 ### Phase 1b — the unified cutover (critical path)
 
 Delivered **north-star-first**: sync `http.get` (which the reference soak uses)

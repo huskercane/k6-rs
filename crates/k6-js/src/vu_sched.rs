@@ -181,6 +181,40 @@ impl YielderPtr {
 
 pub(crate) type VuCoroutine = Coroutine<Resume, Yield, ()>;
 
+/// Wraps the VU coroutine so a drop DURING an active panic does NOT force_unwind
+/// it. `Coroutine::drop` force_unwinds a suspended coroutine; doing that while a
+/// panic is already unwinding is a panic-during-panic → non-unwinding process
+/// ABORT (taking every other VU on the loop thread). On the rare VU-panic path
+/// (`drive_vu` unwinding a host-fn/client panic drops its local `coro`), we instead
+/// LEAK the coroutine — its stack + Context — so the panic can reach the
+/// task-boundary `catch_unwind` cleanly and isolate to just that VU. The leak is
+/// one 512 KB stack on a bug path (reclaimed at process exit); the loop thread and
+/// its other VUs survive. A DELIBERATE hard-cancel force_unwind (not during a
+/// panic) goes through [`Self::force_unwind`] and is the normal validated path.
+struct PanicSafeCoro(Option<VuCoroutine>);
+
+impl PanicSafeCoro {
+    fn resume(&mut self, input: Resume) -> CoroutineResult<Yield, ()> {
+        self.0.as_mut().expect("coroutine present").resume(input)
+    }
+    fn force_unwind(&mut self) {
+        if let Some(c) = self.0.as_mut() {
+            c.force_unwind();
+        }
+    }
+}
+
+impl Drop for PanicSafeCoro {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Leak instead of force_unwinding mid-panic (which would abort).
+            std::mem::forget(self.0.take());
+        }
+        // Otherwise the inner `Option<VuCoroutine>` drops normally → clean
+        // force_unwind (the validated unwind-through-QuickJS-C path).
+    }
+}
+
 /// The RunNext/Stop decision at each `IterationBoundary` (and once up front) — the
 /// executor's control port. `next` MAY await: constant-vus returns a ready bool
 /// (deadline/cancel check), while the arrival-rate coordinator path parks here
@@ -280,7 +314,28 @@ where
     C: HttpClient + 'static,
     K: IterationControl + 'static,
 {
-    tokio::task::spawn_local(drive_vu(coro, shared, client, bp, control, hard))
+    use futures_util::FutureExt;
+    tokio::task::spawn_local(async move {
+        // Fault isolation (#9): catch a panic in the VU's own execution (a host-fn
+        // or client bug) at the task boundary. CRUCIAL — if the panic instead
+        // unwound the task, the parked `coro` would be dropped DURING the active
+        // panic, and `Coroutine::drop` force_unwinds a suspended coroutine → a
+        // force_unwind-during-panic aborts the process (taking every other VU on
+        // the loop thread). Catching here stops the panic first; `coro` then drops
+        // AFTER, so its force_unwind runs cleanly (the validated path). One VU's
+        // bug degrades to one lost VU + a loud log, not a whole-run abort.
+        let driven = std::panic::AssertUnwindSafe(drive_vu(
+            PanicSafeCoro(Some(coro)), shared, client, bp, control, hard,
+        ))
+        .catch_unwind()
+        .await;
+        if driven.is_err() {
+            eprintln!(
+                "error: a VU panicked mid-run and was isolated; run is DEGRADED \
+                 (iteration counts may be undercounted)."
+            );
+        }
+    })
 }
 
 /// Drive a VU coroutine's iteration loop. Owns the VU's futures; never touches
@@ -292,7 +347,7 @@ where
 /// awaiting dispatch, and the two-tier cancellation plugs in — prefer stopping at
 /// the boundary, reserving `force_unwind` mid-op for a hard deadline.
 pub(crate) async fn drive_vu<C, K>(
-    mut coro: VuCoroutine,
+    mut coro: PanicSafeCoro,
     shared: Shared,
     client: Arc<C>,
     bp: Backpressure,

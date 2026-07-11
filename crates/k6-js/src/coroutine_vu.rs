@@ -54,6 +54,13 @@ const COROUTINE_STACK_SIZE: usize = VU_MAX_STACK + 256 * 1024; // 256 KB JS + 25
 pub(crate) enum IterationOutcome {
     Completed { value: String },
     Errored { message: String },
+    /// The iteration was cut short by the hard-stop (the CPU-interrupt handler
+    /// broke a runaway JS loop, or the event loop was abandoned at shutdown). A
+    /// shutdown ARTIFACT — counted `interrupted`, NOT `errored`, so a graceful stop
+    /// can't trip an error threshold in the run's final moment. Semantically
+    /// identical to a `force_unwind` interrupt (which the VU can't reach a boundary
+    /// to publish — that path is counted in `drive_vu`).
+    Interrupted,
 }
 
 /// Everything a coroutine VU needs to run a user script beyond the k6 API: the
@@ -176,7 +183,15 @@ pub(crate) fn build_coroutine_vu(
     metrics: Option<BuiltinMetrics>,
     result: Rc<RefCell<Option<IterationOutcome>>>,
 ) -> VuCoroutine {
-    build_coroutine_vu_spec(VuSpec::script(script), 0, shared, metrics, result)
+    // Tests use a never-firing hard token (no CPU-interrupt / hard-stop).
+    build_coroutine_vu_spec(
+        VuSpec::script(script),
+        0,
+        shared,
+        metrics,
+        result,
+        tokio_util::sync::CancellationToken::new(),
+    )
 }
 
 /// Build a long-lived coroutine VU from a full [`VuSpec`]. Bootstrap runs once
@@ -190,6 +205,7 @@ pub(crate) fn build_coroutine_vu_spec(
     shared: Shared,
     metrics: Option<BuiltinMetrics>,
     result: Rc<RefCell<Option<IterationOutcome>>>,
+    hard_token: tokio_util::sync::CancellationToken,
 ) -> VuCoroutine {
     let prepared = prepare_script_with_dir(&spec.script, spec.script_dir.as_deref());
     // The exported function to run each iteration; default export otherwise.
@@ -198,6 +214,19 @@ pub(crate) fn build_coroutine_vu_spec(
     Coroutine::with_stack(stack, move |yielder: &Yielder<Resume, Yield>, first: Resume| {
         let yp = YielderPtr::new(yielder);
         let rt = runtime::create_runtime().expect("rt");
+        // CPU-bound interrupt (#11): QuickJS calls this at JS bytecode back-edges;
+        // returning true throws an (interpreter-level) exception that unwinds the
+        // running script — the only way to break a runaway `while(true){}` that
+        // never yields to a suspend point (force_unwind can't reach it). Wired to
+        // the hard-stop token, so it fires only at the hard deadline. SCOPE: this
+        // reaches JS loops only — a hung native host fn or a ReDoS regex in
+        // QuickJS's C engine never returns to the interpreter loop, so neither this
+        // NOR force_unwind can interrupt them; those fall to the process-level hard
+        // kill (second Ctrl-C → exit(130)), the documented backstop for native hangs.
+        {
+            let t = hard_token.clone();
+            rt.set_interrupt_handler(Some(Box::new(move || t.is_cancelled())));
+        }
         let ctx = runtime::create_context(&rt).expect("ctx");
 
         // --- bootstrap ONCE: real yielding http (jar + __wrap_response) + the
@@ -325,16 +354,31 @@ pub(crate) fn build_coroutine_vu_spec(
                 if settled && idle {
                     break;
                 }
+                // Hard-stop fired mid-iteration (the CPU-interrupt broke a runaway
+                // loop, or I/O is being abandoned): stop draining. The event loop
+                // may keep re-interrupting (the handler stays armed), so waiting for
+                // a clean settle would spin — bail and classify below as interrupted.
+                if hard_token.is_cancelled() {
+                    break;
+                }
                 let _ = yp.suspend(Yield::AwaitPending);
             }
 
-            // Publish a TYPED outcome — a thrown iteration is Errored, distinct
-            // from a Completed value (bar b; #5's executor counts on this).
+            // Publish a TYPED outcome. A thrown iteration is Errored (distinct from
+            // a Completed value; #5's executor counts on this). BUT if the hard-stop
+            // fired during this iteration and it did NOT cleanly complete, the throw
+            // is a shutdown artifact (the CPU-interrupt broke it, or the drain
+            // bailed) → Interrupted, NOT Errored (design note 3: an interrupt-throw
+            // must land in the interrupted lane so it can't trip an error threshold
+            // at end-of-run). A clean completion at shutdown still counts Completed.
             ctx.with(|ctx| {
                 let failed: bool = ctx.globals().get("__failed").unwrap_or(false);
-                let outcome = if failed {
+                let done: bool = ctx.globals().get("__done").unwrap_or(false);
+                let outcome = if hard_token.is_cancelled() && (failed || !done) {
+                    IterationOutcome::Interrupted
+                } else if failed {
                     let message: String = ctx.globals().get("__err").unwrap_or_default();
-                    // TODO(#5): surface to the run logger (folds in the init eprintln gap).
+                    // TODO(#6): surface to the run logger (folds in the init eprintln gap).
                     IterationOutcome::Errored { message }
                 } else {
                     // Match the sync VU exactly: record `iteration_duration` +
@@ -985,7 +1029,14 @@ mod tests {
         let out = LocalSet::new().block_on(&rt, async {
             let shared = Shared::new();
             let result = Rc::new(RefCell::new(None));
-            let coro = build_coroutine_vu_spec(spec, 7, shared.clone(), None, result.clone());
+            let coro = build_coroutine_vu_spec(
+                spec,
+                7,
+                shared.clone(),
+                None,
+                result.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            );
             spawn_vu(coro, shared, Arc::new(NoHttp), Backpressure::new(4), |n| n < 2)
                 .await
                 .unwrap();
@@ -1084,6 +1135,47 @@ mod tests {
             (max_used as usize) < COROUTINE_STACK_SIZE,
             "C-stack high-water {kb:.1} KB must fit COROUTINE_STACK_SIZE {} KB",
             COROUTINE_STACK_SIZE / 1024
+        );
+    }
+
+    /// #11 CPU-interrupt: a VU spinning in `while(true){}` (no yield point, so
+    /// force_unwind can't reach it) is broken by the interrupt handler when the hard
+    /// token fires, and the cut-short iteration is classified **Interrupted, NOT
+    /// Errored** (design note 3 — a shutdown artifact must not trip an error
+    /// threshold). The token is fired from a SEPARATE OS thread because the spinning
+    /// coroutine wedges its loop thread (mirrors the real watchdog thread).
+    #[test]
+    fn cpu_spin_is_interrupted_not_errored() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = LocalSet::new().block_on(&rt, async {
+            let hard = tokio_util::sync::CancellationToken::new();
+            let h2 = hard.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                h2.cancel();
+            });
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu_spec(
+                VuSpec::script("export default function () { while (true) {} }"),
+                0,
+                shared.clone(),
+                None,
+                result.clone(),
+                hard,
+            );
+            // drive_vu itself uses a never-firing hard (the interrupt is what breaks
+            // the spin, not force_unwind); `|n| n<1` stops after the one iteration.
+            spawn_vu(coro, shared, Arc::new(NoHttp), Backpressure::new(4), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Interrupted),
+            "a hard-stop while spinning must classify Interrupted, not Errored"
         );
     }
 

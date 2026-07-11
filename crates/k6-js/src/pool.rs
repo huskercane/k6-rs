@@ -123,13 +123,18 @@ where
     let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let interrupted = Arc::clone(&hard.interrupted);
         let cancel = cancel.clone();
         move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
-            let (completed, errored, cancel) =
-                (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
+            let (completed, errored, interrupted, cancel) = (
+                Arc::clone(&completed),
+                Arc::clone(&errored),
+                Arc::clone(&interrupted),
+                cancel.clone(),
+            );
             move |n: u32| -> bool {
                 if n >= 1 {
-                    tally_outcome(&result, &completed, &errored);
+                    tally_outcome(&result, &completed, &errored, &interrupted);
                 }
                 !cancel.is_cancelled() && Instant::now() < deadline
             }
@@ -160,6 +165,7 @@ fn tally_outcome(
     result: &Rc<RefCell<Option<IterationOutcome>>>,
     completed: &AtomicU64,
     errored: &AtomicU64,
+    interrupted: &AtomicU64,
 ) {
     match result.borrow().as_ref() {
         Some(IterationOutcome::Completed { .. }) => {
@@ -167,6 +173,12 @@ fn tally_outcome(
         }
         Some(IterationOutcome::Errored { .. }) => {
             errored.fetch_add(1, Ordering::Relaxed);
+        }
+        // A hard-stop interrupt reached a boundary (CPU-interrupt broke the loop):
+        // count it in the same lane as a force_unwind interrupt (drive_vu's counter
+        // is the SAME Arc — see the control factories), NOT as errored.
+        Some(IterationOutcome::Interrupted) => {
+            interrupted.fetch_add(1, Ordering::Relaxed);
         }
         None => {}
     }
@@ -230,6 +242,7 @@ fn run_vus_on_loops<C, F, K>(
                                 shared.clone(),
                                 Some(metrics.clone()),
                                 result.clone(),
+                                hard.token.clone(),
                             );
                             let control = make_control(id, result);
                             handles.push(spawn_vu_hard(
@@ -289,13 +302,18 @@ where
     let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let interrupted = Arc::clone(&hard.interrupted);
         let cancel = cancel.clone();
         move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
-            let (completed, errored, cancel) =
-                (Arc::clone(&completed), Arc::clone(&errored), cancel.clone());
+            let (completed, errored, interrupted, cancel) = (
+                Arc::clone(&completed),
+                Arc::clone(&errored),
+                Arc::clone(&interrupted),
+                cancel.clone(),
+            );
             move |n: u32| -> bool {
                 if n >= 1 {
-                    tally_outcome(&result, &completed, &errored);
+                    tally_outcome(&result, &completed, &errored, &interrupted);
                 }
                 // `n` iterations already done ⇒ run the (n)th while under the cap.
                 n < iterations_per_vu && !cancel.is_cancelled() && Instant::now() < deadline
@@ -360,18 +378,20 @@ where
     let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let interrupted = Arc::clone(&hard.interrupted);
         let remaining = Arc::clone(&remaining);
         let cancel = cancel.clone();
         move |_index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| {
-            let (completed, errored, remaining, cancel) = (
+            let (completed, errored, interrupted, remaining, cancel) = (
                 Arc::clone(&completed),
                 Arc::clone(&errored),
+                Arc::clone(&interrupted),
                 Arc::clone(&remaining),
                 cancel.clone(),
             );
             move |n: u32| -> bool {
                 if n >= 1 {
-                    tally_outcome(&result, &completed, &errored);
+                    tally_outcome(&result, &completed, &errored, &interrupted);
                 }
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     return false;
@@ -429,12 +449,13 @@ struct RampingControl {
     result: Rc<RefCell<Option<IterationOutcome>>>,
     completed: Arc<AtomicU64>,
     errored: Arc<AtomicU64>,
+    interrupted: Arc<AtomicU64>,
 }
 
 impl IterationControl for RampingControl {
     async fn next(&mut self, completed_iters: u32) -> bool {
         if completed_iters >= 1 {
-            tally_outcome(&self.result, &self.completed, &self.errored);
+            tally_outcome(&self.result, &self.completed, &self.errored, &self.interrupted);
         }
         loop {
             if self.stop.is_cancelled() {
@@ -522,6 +543,7 @@ where
     let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
+        let interrupted = Arc::clone(&hard.interrupted);
         let stop = stop.clone();
         move |index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| RampingControl {
             my_index: index,
@@ -530,6 +552,7 @@ where
             result,
             completed: Arc::clone(&completed),
             errored: Arc::clone(&errored),
+            interrupted: Arc::clone(&interrupted),
         }
     };
 
@@ -607,6 +630,7 @@ struct ArrivalControl {
     result: Rc<RefCell<Option<IterationOutcome>>>,
     completed: Arc<AtomicU64>,
     errored: Arc<AtomicU64>,
+    interrupted: Arc<AtomicU64>,
 }
 
 impl IterationControl for ArrivalControl {
@@ -616,16 +640,8 @@ impl IterationControl for ArrivalControl {
             // iteration that threw is `errored`, NOT a completion and NOT a drop —
             // it consumed an arrival slot and ran, so conservation requires it be
             // counted here (else completed+dropped silently under-sums the
-            // integral by the error count).
-            match self.result.borrow().as_ref() {
-                Some(IterationOutcome::Completed { .. }) => {
-                    self.completed.fetch_add(1, Ordering::Relaxed);
-                }
-                Some(IterationOutcome::Errored { .. }) => {
-                    self.errored.fetch_add(1, Ordering::Relaxed);
-                }
-                None => {}
-            }
+            // integral by the error count). A hard-stop interrupt is `interrupted`.
+            tally_outcome(&self.result, &self.completed, &self.errored, &self.interrupted);
         }
         // Signal idle, then await dispatch. A send error (coordinator gone) or a
         // closed channel (senders dropped at end-of-run) ⇒ graceful Stop.
@@ -840,6 +856,7 @@ fn run_arrival_loop_thread<C>(
                 shared.clone(),
                 Some(metrics.clone()),
                 result.clone(),
+                hard.token.clone(),
             );
             let control = ArrivalControl {
                 my_id: id,
@@ -848,6 +865,7 @@ fn run_arrival_loop_thread<C>(
                 result,
                 completed: Arc::clone(&completed),
                 errored: Arc::clone(&errored),
+                interrupted: Arc::clone(&hard.interrupted),
             };
             handles.push(spawn_vu_hard(
                 coro,
@@ -1436,6 +1454,69 @@ mod tests {
         assert_eq!(summary.iterations_completed, 0);
         assert_eq!(summary.iterations_errored, 0);
         assert_eq!(summary.iterations_interrupted, 1, "the hung VU was force-unwound");
+    }
+
+    /// #11 CPU-interrupt through the production executor: a VU spinning in
+    /// `while(true){}` (uninterruptible by force_unwind — no suspend point) is
+    /// broken by the CPU-interrupt handler when the WATCHDOG fires the hard token,
+    /// counted Interrupted (not errored), and the run terminates instead of
+    /// deadlocking on the wedged loop thread.
+    #[test]
+    fn constant_vus_cpu_spin_interrupted_via_watchdog_not_deadlock() {
+        let summary = run_constant_vus_on(
+            1,
+            "export default function () { while (true) {} }".to_string(),
+            1,
+            Duration::from_millis(80),  // duration
+            Arc::new(Mock200),
+            Backpressure::new(4),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(80),  // graceful stop → watchdog fires hard ~160ms
+        );
+        // Reaching here = the CPU-interrupt broke the runaway loop (else deadlock).
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_errored, 0, "a shutdown interrupt is NOT an error");
+        assert_eq!(summary.iterations_interrupted, 1, "the spinning VU was interrupted");
+    }
+
+    /// #11 four-way conservation with CPU-interrupt (design note 3): 2 VUs (one per
+    /// pinned thread) each spin forever, so the coordinator dispatches both then
+    /// finds the idle set empty ⇒ the rest drop. Both spinners are interrupted (not
+    /// errored), and completed + dropped + errored + interrupted == integral holds
+    /// — the invariant that silently breaks if an interrupt-throw leaks into errored.
+    #[test]
+    fn arrival_rate_cpu_spin_conserves_four_ways_with_interrupt() {
+        let curve = ArrivalCurve::constant(100, Duration::from_secs(1), Duration::from_millis(150));
+        let integral = curve.expected_arrivals(Duration::from_millis(150)); // ≈ 15
+        let summary = run_arrival_rate_on(
+            2, // 1 VU per thread ⇒ each spins independently (no intra-thread wedge)
+            "export default function () { while (true) {} }".to_string(),
+            2,
+            curve,
+            Arc::new(Mock200),
+            Backpressure::new(8),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(100),
+        );
+        assert_eq!(summary.iterations_completed, 0);
+        assert_eq!(summary.iterations_errored, 0, "spin-interrupt is not an error");
+        assert_eq!(
+            summary.iterations_interrupted, 2,
+            "both spinning VUs interrupted, not errored: {summary:?}"
+        );
+        assert!(summary.iterations_dropped > 0, "arrivals past the 2 spinners dropped");
+        let total = summary.iterations_completed
+            + summary.iterations_dropped
+            + summary.iterations_errored
+            + summary.iterations_interrupted;
+        let lo = (integral as u64).saturating_sub(3);
+        let hi = integral as u64 + 3;
+        assert!(
+            (lo..=hi).contains(&total),
+            "four-way conservation with interrupt: {total} vs integral {integral:.1} ({summary:?})"
+        );
     }
 
     /// ws-abort gate (slice 3b): a VU parked in a `ws.connect` recv loop — live ws

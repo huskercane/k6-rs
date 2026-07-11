@@ -988,3 +988,37 @@ early, not last):
 
 **NEXT = #11 (CPU-bound interrupt handler)** — the soak-BLOCKER. Then #12 spike
 re-verify → #9 loop-thread-panic → 7900 soak → #6 delete sync path.
+
+### #14 measurement — caveats (keep honest)
+
+- **Probe under-counts by one native leaf frame:** `__sp()` reads at `rec()` ENTRY,
+  before `crypto.sha256` runs, so the ~252KB excludes the sha256 Rust frame at the
+  deepest level (the frame closest to the guard). True peak = 252KB + one host-fn
+  frame (a few KB). Immaterial vs 260KB headroom — but the HEADROOM is the safety,
+  not the exact 252. Do not quote 252 as "the ceiling."
+- **INVARIANT the 512KB budget rests on:** NO synchronous host fn may recurse
+  unboundedly in native code. `sha256` is native-heavy but iterative (shallow-
+  framed); the budget holds because I1 keeps heavy work (async I/O) on the
+  SCHEDULER, off the coroutine stack. A sync host fn that recursed deeply in native
+  C would consume coroutine C-stack BELOW QuickJS's anchor, uncaught by this
+  measurement. We have none today (and QuickJS guards its own JSON.parse/regex
+  recursion). If one is ever added: RE-MEASURE. State it now, don't rediscover at
+  7900×.
+
+- **#11 DONE ✅ (53468d2) — CPU-bound interrupt handler (soak-BLOCKER closed).**
+  `build_coroutine_vu_spec` installs rquickjs `set_interrupt_handler` (checked at JS
+  back-edges) wired to the hard-stop token → throws to unwind a runaway
+  `while(true){}` that force_unwind can't reach. Fired by the watchdog on its own OS
+  thread (a wedged loop thread can't block the trigger). NEW
+  `IterationOutcome::Interrupted`: a hard-stop-cut iteration classifies interrupted,
+  NOT errored (the driver loop bails vs re-interrupt spin), routed to the SAME
+  interrupted counter as force_unwind — a shutdown throw can't trip an error
+  threshold. SCOPE: JS loops only; native-C hangs (ReDoS regex, hung sync host fn)
+  never return to the interpreter, so neither tier breaks them → they fall to the
+  process-level double-Ctrl-C exit(130) backstop. CLI smoke: runaway while(true) →
+  0 iters, "interrupted: 2", exit 0. KNOWN: a spinning VU still wedges its
+  loop-thread-mates UNTIL the hard deadline (single-thread-per-loop); the interrupt
+  bounds that to graceful_stop.
+
+**NEXT = #12 (spike re-verify CI gate) → #9 (loop-thread-panic undercount) → 7900
+soak → #6 (delete sync path).**

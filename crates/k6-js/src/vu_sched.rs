@@ -191,6 +191,15 @@ pub(crate) type VuCoroutine = Coroutine<Resume, Yield, ()>;
 /// one 512 KB stack on a bug path (reclaimed at process exit); the loop thread and
 /// its other VUs survive. A DELIBERATE hard-cancel force_unwind (not during a
 /// panic) goes through [`Self::force_unwind`] and is the normal validated path.
+///
+/// SCOPE: this handles the ASYNC-DRIVER unwind — a panic that originates in
+/// `drive_vu` (a client/host-fn future panicking while the coroutine is parked at a
+/// yield), a real Rust unwind. A *synchronous* host-fn panic inside `coro.resume()`
+/// is a different surface: rquickjs traps panics at the callback boundary and turns
+/// them into a JS exception, so they land in the `Errored` lane and never become a
+/// Rust unwind through the C frames. If that containment is ever violated (a host
+/// fn panicking through the C boundary), it is the SAME force_unwind-through-C
+/// surface that #12's `unwind-safety` CI gate guards.
 struct PanicSafeCoro(Option<VuCoroutine>);
 
 impl PanicSafeCoro {

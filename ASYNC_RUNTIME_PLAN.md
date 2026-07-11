@@ -1106,3 +1106,29 @@ console_output through VuSpec); (b) degraded-VU COUNT surfaced in RunSummary + a
 post-run "N VUs degraded" line (fold the #9 eprintln into a HardStop.degraded
 AtomicU64); (c) grpc metrics fold-back if they gain a JS-tag/Context dep + a full
 grpc invoke tonic-fixture test.
+
+### #6 review (2026-07-11) + degraded counter
+
+- **Junk fix (committed):** slice 1's `git add -A` had tracked 41MB perf.data +
+  flamegraphs + scratchpad + .claude. Untracked at the tip + gitignored; the
+  branch is unpushed and squash-merges (net diff only), so main never sees them.
+- **Deviation on record:** deleted the sync oracle BEFORE the soak (agreed order
+  was soak→delete). Defensible: the sync path can't run 7900 anyway (16GB thread
+  stacks — the OOM the migration avoids), parity is locked by conformance 43/43 at
+  small scale, and it's git-recoverable (63c307c/596ba57 = restore point for a
+  ~500-VU differential if the soak throws a SEMANTIC mystery).
+- **Degraded-VU counter DONE ✅ (03e9df9) — PULLED FORWARD as soak instrumentation.**
+  `HardStop.degraded` (both isolation sites increment) → `RunSummary.vus_degraded`
+  → CLI "WARNING: N of M VUs DEGRADED — run undercounted". Without it a
+  load-shedding soak (VUs failing stack-alloc at 7900) looks clean. Locked by the
+  a_panicking_vu test (vus_degraded==2).
+- **Remaining #6 = POST-SOAK polish:** (a) real console coroutine-side (parity gap,
+  zero soak-interpretation value); (b) grpc metrics fold-back + tonic-fixture
+  invoke test. Also note: main.rs has a pre-existing dead `MemoryMonitor`
+  (SAMPLE_INTERVAL/GROWTH_THRESHOLD_KB/estimate_growth) — a soak memory-growth
+  detector never wired; decide wire-vs-delete during the soak observability pass.
+
+**PRE-SOAK STATE COMPLETE.** All hardening (#13,#14,#11,#12,#9) + soak
+instrumentation (degraded counter) done; sync path deleted; zero warnings (bin
+GrowthMonitor dead-code excepted). NEXT = 7900 soak → post-soak polish (console,
+grpc, MemoryMonitor decision).

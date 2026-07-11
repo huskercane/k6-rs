@@ -7,7 +7,7 @@ use rquickjs::{CatchResultExt, Context as JsContext, Function};
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
-use k6_core::traits::{HttpClient, IterationResult, VirtualUser};
+use k6_core::traits::HttpClient;
 
 use crate::runtime;
 
@@ -592,8 +592,11 @@ impl QuickJsVu {
     }
 }
 
-impl VirtualUser for QuickJsVu {
-    fn run_iteration(&mut self) -> Result<IterationResult> {
+impl QuickJsVu {
+    /// Run the default (or named `exec`) function once. The per-VU ITERATION
+    /// executor path is gone (the coroutine pool replaced it); this survives as
+    /// the one-shot eval primitive the lifecycle hooks + tests use.
+    pub fn run_iteration(&mut self) -> Result<()> {
         let iteration = self.iteration;
         self.iteration += 1;
 
@@ -647,13 +650,7 @@ impl VirtualUser for QuickJsVu {
             metrics.record_iteration(duration.as_secs_f64() * 1000.0);
         }
 
-        Ok(IterationResult { duration })
-    }
-
-    fn reset(&mut self) {
-        // VU state persists across iterations (like k6) —
-        // cookies, variables, etc. carry over.
-        // Only per-iteration state (__ITER) is updated in run_iteration.
+        Ok(())
     }
 }
 
@@ -822,6 +819,7 @@ fn extract_import_path(import_line: &str) -> Option<&str> {
 
 /// Extract named imports from an import statement.
 /// e.g. `import { foo, bar } from 'k6/x/mymodule'` → `["foo", "bar"]`
+#[cfg(test)]
 fn extract_import_names(import_line: &str) -> Option<Vec<&str>> {
     let open = import_line.find('{')?;
     let close = import_line.find('}')?;
@@ -837,8 +835,6 @@ fn extract_import_names(import_line: &str) -> Option<Vec<&str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
     #[test]
     fn create_vu_and_run_iteration() {
         let script = r#"
@@ -851,9 +847,8 @@ mod tests {
         assert_eq!(vu.vu_id(), 1);
         assert_eq!(vu.iteration(), 0);
 
-        let result = vu.run_iteration().unwrap();
+        vu.run_iteration().unwrap();
         assert_eq!(vu.iteration(), 1);
-        assert!(result.duration < Duration::from_millis(100));
     }
 
     #[test]
@@ -1008,18 +1003,6 @@ export function setup() {
 
         let mut vu = QuickJsVu::new(42, script, &[]).unwrap();
         vu.run_iteration().unwrap();
-    }
-
-    #[test]
-    fn vu_implements_virtual_user_trait() {
-        let script = r#"
-            globalThis.__k6_default = function() {};
-        "#;
-
-        let mut vu: Box<dyn VirtualUser> = Box::new(QuickJsVu::new(1, script, &[]).unwrap());
-
-        vu.run_iteration().unwrap();
-        vu.reset();
     }
 
     #[test]

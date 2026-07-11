@@ -351,7 +351,7 @@ where
 /// constant-vus supplies a deadline check, the arrival-rate coordinator parks here
 /// awaiting dispatch, and the two-tier cancellation plugs in — prefer stopping at
 /// the boundary, reserving `force_unwind` mid-op for a hard deadline.
-pub(crate) async fn drive_vu<C, K>(
+async fn drive_vu<C, K>(
     mut coro: PanicSafeCoro,
     shared: Shared,
     client: Arc<C>,

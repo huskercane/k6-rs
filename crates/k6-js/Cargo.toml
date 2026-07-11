@@ -45,8 +45,3 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-criterion = { workspace = true }
-
-[[bench]]
-name = "http_bridge"
-harness = false

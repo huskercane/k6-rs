@@ -969,3 +969,22 @@ early, not last):
   → #11 CPU-bound interrupt handler (soak-blocker, NON-cuttable)
   → #12 spike re-verify → #9 loop-thread-panic → 7900 soak
   → #6 delete sync path + console on coroutine path
+
+### Pre-soak progress (2026-07-10)
+
+- **#13 DONE ✅ (8073a6f) — ramping poll→watch<u32> (F1).** Inactive VUs park on
+  `desired_rx.changed()` (select'd vs the stop token), waking ONLY on a ramp change
+  — zero idle wakeups (was ~400k timer-fires/s at 7900-VU ramp). Controller
+  broadcasts only on an actual change; `borrow_and_update` prevents missed/spurious
+  wakes. Stable ×5 + CLI smoke (0→6 VUs).
+- **#14 DONE ✅ (050fe20) — fat-frame stack measurement: 512KB budget VALIDATED.**
+  Worst-case C-stack high-water = **~252 KB** (deep recursion + `crypto.sha256`
+  every frame), right at VU_MAX_STACK — QuickJS's anchored check caps JS+native
+  recursion at that budget regardless of frame fatness (heavy I/O runs on the
+  scheduler, off-stack, I1). **260 KB headroom (>2×)** under the 512KB allocation
+  ⇒ 512KB × 7900 ≈ 4GB stacks, the designed budget, holds. Coupling locked by
+  `fat_frame_recursion_traps_rangeerror_before_native_overflow`; number by the
+  `#[ignore]` `measure_fat_frame_c_stack_highwater`.
+
+**NEXT = #11 (CPU-bound interrupt handler)** — the soak-BLOCKER. Then #12 spike
+re-verify → #9 loop-thread-panic → 7900 soak → #6 delete sync path.

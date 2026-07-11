@@ -1072,3 +1072,15 @@ Soak-observability watch item, tracked here — not a #12 blocker.
 
 **ALL PRE-SOAK HARDENING COMPLETE (#13,#14,#11,#12,#9 ✅). NEXT = 7900 soak → #6
 (delete sync path).** Carry the cooperative-scheduling-tax soak-watch (above).
+
+### #9 review — forward findings (folded)
+
+- **[done] PanicSafeCoro scope comment:** documented that it handles the
+  ASYNC-DRIVER unwind; synchronous host-fn panics are contained by rquickjs's
+  callback catch → `Errored` (never a Rust unwind through C); if ever violated it's
+  the same surface #12's CI gate guards.
+- **[→ #6] Soak observability:** the degraded `eprintln` is per-panicked-VU (loud),
+  but the soak wants a COUNT — a post-run "N VUs degraded" line makes the undercount
+  quantifiable instead of grep-stderr. Fold into #6's observability wiring (add a
+  degraded-VU AtomicU64 surfaced in the run summary alongside the console/logger
+  cluster).

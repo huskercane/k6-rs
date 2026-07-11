@@ -1,9 +1,8 @@
+//! Executor scheduling primitives. The per-VU spawn model now lives in the
+//! coroutine pool (`k6_js::pool`); what remains here is the JS-free, shareable
+//! scheduling math both the CLI wiring and the pool consume.
+
+/// The arrival-rate curve integral (constant + ramping arrival rate).
 pub mod arrival;
-pub mod constant_arrival_rate;
-pub mod constant_vus;
-pub mod externally_controlled;
-pub mod per_vu_iterations;
-pub mod ramping_arrival_rate;
-pub mod ramping_vus;
-pub mod shared_iterations;
+/// The ramping-VUs active-count schedule.
 pub mod vu_ramp;

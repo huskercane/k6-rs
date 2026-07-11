@@ -8,4 +8,3 @@ pub mod shared;
 pub mod summary;
 pub mod thresholds;
 pub mod traits;
-pub mod vu_pool;

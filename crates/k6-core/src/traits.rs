@@ -1,25 +1,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio_util::sync::CancellationToken;
-
-/// Result of a single VU iteration.
-pub struct IterationResult {
-    pub duration: Duration,
-}
-
-/// A virtual user that can execute script iterations.
-///
-/// Each VU owns its own JS context and HTTP client state.
-/// Implementations must be `Send` to move between threads.
-pub trait VirtualUser: Send {
-    /// Run one iteration of the test script.
-    fn run_iteration(&mut self) -> Result<IterationResult>;
-
-    /// Reset VU state between iterations (e.g., clear per-iteration data).
-    /// Called automatically when the VU is returned to the pool.
-    fn reset(&mut self);
-}
 
 /// Summary returned when an executor finishes.
 ///
@@ -42,16 +23,6 @@ pub struct RunSummary {
     pub iterations_errored: u64,
     pub iterations_interrupted: u64,
     pub duration: Duration,
-}
-
-/// An executor that schedules VU iterations according to a strategy.
-///
-/// Different executor types (constant-vus, constant-arrival-rate, etc.)
-/// implement this trait. Executors are generic over the VU type —
-/// they don't know about JS or HTTP.
-pub trait Executor: Send + Sync {
-    /// Run the executor until completion or cancellation.
-    fn run(&self, cancel: CancellationToken) -> impl Future<Output = Result<RunSummary>> + Send;
 }
 
 /// Abstraction over HTTP clients for testability.

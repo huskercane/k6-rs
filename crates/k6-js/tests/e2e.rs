@@ -1,3 +1,7 @@
+//! End-to-end: real HTTP server + the coroutine pool executors. Exercises
+//! http.get + check through the production path (`k6_js::pool`) against a live
+//! axum server.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,11 +12,11 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use k6_core::backpressure::Backpressure;
-use k6_core::executor::constant_arrival_rate::ConstantArrivalRateExecutor;
-use k6_core::executor::constant_vus::ConstantVusExecutor;
-use k6_core::vu_pool::VuPool;
+use k6_core::executor::arrival::ArrivalCurve;
+use k6_core::metrics::BuiltinMetrics;
+use k6_js::coroutine_vu::VuSpec;
 use k6_js::http_client::ReqwestHttpClient;
-use k6_js::vu::{self, QuickJsVu};
+use k6_js::pool;
 
 /// Start a test HTTP server, returns the base URL.
 async fn start_test_server(request_count: Arc<AtomicU32>) -> String {
@@ -35,9 +39,7 @@ async fn start_test_server(request_count: Arc<AtomicU32>) -> String {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // Give server a moment to start
     tokio::time::sleep(Duration::from_millis(50)).await;
-
     url
 }
 
@@ -68,8 +70,9 @@ async fn start_slow_server(delay: Duration, request_count: Arc<AtomicU32>) -> St
     url
 }
 
+/// RAW k6 script (the coroutine VU prepares it) that GETs + checks the endpoint.
 fn make_script(base_url: &str) -> String {
-    let raw = format!(
+    format!(
         r#"
 export default function() {{
     const res = http.get('{base_url}/api/test');
@@ -78,47 +81,34 @@ export default function() {{
     }});
 }}
 "#
-    );
-    vu::prepare_script(&raw)
-}
-
-fn create_vu(
-    id: u32,
-    script: &str,
-    handle: tokio::runtime::Handle,
-    client: Arc<ReqwestHttpClient>,
-    bp: Backpressure,
-) -> QuickJsVu {
-    QuickJsVu::new_with_http(id, script, &[], handle, client, bp).unwrap()
+    )
 }
 
 #[tokio::test]
 async fn constant_vus_against_real_server() {
     let request_count = Arc::new(AtomicU32::new(0));
     let base_url = start_test_server(request_count.clone()).await;
-    let script = make_script(&base_url);
+    let spec = VuSpec::script(make_script(&base_url));
 
-    let handle = tokio::runtime::Handle::current();
     let client = Arc::new(ReqwestHttpClient::new(false).unwrap());
     let bp = Backpressure::new(10);
+    let metrics = BuiltinMetrics::new();
 
-    // Create VUs inside spawn_blocking (QuickJS needs this)
-    let vus = tokio::task::spawn_blocking({
-        let script = script.clone();
-        let client = client.clone();
-        let bp = bp.clone();
-        let handle = handle.clone();
-        move || {
-            (0..3)
-                .map(|i| create_vu(i, &script, handle.clone(), client.clone(), bp.clone()))
-                .collect::<Vec<_>>()
-        }
+    // The pool owns loop threads + blocks; run it off the async executor.
+    let summary = tokio::task::spawn_blocking(move || {
+        pool::run_constant_vus(
+            spec,
+            3,
+            Duration::from_millis(500),
+            client,
+            bp,
+            metrics,
+            CancellationToken::new(),
+            Duration::from_millis(200),
+        )
     })
     .await
     .unwrap();
-
-    let executor = ConstantVusExecutor::new(vus, Duration::from_millis(500));
-    let summary = executor.run(CancellationToken::new()).await.unwrap();
 
     assert!(
         summary.iterations_completed >= 3,
@@ -128,59 +118,42 @@ async fn constant_vus_against_real_server() {
     assert_eq!(summary.iterations_dropped, 0);
 
     let requests = request_count.load(Ordering::Relaxed);
-    assert!(
-        requests >= 3,
-        "expected >= 3 HTTP requests to server, got {requests}"
-    );
+    assert!(requests >= 3, "expected >= 3 HTTP requests to server, got {requests}");
 }
 
 #[tokio::test]
 async fn arrival_rate_with_slow_server_causes_drops() {
     let request_count = Arc::new(AtomicU32::new(0));
-    // Server responds in 200ms
+    // Server responds in 200ms.
     let base_url = start_slow_server(Duration::from_millis(200), request_count.clone()).await;
-    let script = make_script(&base_url);
+    let spec = VuSpec::script(make_script(&base_url));
 
-    let handle = tokio::runtime::Handle::current();
     let client = Arc::new(ReqwestHttpClient::new(false).unwrap());
     let bp = Backpressure::new(4);
+    let metrics = BuiltinMetrics::new();
 
-    // Only 2 VUs but requesting 50/s — will definitely exhaust pool
-    let vus = tokio::task::spawn_blocking({
-        let script = script.clone();
-        let client = client.clone();
-        let bp = bp.clone();
-        let handle = handle.clone();
-        move || {
-            (0..2)
-                .map(|i| create_vu(i, &script, handle.clone(), client.clone(), bp.clone()))
-                .collect::<Vec<_>>()
-        }
+    // Only 2 VUs but 50/s against a 200ms server — the idle set empties ⇒ drops.
+    let curve = ArrivalCurve::constant(50, Duration::from_secs(1), Duration::from_millis(500));
+    let summary = tokio::task::spawn_blocking(move || {
+        pool::run_arrival_rate(
+            spec,
+            2,
+            curve,
+            client,
+            bp,
+            metrics,
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        )
     })
     .await
     .unwrap();
 
-    let pool = Arc::new(VuPool::new(vus));
-    let executor = ConstantArrivalRateExecutor::new(
-        pool.clone(),
-        50,
-        Duration::from_secs(1),
-        Duration::from_millis(500),
-    );
-
-    let summary = executor.run(CancellationToken::new()).await.unwrap();
-
-    // Should have dropped some iterations (2 VUs can't sustain 50/s with 200ms response)
     assert!(
         summary.iterations_dropped > 0,
-        "expected dropped iterations with slow server, got 0"
+        "expected dropped iterations with a slow server, got 0 ({summary:?})"
     );
     assert!(summary.iterations_completed > 0);
-
-    // Pool capacity unchanged — memory guarantee
-    assert_eq!(pool.capacity(), 2);
-    // All VUs returned
-    assert_eq!(pool.available_count(), 2);
 }
 
 #[tokio::test]
@@ -188,7 +161,7 @@ async fn check_results_are_correct() {
     let request_count = Arc::new(AtomicU32::new(0));
     let base_url = start_test_server(request_count.clone()).await;
 
-    let raw = format!(
+    let spec = VuSpec::script(format!(
         r#"
 export default function() {{
     const res = http.get('{base_url}/api/test');
@@ -201,29 +174,31 @@ export default function() {{
     }}
 }}
 "#
-    );
-    let script = vu::prepare_script(&raw);
+    ));
 
-    let handle = tokio::runtime::Handle::current();
     let client = Arc::new(ReqwestHttpClient::new(false).unwrap());
     let bp = Backpressure::new(10);
+    let metrics = BuiltinMetrics::new();
 
-    let vus = tokio::task::spawn_blocking({
-        let script = script.clone();
-        let client = client.clone();
-        let bp = bp.clone();
-        let handle = handle.clone();
-        move || vec![create_vu(0, &script, handle, client, bp)]
+    let summary = tokio::task::spawn_blocking(move || {
+        pool::run_constant_vus(
+            spec,
+            1,
+            Duration::from_millis(300),
+            client,
+            bp,
+            metrics,
+            CancellationToken::new(),
+            Duration::from_millis(200),
+        )
     })
     .await
     .unwrap();
 
-    let executor = ConstantVusExecutor::new(vus, Duration::from_millis(300));
-    let summary = executor.run(CancellationToken::new()).await.unwrap();
-
-    // All iterations should succeed (no thrown errors)
+    // A thrown check-failure would land in `errored`, not `completed`.
     assert!(
         summary.iterations_completed >= 1,
-        "expected >= 1 successful iteration"
+        "expected >= 1 successful iteration ({summary:?})"
     );
+    assert_eq!(summary.iterations_errored, 0, "checks should pass ({summary:?})");
 }

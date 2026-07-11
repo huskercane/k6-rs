@@ -20,7 +20,7 @@ use k6_core::metrics::BuiltinMetrics;
 
 use crate::api::http::register_yielding_http;
 use crate::runtime::{self, VU_MAX_STACK};
-use crate::vu::prepare_script;
+use crate::vu::prepare_script_with_dir;
 use crate::vu_sched::{OpDone, Resume, Shared, VuCoroutine, Yield, YielderPtr};
 
 /// Per-VU coroutine stack size — **the fixed-memory blast radius**: this × maxVUs
@@ -52,7 +52,11 @@ pub(crate) enum IterationOutcome {
 /// (`exec`, default `__k6_default`). Cloned per VU across loop threads (all `Send`).
 #[derive(Clone, Default)]
 pub struct VuSpec {
+    /// RAW script source (NOT pre-transformed) — the builder runs `prepare_script`
+    /// with `script_dir` so local imports resolve.
     pub script: String,
+    /// Directory the script lives in, for resolving `./`/`../` imports + `open()`.
+    pub script_dir: Option<std::path::PathBuf>,
     pub env: Vec<(String, String)>,
     /// JSON-serialized `setup()` return value, or `None`.
     pub setup_data: Option<String>,
@@ -154,7 +158,8 @@ fn bootstrap_api(
 }
 
 /// Build a long-lived coroutine VU for `script` with default env/setup/exec — a
-/// thin shim over [`build_coroutine_vu_spec`] used by tests and simple callers.
+/// thin shim over [`build_coroutine_vu_spec`] used by the coroutine_vu tests.
+#[cfg(test)]
 pub(crate) fn build_coroutine_vu(
     script: String,
     shared: Shared,
@@ -176,7 +181,7 @@ pub(crate) fn build_coroutine_vu_spec(
     metrics: Option<BuiltinMetrics>,
     result: Rc<RefCell<Option<IterationOutcome>>>,
 ) -> VuCoroutine {
-    let prepared = prepare_script(&spec.script);
+    let prepared = prepare_script_with_dir(&spec.script, spec.script_dir.as_deref());
     // The exported function to run each iteration; default export otherwise.
     let exec_name = spec.exec_fn.clone().unwrap_or_else(|| "__k6_default".to_string());
     let stack = DefaultStack::new(COROUTINE_STACK_SIZE).expect("allocate coroutine stack");
@@ -961,6 +966,7 @@ mod tests {
                 }
             "#
             .to_string(),
+            script_dir: None,
             env: vec![("BASE".to_string(), "http://x".to_string())],
             setup_data: Some(r#"{"token":"abc"}"#.to_string()),
             exec_fn: Some("myScenario".to_string()),

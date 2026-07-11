@@ -9,17 +9,13 @@ use tokio_util::sync::CancellationToken;
 
 use k6_core::backpressure::Backpressure;
 use k6_core::config::{self, ExecutorType, TestConfig};
-use k6_core::executor::constant_arrival_rate::ConstantArrivalRateExecutor;
-use k6_core::executor::constant_vus::ConstantVusExecutor;
-use k6_core::executor::externally_controlled::ExternallyControlledExecutor;
-use k6_core::executor::per_vu_iterations::PerVuIterationsExecutor;
-use k6_core::executor::ramping_arrival_rate::RampingArrivalRateExecutor;
-use k6_core::executor::ramping_vus::RampingVusExecutor;
-use k6_core::executor::shared_iterations::SharedIterationsExecutor;
+use k6_core::executor::arrival::ArrivalCurve;
+use k6_core::executor::vu_ramp::VuRampSchedule;
 use k6_core::metrics::BuiltinMetrics;
-use k6_core::vu_pool::VuPool;
+use k6_js::coroutine_vu::VuSpec;
 use k6_js::http_client::ReqwestHttpClient;
 use k6_js::hyper_client::{AnyHttpClient, HyperHttpClient};
+use k6_js::pool;
 use k6_js::vu::{self, QuickJsVu};
 
 #[derive(Parser)]
@@ -534,32 +530,10 @@ async fn run_test(
         }
     };
 
-    // Helper to create VUs with metrics, setup data, and optional exec function
-    let create_vus =
-        |num: u32, bp: &Backpressure, exec: &Option<String>| -> Result<Vec<QuickJsVu>> {
-            (0..num)
-                .map(|i| {
-                    let mut vu = QuickJsVu::new_full_with_console(
-                        i,
-                        &script,
-                        &env_vars,
-                        handle.clone(),
-                        Arc::clone(&client),
-                        bp.clone(),
-                        Some(metrics.clone()),
-                        script_dir.clone(),
-                        console_output.clone(),
-                    )?;
-                    if let Some(ref data) = setup_data {
-                        vu.set_setup_data(data)?;
-                    }
-                    if let Some(fn_name) = exec {
-                        vu.set_exec_fn(fn_name);
-                    }
-                    Ok(vu)
-                })
-                .collect()
-        };
+    // VUs are now built inside the coroutine executors (k6_js::pool) from a
+    // per-scenario VuSpec; the sync create_vus helper is gone. setup()/teardown()
+    // still run on the one-off sync QuickJsVu below (they run once, not per-VU) —
+    // retired with the rest of the sync path at #6.
 
     // Accumulated executor execution window, used as the counter-rate
     // denominator (and reported test-run duration) below. This is the sum of
@@ -587,12 +561,29 @@ async fn run_test(
         metrics.set_vus(num_vus);
         metrics.set_vus_max(num_vus);
 
+        // One VuSpec per scenario: the RAW script (build_coroutine_vu_spec prepares
+        // it with script_dir for local imports) + env + setup() data + the exec fn.
+        let spec = VuSpec {
+            script: raw_script.clone(),
+            script_dir: script_dir.clone(),
+            env: env_vars.clone(),
+            setup_data: setup_data.clone(),
+            exec_fn: scenario.exec.clone(),
+        };
+        let graceful_stop = scenario.graceful_stop;
+
+        // The coroutine executors block (they own loop threads + join); run each on
+        // a blocking task so the async main loop isn't stalled.
         let summary = match &scenario.executor {
             ExecutorType::ConstantVus { vus, duration } => {
-                let bp = Backpressure::from_vus(*vus as usize);
-                let vus = create_vus(*vus, &bp, &scenario.exec)?;
-                let executor = ConstantVusExecutor::new(vus, *duration);
-                executor.run(cancel.clone()).await?
+                let nv = *vus as usize;
+                let bp = Backpressure::from_vus(nv);
+                let (client, metrics, cancel, duration) =
+                    (Arc::clone(&client), metrics.clone(), cancel.clone(), *duration);
+                tokio::task::spawn_blocking(move || {
+                    pool::run_constant_vus(spec, nv, duration, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
             ExecutorType::ConstantArrivalRate {
                 rate,
@@ -601,12 +592,15 @@ async fn run_test(
                 pre_allocated_vus,
                 max_vus,
             } => {
-                let nv = max_vus.unwrap_or(*pre_allocated_vus);
-                let bp = Backpressure::from_vus(nv as usize);
-                let vus = create_vus(nv, &bp, &scenario.exec)?;
-                let pool = Arc::new(VuPool::new(vus));
-                let executor = ConstantArrivalRateExecutor::new(pool, *rate, *time_unit, *duration);
-                executor.run(cancel.clone()).await?
+                let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
+                let bp = Backpressure::from_vus(nv);
+                let curve = ArrivalCurve::constant(*rate, *time_unit, *duration);
+                let (client, metrics, cancel) =
+                    (Arc::clone(&client), metrics.clone(), cancel.clone());
+                tokio::task::spawn_blocking(move || {
+                    pool::run_arrival_rate(spec, nv, curve, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
             ExecutorType::RampingVus {
                 start_vus, stages, ..
@@ -616,12 +610,15 @@ async fn run_test(
                     .map(|s| s.target)
                     .max()
                     .unwrap_or(*start_vus)
-                    .max(*start_vus);
-                let bp = Backpressure::from_vus(nv as usize);
-                let vus = create_vus(nv, &bp, &scenario.exec)?;
-                let pool = Arc::new(VuPool::new(vus));
-                let executor = RampingVusExecutor::new(pool, stages.clone(), *start_vus);
-                executor.run(cancel.clone()).await?
+                    .max(*start_vus) as usize;
+                let bp = Backpressure::from_vus(nv);
+                let schedule = VuRampSchedule::new(*start_vus, stages);
+                let (client, metrics, cancel) =
+                    (Arc::clone(&client), metrics.clone(), cancel.clone());
+                tokio::task::spawn_blocking(move || {
+                    pool::run_ramping_vus(spec, nv, schedule, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
             ExecutorType::RampingArrivalRate {
                 start_rate,
@@ -630,49 +627,62 @@ async fn run_test(
                 pre_allocated_vus,
                 max_vus,
             } => {
-                let nv = max_vus.unwrap_or(*pre_allocated_vus);
-                let bp = Backpressure::from_vus(nv as usize);
-                let vus = create_vus(nv, &bp, &scenario.exec)?;
-                let pool = Arc::new(VuPool::new(vus));
-                let executor = RampingArrivalRateExecutor::new(
-                    pool,
-                    stages.clone(),
-                    *start_rate as f64,
-                    *time_unit,
-                );
-                executor.run(cancel.clone()).await?
+                let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
+                let bp = Backpressure::from_vus(nv);
+                let curve = ArrivalCurve::new(*start_rate as f64, stages, *time_unit);
+                let (client, metrics, cancel) =
+                    (Arc::clone(&client), metrics.clone(), cancel.clone());
+                tokio::task::spawn_blocking(move || {
+                    pool::run_arrival_rate(spec, nv, curve, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
             ExecutorType::PerVuIterations {
                 vus,
                 iterations,
                 max_duration,
             } => {
-                let bp = Backpressure::from_vus(*vus as usize);
-                let vus = create_vus(*vus, &bp, &scenario.exec)?;
-                let executor = PerVuIterationsExecutor::new(vus, *iterations, *max_duration);
-                executor.run(cancel.clone()).await?
+                let nv = *vus as usize;
+                let bp = Backpressure::from_vus(nv);
+                let (client, metrics, cancel, iters, md) = (
+                    Arc::clone(&client),
+                    metrics.clone(),
+                    cancel.clone(),
+                    *iterations,
+                    *max_duration,
+                );
+                tokio::task::spawn_blocking(move || {
+                    pool::run_per_vu_iterations(spec, nv, iters, md, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
             ExecutorType::SharedIterations {
                 vus,
                 iterations,
                 max_duration,
             } => {
-                let bp = Backpressure::from_vus(*vus as usize);
-                let vus = create_vus(*vus, &bp, &scenario.exec)?;
-                let executor = SharedIterationsExecutor::new(vus, *iterations, *max_duration);
-                executor.run(cancel.clone()).await?
+                let nv = *vus as usize;
+                let bp = Backpressure::from_vus(nv);
+                let (client, metrics, cancel, iters, md) = (
+                    Arc::clone(&client),
+                    metrics.clone(),
+                    cancel.clone(),
+                    *iterations,
+                    *max_duration,
+                );
+                tokio::task::spawn_blocking(move || {
+                    pool::run_shared_iterations(spec, nv, iters, md, client, bp, metrics, cancel, graceful_stop)
+                })
+                .await?
             }
-            ExecutorType::ExternallyControlled {
-                vus,
-                max_vus,
-                duration,
-            } => {
-                let nv = *max_vus;
-                let bp = Backpressure::from_vus(nv as usize);
-                let vus_vec = create_vus(nv, &bp, &scenario.exec)?;
-                let pool = Arc::new(VuPool::new(vus_vec));
-                let executor = ExternallyControlledExecutor::new(pool, *vus, nv, *duration);
-                executor.run(cancel.clone()).await?
+            ExecutorType::ExternallyControlled { .. } => {
+                // F3: fail LOUD, never a silent no-op — the async runtime has no
+                // REST control API to drive runtime VU changes.
+                anyhow::bail!(
+                    "the externally-controlled executor is not supported on the async runtime \
+                     (scenario '{name}') — it needs the k6 REST control API. Use a \
+                     constant-vus / ramping-vus / arrival-rate executor instead."
+                );
             }
         };
 
@@ -682,6 +692,18 @@ async fn run_test(
             "  scenario {name}: {} iterations in {:?}",
             summary.iterations_completed, summary.duration
         );
+        // Surface the non-completed lanes — each is a distinct load-test signal:
+        // errored = ran but threw (app health), interrupted = force-unwound at
+        // shutdown (artifact, NOT a failure), dropped = never started (capacity).
+        if summary.iterations_errored > 0 {
+            eprintln!("    errored: {} iterations", summary.iterations_errored);
+        }
+        if summary.iterations_interrupted > 0 {
+            eprintln!(
+                "    interrupted: {} iterations (force-stopped at shutdown)",
+                summary.iterations_interrupted
+            );
+        }
         if summary.iterations_dropped > 0 {
             // Emit the dropped_iterations metric (parity with upstream, which
             // emits one sample per scenario). The cause differs by executor —
@@ -1058,64 +1080,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Regression lock for the tokio default `max_blocking_threads = 512`
-    /// ceiling. constant/ramping-vus spawn one long-lived `spawn_blocking` loop
-    /// per VU that holds its thread for the whole run; with the stock
-    /// `#[tokio::main]` cap, every VU past the 512th never gets a thread and so
-    /// never starts. This drives >512 VUs on the runtime `main` actually builds
-    /// (`build_runtime`) and asserts all of them run at least once. It FAILS on
-    /// the default-512 runtime (only 512 start) and passes with the raised cap.
-    #[test]
-    fn runtime_starts_more_than_512_concurrent_vus() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::time::Duration;
-
-        use k6_core::traits::{IterationResult, VirtualUser};
-
-        const N: u32 = 600; // > 512
-
-        struct StartVu {
-            started: Arc<AtomicU32>,
-            counted: bool,
-        }
-
-        impl VirtualUser for StartVu {
-            fn run_iteration(&mut self) -> Result<IterationResult> {
-                if !self.counted {
-                    self.counted = true;
-                    self.started.fetch_add(1, Ordering::Relaxed);
-                }
-                // Hold the blocking thread like a real VU iteration would, so a
-                // 512-capped pool cannot recycle threads to the queued VUs.
-                std::thread::sleep(Duration::from_millis(20));
-                Ok(IterationResult {
-                    duration: Duration::from_millis(20),
-                })
-            }
-            fn reset(&mut self) {}
-        }
-
-        let started = Arc::new(AtomicU32::new(0));
-        let vus: Vec<StartVu> = (0..N)
-            .map(|_| StartVu {
-                started: Arc::clone(&started),
-                counted: false,
-            })
-            .collect();
-
-        let rt = build_runtime().unwrap();
-        rt.block_on(async {
-            let executor = ConstantVusExecutor::new(vus, Duration::from_millis(500));
-            executor.run(CancellationToken::new()).await.unwrap();
-        });
-
-        assert_eq!(
-            started.load(Ordering::Relaxed),
-            N,
-            "all {N} VUs must start; the default 512-thread blocking pool caps this"
-        );
-    }
+    // RETIRED at the #5 cutover: `runtime_starts_more_than_512_concurrent_vus`
+    // regression-locked the old spawn_blocking-per-VU 512-thread ceiling stopgap.
+    // VUs are now `!Send` coroutines sharded onto ~cores loop threads (k6_js::pool),
+    // so there is no per-VU blocking thread and no 512 ceiling — the property it
+    // guarded is provided structurally by the coroutine model, and validated at
+    // scale by the 7900-VU soak (pending). The pool tests cover many-VUs-per-thread.
 
     fn empty_overrides() -> CliOverrides {
         CliOverrides {

@@ -236,14 +236,33 @@ fn run_vus_on_loops<C, F, K>(
                             // Per-VU outcome cell: the coroutine writes the last
                             // iteration's outcome, the control reads it (same thread).
                             let result = Rc::new(RefCell::new(None));
-                            let coro = build_coroutine_vu_spec(
-                                spec.clone(),
-                                id,
-                                shared.clone(),
-                                Some(metrics.clone()),
-                                result.clone(),
-                                hard.token.clone(),
-                            );
+                            // Per-VU BUILD isolation (#9): the coroutine-stack
+                            // allocation can panic under memory pressure (OOM at
+                            // 7900 VUs — the soak condition). Without this, one
+                            // failed VU build would panic the whole loop thread and
+                            // silently drop EVERY VU sharded onto it. Catch it, log
+                            // LOUD, skip just that VU — degraded, not a silent hole.
+                            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                build_coroutine_vu_spec(
+                                    spec.clone(),
+                                    id,
+                                    shared.clone(),
+                                    Some(metrics.clone()),
+                                    result.clone(),
+                                    hard.token.clone(),
+                                )
+                            }));
+                            let coro = match built {
+                                Ok(c) => c,
+                                Err(_) => {
+                                    eprintln!(
+                                        "error: VU {id} failed to initialize (coroutine-stack \
+                                         allocation panicked — likely OOM); skipping it. Run is \
+                                         DEGRADED — iteration counts are undercounted."
+                                    );
+                                    continue;
+                                }
+                            };
                             let control = make_control(id, result);
                             handles.push(spawn_vu_hard(
                                 coro,
@@ -254,6 +273,9 @@ fn run_vus_on_loops<C, F, K>(
                                 hard.clone(),
                             ));
                         }
+                        // VU panics are caught + logged inside spawn_vu_hard (so the
+                        // parked coroutine drops cleanly, not during a panic); the
+                        // task itself never panics, so this await just joins.
                         for h in handles {
                             let _ = h.await;
                         }
@@ -263,7 +285,12 @@ fn run_vus_on_loops<C, F, K>(
         );
     }
     for h in threads {
-        let _ = h.join();
+        if h.join().is_err() {
+            eprintln!(
+                "error: a k6 loop thread panicked; run is DEGRADED — a shard of VUs did not \
+                 run, iteration counts are undercounted."
+            );
+        }
     }
 }
 
@@ -770,7 +797,12 @@ where
     let duration = coordinator.join().unwrap_or(Duration::ZERO);
     let watchdog = spawn_hard_stop_watchdog(hard.token.clone(), graceful_stop);
     for h in loop_threads {
-        let _ = h.join();
+        if h.join().is_err() {
+            eprintln!(
+                "error: a k6 loop thread panicked; run is DEGRADED — a shard of VUs did not \
+                 run, iteration counts are undercounted."
+            );
+        }
     }
     watchdog.finish();
 
@@ -850,14 +882,29 @@ fn run_arrival_loop_thread<C>(
         for (id, run_next_rx) in vus {
             let shared = Shared::new();
             let result = Rc::new(RefCell::new(None));
-            let coro = build_coroutine_vu_spec(
-                spec.clone(),
-                id,
-                shared.clone(),
-                Some(metrics.clone()),
-                result.clone(),
-                hard.token.clone(),
-            );
+            // Per-VU BUILD isolation (#9): see run_vus_on_loops. A skipped arrival
+            // VU never reports idle, so the coordinator's startup proceeds degraded
+            // after its timeout and any arrival routed to it drops (send fails).
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_coroutine_vu_spec(
+                    spec.clone(),
+                    id,
+                    shared.clone(),
+                    Some(metrics.clone()),
+                    result.clone(),
+                    hard.token.clone(),
+                )
+            }));
+            let coro = match built {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!(
+                        "error: VU {id} failed to initialize (coroutine-stack allocation \
+                         panicked — likely OOM); skipping it. Run is DEGRADED."
+                    );
+                    continue;
+                }
+            };
             let control = ArrivalControl {
                 my_id: id,
                 idle_tx: idle_tx.clone(),
@@ -877,7 +924,12 @@ fn run_arrival_loop_thread<C>(
             ));
         }
         for h in handles {
-            let _ = h.await;
+            if h.await.is_err() {
+                eprintln!(
+                    "error: a VU task panicked mid-run; run is DEGRADED (iteration counts \
+                     may be undercounted)."
+                );
+            }
         }
     });
 }
@@ -1016,6 +1068,47 @@ mod tests {
                 })
             }
         }
+    }
+
+    /// A client whose `send` PANICS — injects a per-VU runtime fault (the panic
+    /// happens inside `drive_vu`'s task, on the loop thread).
+    struct PanicClient;
+    impl HttpClient for PanicClient {
+        fn send(&self, _req: HttpRequest) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+            async { panic!("injected VU fault in http send") }
+        }
+    }
+
+    /// #9 fault isolation: even VUs `http.get` (→ PanicClient panics their task),
+    /// odd VUs loop http-free. A panicking VU must NOT take its peers: the odd VUs
+    /// keep completing, and the run RETURNS (loop threads survive the panics, join
+    /// cleanly) rather than crashing or hanging. Pinned 2 threads so both host a
+    /// panicking + a surviving VU is not required — the point is peers survive.
+    #[test]
+    fn a_panicking_vu_does_not_take_its_peers() {
+        let script = r#"
+            export default function () {
+                if (__VU % 2 === 0) { http.get('http://x/'); }  // even VUs panic
+                // odd VUs just loop, completing many iterations
+            }
+        "#;
+        let summary = run_constant_vus_on(
+            2,
+            script.to_string(),
+            4, // VUs 0,2 panic; 1,3 survive
+            Duration::from_millis(120),
+            Arc::new(PanicClient),
+            Backpressure::new(16),
+            BuiltinMetrics::new(),
+            CancellationToken::new(),
+            Duration::from_millis(80),
+        );
+        // Reaching here = the run returned (no propagated panic, no hang).
+        // Odd VUs completed despite even VUs panicking → the fault was isolated.
+        assert!(
+            summary.iterations_completed > 0,
+            "surviving VUs must keep completing despite peers panicking: {summary:?}"
+        );
     }
 
     /// A client whose `send` never resolves — models hung I/O (a server that

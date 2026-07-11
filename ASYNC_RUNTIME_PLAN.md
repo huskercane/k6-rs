@@ -1045,3 +1045,13 @@ OBSERVABLE, not eliminated.
    starvation vs. a real server-side tail. A per-loop-thread iteration-latency
    histogram is worth adding if instrumenting the soak anyway.
 Soak-observability watch item, tracked here — not a #12 blocker.
+
+- **#12 DONE ✅ — spike re-verification CI gate.** Added an isolated `unwind-safety`
+  job to `.github/workflows/ci.yml` that runs `cargo test -p k6-js -- --ignored`
+  (the 2 force_unwind-through-QuickJS-C spikes + the fat-frame stack measurement).
+  SEPARATE job/runner so a potential process-abort (unwind regression from a
+  corosensei/rquickjs/toolchain bump) fails CI LOUD without taking the main suite.
+  Closes the blind spot: `#[ignore]` meant CI never ran the fragile invariant the
+  8h soak leans on. Verified green locally (exit 0).
+
+**NEXT = #9 (loop-thread-panic undercount) → 7900 soak → #6 (delete sync path).**

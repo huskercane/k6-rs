@@ -63,3 +63,40 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Isolated job for the #[ignore] safety spikes that the main `test` job skips.
+  # The async runtime's hard-cancellation tier leans on corosensei force_unwind
+  # driving a Rust panic THROUGH QuickJS C frames (validated once on Linux x86-64,
+  # but platform-/toolchain-fragile). A corosensei / rquickjs / Rust-toolchain bump
+  # that regresses unwind-through-cleanup-free-C would abort at the FIRST hard-stop
+  # in the 8h soak — hour 7, worst place to learn it. This job runs those spikes
+  # (+ the fat-frame stack measurement) so a regression fails CI LOUD instead. It's
+  # a SEPARATE job (own runner/process) so a potential abort can't take the main
+  # suite. See ASYNC_RUNTIME_PLAN.md (#12).
+  unwind-safety:
+    name: Unwind-through-C safety spikes
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # `--ignored` runs the force_unwind-through-QuickJS-C spikes + the fat-frame
+      # stack measurement. A process abort here (unwind regression) fails the job.
+      - name: force_unwind + stack spikes
+        run: cargo test -p k6-js -- --ignored --nocapture --test-threads=1

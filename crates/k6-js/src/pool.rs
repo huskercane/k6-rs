@@ -420,7 +420,11 @@ where
 /// the highest indices first, matching the sync executor's scale-down.
 struct RampingControl {
     my_index: usize,
-    desired: Arc<AtomicU32>,
+    /// Broadcast of the desired active-VU count from the controller. An inactive VU
+    /// parks on `changed()` — waking ONLY on a ramp change, not on a timer — so idle
+    /// VUs cost zero wakeups (the poll version fired ~50×/s per idle VU; at a
+    /// 7900-VU ramp that was ~400k timer-fires/s of pure overhead).
+    desired_rx: tokio::sync::watch::Receiver<u32>,
     stop: CancellationToken,
     result: Rc<RefCell<Option<IterationOutcome>>>,
     completed: Arc<AtomicU64>,
@@ -436,11 +440,18 @@ impl IterationControl for RampingControl {
             if self.stop.is_cancelled() {
                 return false;
             }
-            if (self.my_index as u32) < self.desired.load(Ordering::Relaxed) {
+            // `borrow_and_update` marks this version seen, so the `changed()` below
+            // waits for the NEXT ramp change (no missed change, no spurious wake).
+            if (self.my_index as u32) < *self.desired_rx.borrow_and_update() {
                 return true;
             }
-            // Inactive: park briefly, then re-check (≈20 ms activation granularity).
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Inactive: sleep until the desired count changes OR the run stops. A
+            // dropped sender (controller exit) resolves `changed()` as Err → we loop
+            // and observe `stop` cancelled → false.
+            tokio::select! {
+                _ = self.desired_rx.changed() => {}
+                _ = self.stop.cancelled() => return false,
+            }
         }
     }
 }
@@ -473,7 +484,9 @@ where
     let deadline = start + total_duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
-    let desired = Arc::new(AtomicU32::new(0));
+    // Desired active-VU count, broadcast to all VUs via a watch channel (see
+    // RampingControl — event-driven, not polled).
+    let (desired_tx, desired_rx) = tokio::sync::watch::channel(0u32);
     // Graceful stop for the VUs, fired by the controller at schedule end / cancel.
     let stop = CancellationToken::new();
     let hard = HardStop {
@@ -483,15 +496,22 @@ where
 
     // Controller: drive `desired` along the schedule until the schedule ends (or
     // cancel), then fire `stop` so every VU graceful-stops at its next boundary.
+    // On exit it drops `desired_tx`, waking any VU parked on `changed()`.
     let controller = {
-        let desired = Arc::clone(&desired);
         let stop = stop.clone();
         let cancel = cancel.clone();
         thread::Builder::new()
             .name("k6-ramp-controller".into())
             .spawn(move || {
+                let mut last = u32::MAX;
                 while !cancel.is_cancelled() && start.elapsed() < total_duration {
-                    desired.store(schedule.interpolate(start.elapsed()), Ordering::Relaxed);
+                    let want = schedule.interpolate(start.elapsed());
+                    // Only broadcast on an actual change — no-op sends would wake
+                    // every idle VU for nothing.
+                    if want != last {
+                        let _ = desired_tx.send(want);
+                        last = want;
+                    }
                     thread::sleep(Duration::from_millis(50));
                 }
                 stop.cancel();
@@ -502,11 +522,10 @@ where
     let make_control = {
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
-        let desired = Arc::clone(&desired);
         let stop = stop.clone();
         move |index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| RampingControl {
             my_index: index,
-            desired: Arc::clone(&desired),
+            desired_rx: desired_rx.clone(),
             stop: stop.clone(),
             result,
             completed: Arc::clone(&completed),

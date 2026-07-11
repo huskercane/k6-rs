@@ -23,6 +23,12 @@ pub struct RunSummary {
     pub iterations_errored: u64,
     pub iterations_interrupted: u64,
     pub duration: Duration,
+    /// VUs that FAILED to initialize (coroutine-stack OOM at scale) or panicked
+    /// mid-run and were isolated — a *degraded* run. Non-zero means the run
+    /// executed with FEWER effective VUs than requested and its iteration counts
+    /// are undercounted; a soak that sheds VUs under memory pressure surfaces here
+    /// instead of looking clean.
+    pub vus_degraded: u64,
 }
 
 /// Abstraction over HTTP clients for testability.

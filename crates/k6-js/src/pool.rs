@@ -113,10 +113,7 @@ where
     let deadline = start + duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
-    let hard = HardStop {
-        token: CancellationToken::new(),
-        interrupted: Arc::new(AtomicU64::new(0)),
-    };
+    let hard = HardStop::new();
 
     // constant-vus control: run continuously until the deadline (or cancel). No
     // drops (no arrival curve); a stuck VU is force_unwound by the watchdog.
@@ -154,6 +151,7 @@ where
         iterations_dropped: 0, // constant-vus never drops (no arrival curve)
         iterations_errored: errored.load(Ordering::Relaxed),
         iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
+        vus_degraded: hard.degraded.load(Ordering::Relaxed),
         duration: start.elapsed(),
     }
 }
@@ -255,6 +253,7 @@ fn run_vus_on_loops<C, F, K>(
                             let coro = match built {
                                 Ok(c) => c,
                                 Err(_) => {
+                                    hard.degraded.fetch_add(1, Ordering::Relaxed);
                                     eprintln!(
                                         "error: VU {id} failed to initialize (coroutine-stack \
                                          allocation panicked — likely OOM); skipping it. Run is \
@@ -321,10 +320,7 @@ where
     let deadline = start + max_duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
-    let hard = HardStop {
-        token: CancellationToken::new(),
-        interrupted: Arc::new(AtomicU64::new(0)),
-    };
+    let hard = HardStop::new();
 
     let make_control = {
         let completed = Arc::clone(&completed);
@@ -363,6 +359,7 @@ where
         iterations_dropped: planned.saturating_sub(c + e + i),
         iterations_errored: e,
         iterations_interrupted: i,
+        vus_degraded: hard.degraded.load(Ordering::Relaxed),
         duration: start.elapsed(),
     }
 }
@@ -397,10 +394,7 @@ where
     let errored = Arc::new(AtomicU64::new(0));
     // The shared iteration budget — CAS-claimed by every VU across all threads.
     let remaining = Arc::new(AtomicU32::new(total_iterations));
-    let hard = HardStop {
-        token: CancellationToken::new(),
-        interrupted: Arc::new(AtomicU64::new(0)),
-    };
+    let hard = HardStop::new();
 
     let make_control = {
         let completed = Arc::clone(&completed);
@@ -455,6 +449,7 @@ where
         iterations_dropped: (total_iterations as u64).saturating_sub(c + e + i),
         iterations_errored: e,
         iterations_interrupted: i,
+        vus_degraded: hard.degraded.load(Ordering::Relaxed),
         duration: start.elapsed(),
     }
 }
@@ -537,10 +532,7 @@ where
     let (desired_tx, desired_rx) = tokio::sync::watch::channel(0u32);
     // Graceful stop for the VUs, fired by the controller at schedule end / cancel.
     let stop = CancellationToken::new();
-    let hard = HardStop {
-        token: CancellationToken::new(),
-        interrupted: Arc::new(AtomicU64::new(0)),
-    };
+    let hard = HardStop::new();
 
     // Controller: drive `desired` along the schedule until the schedule ends (or
     // cancel), then fire `stop` so every VU graceful-stops at its next boundary.
@@ -594,6 +586,7 @@ where
         iterations_dropped: 0, // ramping-vus never drops
         iterations_errored: errored.load(Ordering::Relaxed),
         iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
+        vus_degraded: hard.degraded.load(Ordering::Relaxed),
         duration: start.elapsed(),
     }
 }
@@ -736,10 +729,7 @@ where
     // Hard-cancellation tier: fired by the watchdog `graceful_stop` after the run
     // ends, to force_unwind any VU still parked mid-op (hung I/O) so the join
     // can't hang. Each such VU counts as one interrupted iteration.
-    let hard = HardStop {
-        token: CancellationToken::new(),
-        interrupted: Arc::new(AtomicU64::new(0)),
-    };
+    let hard = HardStop::new();
 
     // Per-VU dispatch channels: coordinator holds the senders (by id), each VU its
     // receiver. Idle channel: every VU clones `idle_tx` → coordinator's `idle_rx`.
@@ -811,6 +801,7 @@ where
         iterations_dropped: dropped.load(Ordering::Relaxed),
         iterations_errored: errored.load(Ordering::Relaxed),
         iterations_interrupted: hard.interrupted.load(Ordering::Relaxed),
+        vus_degraded: hard.degraded.load(Ordering::Relaxed),
         duration,
     }
 }
@@ -898,6 +889,7 @@ fn run_arrival_loop_thread<C>(
             let coro = match built {
                 Ok(c) => c,
                 Err(_) => {
+                    hard.degraded.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "error: VU {id} failed to initialize (coroutine-stack allocation \
                          panicked — likely OOM); skipping it. Run is DEGRADED."
@@ -1108,6 +1100,12 @@ mod tests {
         assert!(
             summary.iterations_completed > 0,
             "surviving VUs must keep completing despite peers panicking: {summary:?}"
+        );
+        // The 2 even VUs panicked and were isolated → counted degraded, so the run
+        // is observably NOT clean (the soak-instrumentation the count exists for).
+        assert_eq!(
+            summary.vus_degraded, 2,
+            "the 2 panicking VUs must be counted degraded: {summary:?}"
         );
     }
 

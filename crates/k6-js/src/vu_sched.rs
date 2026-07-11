@@ -270,17 +270,29 @@ pub(crate) async fn run_op<C: HttpClient + 'static>(
 pub(crate) struct HardStop {
     pub(crate) token: CancellationToken,
     pub(crate) interrupted: Arc<AtomicU64>,
+    /// VUs that FAILED (a build-time panic — e.g. coroutine-stack OOM — or a
+    /// mid-run panic) and were isolated rather than run. A soak that sheds VUs
+    /// under memory pressure must surface this: an apparently-clean 8h run could
+    /// really be running at a fraction of the requested VUs with the rest
+    /// degraded. Rolled into `RunSummary.vus_degraded`.
+    pub(crate) degraded: Arc<AtomicU64>,
 }
 
 impl HardStop {
-    /// A `HardStop` that never fires — for the coroutine_vu tests, which exercise
-    /// the VU without a hard deadline. Its interrupted counter is discarded.
-    #[cfg(test)]
-    pub(crate) fn never() -> Self {
+    /// A fresh hard-stop: a live token + zeroed interrupted/degraded counters.
+    pub(crate) fn new() -> Self {
         Self {
             token: CancellationToken::new(),
             interrupted: Arc::new(AtomicU64::new(0)),
+            degraded: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A `HardStop` that never fires — for the coroutine_vu tests, which exercise
+    /// the VU without a hard deadline. Its counters are discarded.
+    #[cfg(test)]
+    pub(crate) fn never() -> Self {
+        Self::new()
     }
 }
 
@@ -320,6 +332,7 @@ where
     K: IterationControl + 'static,
 {
     use futures_util::FutureExt;
+    let degraded = Arc::clone(&hard.degraded);
     tokio::task::spawn_local(async move {
         // Fault isolation (#9): catch a panic in the VU's own execution (a host-fn
         // or client bug) at the task boundary. CRUCIAL — if the panic instead
@@ -335,6 +348,7 @@ where
         .catch_unwind()
         .await;
         if driven.is_err() {
+            degraded.fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "error: a VU panicked mid-run and was isolated; run is DEGRADED \
                  (iteration counts may be undercounted)."

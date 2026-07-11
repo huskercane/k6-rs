@@ -704,6 +704,17 @@ async fn run_test(
                 summary.iterations_interrupted
             );
         }
+        if summary.vus_degraded > 0 {
+            // A degraded VU failed to initialize (stack OOM at scale) or panicked
+            // and was isolated — the run had FEWER effective VUs than requested and
+            // its counts are undercounted. Loud so a "clean" soak that silently
+            // shed load can't be mistaken for a healthy one.
+            eprintln!(
+                "    WARNING: {} of {num_vus} VUs DEGRADED (failed/panicked, isolated) — \
+                 run undercounted",
+                summary.vus_degraded
+            );
+        }
         if summary.iterations_dropped > 0 {
             // Emit the dropped_iterations metric (parity with upstream, which
             // emits one sample per scenario). The cause differs by executor —

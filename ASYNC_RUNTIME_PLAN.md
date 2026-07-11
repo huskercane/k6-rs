@@ -1055,3 +1055,20 @@ Soak-observability watch item, tracked here — not a #12 blocker.
   8h soak leans on. Verified green locally (exit 0).
 
 **NEXT = #9 (loop-thread-panic undercount) → 7900 soak → #6 (delete sync path).**
+
+- **#9 DONE ✅ (3526d31) — loop-thread + VU fault isolation. Found+fixed a real
+  ABORT bug.** BUILD-panic (coroutine-stack alloc OOM at 7900 VUs): catch_unwind
+  around build_coroutine_vu_spec in both loop-thread bodies → skip that VU + log
+  LOUD (degraded), never panic the whole thread + silently drop its shard.
+  Loop-thread joins log on panic (backstop). RUN-panic (host-fn/client bug) — the
+  new test EXPOSED that it was NOT isolated, it SIGABRT'd: a panic in drive_vu
+  drops its local `coro`, `Coroutine::drop` force_unwinds a suspended coroutine,
+  and force_unwind DURING an active panic = panic-during-panic = abort (taking
+  every VU on the loop thread). FIX: `PanicSafeCoro` leaks the coroutine if dropped
+  while `std::thread::panicking()` (skips force_unwind), so the panic reaches
+  spawn_vu_hard's `catch_unwind` boundary cleanly → isolates to one VU (one 512KB
+  stack leaked on a bug path). Deliberate hard-cancel force_unwind stays the normal
+  path. Without this, ANY host-fn/client bug would have aborted the whole 8h soak.
+
+**ALL PRE-SOAK HARDENING COMPLETE (#13,#14,#11,#12,#9 ✅). NEXT = 7900 soak → #6
+(delete sync path).** Carry the cooperative-scheduling-tax soak-watch (above).

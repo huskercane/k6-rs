@@ -31,9 +31,19 @@ use crate::vu_sched::{OpDone, Resume, Shared, VuCoroutine, Yield, YielderPtr};
 /// frames on the coroutine stack — note `client.send` runs on the SCHEDULER, not
 /// here), so QuickJS trips its own `RangeError` BEFORE the native stack
 /// guard-page `SIGSEGV`s. corosensei defaults to 1 MiB; we set it explicitly and
-/// smaller. `quickjs_range_error_trips_before_native_overflow` guards the
-/// coupling at this size. **TUNE via measurement under the OOM-reference script
-/// before the soak (#5)** — do not inherit the default silently.
+/// smaller. `quickjs_range_error_trips_before_native_overflow` +
+/// `fat_frame_recursion_traps_rangeerror_before_native_overflow` guard the coupling
+/// at this size.
+///
+/// **MEASURED (#14, `measure_fat_frame_c_stack_highwater`):** worst-case C-stack
+/// high-water = **~252 KB** — a deep recursion with a native-heavy host fn
+/// (`crypto.sha256`) at EVERY frame, far more stressful than the flat http loops
+/// real load-test scripts run. It lands right at `VU_MAX_STACK` because QuickJS's
+/// anchored `js_check_stack_overflow` caps JS recursion at that C-stack budget
+/// regardless of frame fatness (the heavy I/O future runs on the SCHEDULER, off
+/// this stack, per I1). So 512 KB carries the deepest JS+native frame plus the
+/// coroutine/driver frames beneath it with >2× headroom. At 7900 VUs that's
+/// ~4 GB of stacks — the fixed-memory budget this migration was designed around.
 const COROUTINE_STACK_SIZE: usize = VU_MAX_STACK + 256 * 1024; // 256 KB JS + 256 KB native headroom
 
 /// Typed per-iteration outcome. #5's executor reads this to count completed vs
@@ -986,6 +996,94 @@ mod tests {
             out,
             Some(IterationOutcome::Completed { value: "http://x:abc:7:1".into() }),
             "env + setup data + named exec + __VU + __ITER all wired"
+        );
+    }
+
+    /// #14 fat-frame coupling: deep JS recursion where EACH frame also does
+    /// native-heavy work (`crypto.sha256` — a real host fn with its own Rust
+    /// frame), so a fat native frame sits beneath every JS frame. QuickJS's 256KB
+    /// stack check (anchored onto the coroutine stack) must STILL trip a RangeError,
+    /// caught in JS, before the native guard page — proving COROUTINE_STACK_SIZE
+    /// (512KB) has headroom for the deepest JS+native frame, not just plain call
+    /// depth. (The heaviest native work — the I/O future — runs on the SCHEDULER,
+    /// not the coroutine stack, per I1, so this + plain-depth is the whole surface.)
+    #[test]
+    fn fat_frame_recursion_traps_rangeerror_before_native_overflow() {
+        let script = r#"
+            export default function () {
+                var depth = 0;
+                function rec(n) {
+                    depth = n;
+                    var h = crypto.sha256('x' + n, 'hex'); // fat native frame per level
+                    return rec(n + 1) + h.length;
+                }
+                try { rec(0); return 'no-error'; }
+                catch (e) { return 'caught:' + (depth > 50); }
+            }
+        "#;
+        // Reaching a Completed outcome AT ALL means no native SIGSEGV/abort — the
+        // Rust panic-free RangeError path ran. `caught:true` also confirms real
+        // depth was reached (native frames didn't trip it at depth ~0).
+        match run_script(script, 1) {
+            Some(IterationOutcome::Completed { value }) => assert_eq!(
+                value, "caught:true",
+                "fat-frame recursion must trip a caught RangeError at real depth"
+            ),
+            other => panic!("expected Completed(caught), got {other:?} — a crash here means \
+                             COROUTINE_STACK_SIZE is too small for fat frames"),
+        }
+    }
+
+    /// #14 measurement (run explicitly): the actual C-stack high-water of a
+    /// fat-frame recursion, via an `__sp()` probe returning the current stack
+    /// pointer. QuickJS caps JS recursion at `VU_MAX_STACK` of C-stack (its anchored
+    /// `js_check_stack_overflow`), so the high-water lands near 256KB + the deepest
+    /// host-fn frame — the headroom under COROUTINE_STACK_SIZE (512KB). Reports the
+    /// number and asserts it fits. `#[ignore]` because it's a measurement.
+    ///   cargo test -p k6-js measure_fat_frame -- --ignored --nocapture
+    #[test]
+    #[ignore = "stack measurement; run explicitly with --ignored --nocapture"]
+    fn measure_fat_frame_c_stack_highwater() {
+        use rquickjs::Function;
+        let rt = runtime::create_runtime().unwrap();
+        let ctx = runtime::create_context(&rt).unwrap();
+        let max_used = ctx.with(|ctx| {
+            crate::api::crypto::register(&ctx).unwrap();
+            let sp = Function::new(ctx.clone(), || -> f64 {
+                let probe = 0u8;
+                &probe as *const u8 as usize as f64
+            })
+            .unwrap();
+            ctx.globals().set("__sp", sp).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__base = __sp();
+                globalThis.__max = 0;
+                function rec(n) {
+                    var used = __base - __sp();            // stack grows downward
+                    if (used > __max) __max = used;
+                    var h = crypto.sha256('x' + n, 'hex'); // fat native frame per level
+                    return rec(n + 1) + h.length;
+                }
+                try { rec(0); } catch (e) {}
+            "#,
+            )
+            .unwrap();
+            ctx.globals().get::<_, f64>("__max").unwrap()
+        });
+        let kb = max_used / 1024.0;
+        println!(
+            "=== fat-frame QuickJS C-stack high-water: {kb:.1} KB \
+             (VU_MAX_STACK={} KB, COROUTINE_STACK_SIZE={} KB, headroom={:.1} KB) ===",
+            VU_MAX_STACK / 1024,
+            COROUTINE_STACK_SIZE / 1024,
+            (COROUTINE_STACK_SIZE as f64 - max_used) / 1024.0
+        );
+        assert!(max_used > 0.0, "probe measured nothing");
+        assert!(
+            (max_used as usize) < COROUTINE_STACK_SIZE,
+            "C-stack high-water {kb:.1} KB must fit COROUTINE_STACK_SIZE {} KB",
+            COROUTINE_STACK_SIZE / 1024
         );
     }
 

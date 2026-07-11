@@ -1,8 +1,13 @@
-/// Runtime memory growth detection for VUs.
-///
-/// Samples QuickJS heap usage per VU every N iterations.
-/// Uses linear regression on recent samples to detect monotonic growth.
-/// Warns before the VU hits its memory limit.
+//! Runtime memory growth detection for VUs.
+//!
+//! Samples QuickJS heap usage per VU every N iterations, uses linear regression
+//! on recent samples to detect monotonic growth, and warns before the VU hits its
+//! memory limit.
+//!
+//! Not yet wired into the coroutine VU path — to be connected during the soak
+//! observability pass (#6c), where per-VU heap-growth detection over an 8h run is
+//! exactly the signal the fixed-memory tool exists to surface.
+#![allow(dead_code)] // wired at soak-prep — see #6c note
 
 const SAMPLE_INTERVAL: u32 = 50; // Sample every 50 iterations
 const MIN_SAMPLES: usize = 5; // Need at least 5 samples for regression

@@ -14,12 +14,6 @@
 //!   needs host-fn closures `Send`), not a license to move threads. Spawn only
 //!   via [`spawn_vu`]; a `debug_assert` backstops a stray `tokio::spawn`.
 
-// TRANSITIONAL: the whole graduation stack (this module → register_yielding_http
-// → coroutine_vu) is reachable only from tests until #5 wires the coroutine VU
-// into the executors. REMOVE this allow at #5 — then any genuinely dead scheduler
-// item surfaces instead of being masked.
-#![allow(dead_code)]
-
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -133,7 +127,6 @@ pub(crate) enum Yield {
 }
 
 pub(crate) enum Resume {
-    Start,
     One(OpDone),
     /// Results of an `AwaitAll`, in input order.
     All(Vec<OpDone>),
@@ -280,8 +273,9 @@ pub(crate) struct HardStop {
 }
 
 impl HardStop {
-    /// A `HardStop` that never fires — for callers with no hard deadline (tests,
-    /// the harness). Its interrupted counter is discarded.
+    /// A `HardStop` that never fires — for the coroutine_vu tests, which exercise
+    /// the VU without a hard deadline. Its interrupted counter is discarded.
+    #[cfg(test)]
     pub(crate) fn never() -> Self {
         Self {
             token: CancellationToken::new(),
@@ -290,9 +284,11 @@ impl HardStop {
     }
 }
 
-/// The ONLY sanctioned way to run a VU (I3): `spawn_local`. The `unsafe Send` on
-/// [`Shared`] would let `tokio::spawn` compile — and be UB. Graceful-only variant
-/// (no hard deadline); production paths use [`spawn_vu_hard`].
+/// Graceful-only `spawn_vu` for the coroutine_vu tests (no hard deadline).
+/// Production paths use [`spawn_vu_hard`] directly. The `spawn_local` here is the
+/// only sanctioned way to run a VU (I3): the `unsafe Send` on [`Shared`] would let
+/// `tokio::spawn` compile — and be UB.
+#[cfg(test)]
 pub(crate) fn spawn_vu<C, K>(
     coro: VuCoroutine,
     shared: Shared,

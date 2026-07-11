@@ -3,19 +3,6 @@ name = "k6-js"
 version.workspace = true
 edition.workspace = true
 
-# async-spike: Phase 0 of the async-runtime migration (ASYNC_RUNTIME_PLAN.md).
-# THROWAWAY — enables rquickjs AsyncRuntime/AsyncContext to prove the
-# pool-of-loops mechanism + per-VU isolation. Delete once Phase 1 lands.
-#
-# b2-spike: Phase 0.5 — proves stackful-coroutine (corosensei) suspension of a
-# synchronous QuickJS host fn (the faithful goja-goroutine port). THROWAWAY;
-# deleted once the suspension mechanism is chosen.
-[features]
-async-spike = ["rquickjs/futures"]
-# corosensei is now a base dep (the scheduler in vu_sched is production code);
-# b2-spike only gates the throwaway harness (vu_loop) + spike (b2_spike) modules.
-b2-spike = []
-
 [dependencies]
 k6-core = { workspace = true }
 tokio = { workspace = true }

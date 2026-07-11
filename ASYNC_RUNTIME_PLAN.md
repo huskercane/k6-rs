@@ -950,3 +950,22 @@ tracked): F1 poll→watch (#13) → #11 CPU-interrupt handler → #12 spike re-v
 #9 loop-thread-panic undercount → fat-frame stack measurement → soak. Then #6
 (delete the sync path: QuickJsVu/sync executors/vu_pool/setup-teardown-on-sync,
 + console on the coroutine path).
+
+### #5 cutover review — resequenced pre-soak plan (slice-5 review)
+
+Live cutover confirmed GO (diff-read): cancellation survives the spawn_blocking
+swap (concurrent signal handler → cancel token → pool observes it → blocking task
+returns); four-lane summary stays on the right side of the conformance line
+(errored/interrupted = eprintln only, dropped emits the metric); conformance
+green on the coroutine runtime. Non-blocking notes: scenarios run sequentially
+(PRE-EXISTING — sync path did the same inline await; conformance-tracker item, not
+a cutover regression); second Ctrl-C `process::exit(130)` hard-kills, bypassing
+teardown + summary flush (intended k6 "force" semantics).
+
+**RESEQUENCED** (staff-lens: #11 is the soak-BLOCKER, #13 is fidelity/cuttable;
+fat-frame is the fixed-memory premise and could invalidate the budget → measure
+early, not last):
+  #13 poll→watch (#13) + fat-frame stack measurement (#14) — in parallel, next
+  → #11 CPU-bound interrupt handler (soak-blocker, NON-cuttable)
+  → #12 spike re-verify → #9 loop-thread-panic → 7900 soak
+  → #6 delete sync path + console on coroutine path

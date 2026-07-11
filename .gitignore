@@ -17,3 +17,11 @@ Thumbs.db
 # Test artifacts
 *.duckdb
 *.duckdb.wal
+
+# Profiling / scratch artifacts (never commit — the soak's perf captures land here)
+perf.data
+perf.data.old
+*.svg
+flamegraph*.svg
+/scratchpad/
+/.claude/

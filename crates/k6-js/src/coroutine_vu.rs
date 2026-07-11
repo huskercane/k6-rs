@@ -46,6 +46,42 @@ pub(crate) enum IterationOutcome {
     Errored { message: String },
 }
 
+/// Everything a coroutine VU needs to run a user script beyond the k6 API: the
+/// source plus the per-run script environment (`__ENV`), the `setup()` result
+/// (`__k6_setup_data`), and which exported function to call each iteration
+/// (`exec`, default `__k6_default`). Cloned per VU across loop threads (all `Send`).
+#[derive(Clone, Default)]
+pub struct VuSpec {
+    pub script: String,
+    pub env: Vec<(String, String)>,
+    /// JSON-serialized `setup()` return value, or `None`.
+    pub setup_data: Option<String>,
+    /// Named exported function to run each iteration; `None` = the default export.
+    pub exec_fn: Option<String>,
+}
+
+impl VuSpec {
+    /// A spec with just a script — empty env, no setup data, default export.
+    pub fn script(script: impl Into<String>) -> Self {
+        Self {
+            script: script.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<String> for VuSpec {
+    fn from(script: String) -> Self {
+        Self::script(script)
+    }
+}
+
+impl From<&str> for VuSpec {
+    fn from(script: &str) -> Self {
+        Self::script(script)
+    }
+}
+
 /// Bootstrap the k6 API surface into the coroutine's context — ONCE per VU. Only
 /// modules that fit the yield model (or need no I/O) go here: the dependency-free
 /// APIs (all `&Ctx`, no `block_on`), yielding http (jar + `__wrap_response`),
@@ -58,7 +94,27 @@ fn bootstrap_api(
     yp: YielderPtr,
     shared: Shared,
     metrics: Option<BuiltinMetrics>,
+    spec: &VuSpec,
+    vu_id: usize,
 ) -> Result<()> {
+    // Execution-context globals the user script reads: __VU (this VU's id), __ITER
+    // (updated per iteration), __ENV (the run environment), and __k6_setup_data
+    // (the setup() result). Parity with the sync VU (`vu.rs`).
+    let globals = ctx.globals();
+    globals.set("__VU", vu_id as u32)?;
+    globals.set("__ITER", 0i32)?;
+    let env_obj = rquickjs::Object::new(ctx.clone())?;
+    for (k, v) in &spec.env {
+        env_obj.set(k.as_str(), v.as_str())?;
+    }
+    globals.set("__ENV", env_obj)?;
+    if let Some(json) = &spec.setup_data {
+        // Set the raw JSON as a string global, then parse it in JS — avoids the
+        // quote-escaping fragility of interpolating JSON into a source string.
+        globals.set("__k6_setup_data_json", json.as_str())?;
+        ctx.eval::<(), _>("globalThis.__k6_setup_data = JSON.parse(__k6_setup_data_json);")?;
+    }
+
     // console is OBSERVABILITY — richer output capture folds into #6 with the
     // logger; a no-op stub is a safe defer.
     ctx.eval::<(), _>(
@@ -97,17 +153,32 @@ fn bootstrap_api(
     Ok(())
 }
 
-/// Build a long-lived coroutine VU for `script`. Bootstrap runs once; each
-/// `RunNext` calls the default fn (the sync body yields for `http.get`), drives
-/// the JS event loop to drained, then parks at `IterationBoundary`. The last
-/// iteration's return value is published to `result`.
+/// Build a long-lived coroutine VU for `script` with default env/setup/exec — a
+/// thin shim over [`build_coroutine_vu_spec`] used by tests and simple callers.
 pub(crate) fn build_coroutine_vu(
     script: String,
     shared: Shared,
     metrics: Option<BuiltinMetrics>,
     result: Rc<RefCell<Option<IterationOutcome>>>,
 ) -> VuCoroutine {
-    let prepared = prepare_script(&script);
+    build_coroutine_vu_spec(VuSpec::script(script), 0, shared, metrics, result)
+}
+
+/// Build a long-lived coroutine VU from a full [`VuSpec`]. Bootstrap runs once
+/// (installs the k6 API + __VU/__ENV/setup data, then evaluates the user script);
+/// each `RunNext` calls the configured `exec` function (the sync body yields for
+/// `http.get`), drives the JS event loop to drained, then parks at
+/// `IterationBoundary`. The last iteration's return value is published to `result`.
+pub(crate) fn build_coroutine_vu_spec(
+    spec: VuSpec,
+    vu_id: usize,
+    shared: Shared,
+    metrics: Option<BuiltinMetrics>,
+    result: Rc<RefCell<Option<IterationOutcome>>>,
+) -> VuCoroutine {
+    let prepared = prepare_script(&spec.script);
+    // The exported function to run each iteration; default export otherwise.
+    let exec_name = spec.exec_fn.clone().unwrap_or_else(|| "__k6_default".to_string());
     let stack = DefaultStack::new(COROUTINE_STACK_SIZE).expect("allocate coroutine stack");
     Coroutine::with_stack(stack, move |yielder: &Yielder<Resume, Yield>, first: Resume| {
         let yp = YielderPtr::new(yielder);
@@ -115,9 +186,10 @@ pub(crate) fn build_coroutine_vu(
         let ctx = runtime::create_context(&rt).expect("ctx");
 
         // --- bootstrap ONCE: real yielding http (jar + __wrap_response) + the
-        // user module scope (defines __k6_default). Real API surface grows here.
+        // user module scope (defines the exports). Real API surface grows here.
         ctx.with(|ctx| {
-            bootstrap_api(&ctx, yp, shared.clone(), metrics.clone()).expect("bootstrap k6 API");
+            bootstrap_api(&ctx, yp, shared.clone(), metrics.clone(), &spec, vu_id)
+                .expect("bootstrap k6 API");
             ctx.eval::<(), _>(
                 "globalThis.__resolvers = {}; globalThis.__done = false; globalThis.__ret = '';",
             )
@@ -125,15 +197,26 @@ pub(crate) fn build_coroutine_vu(
             if let Err(e) = ctx.eval::<(), _>(prepared.as_bytes()) {
                 eprintln!("[coroutine_vu] script init error: {e:?}");
             }
+            // Resolve the exec function ONCE (after the script defines it) so the
+            // per-iteration body is a fixed string (no re-parse). Falls back to the
+            // default export if the named function is missing.
+            globals_set_exec(&ctx, &exec_name);
         });
 
         // --- long-lived iteration loop (bootstrap persists; per-iteration driver
         // state reset each pass; per-iteration catch boundary).
         let mut sig = first;
+        let mut iter_index = 0u32;
         loop {
             if matches!(sig, Resume::Stop) {
                 break;
             }
+
+            // __ITER = this iteration's 0-based index (parity with the sync VU).
+            // Set via globals (no eval/parse) each iteration.
+            ctx.with(|ctx| {
+                let _ = ctx.globals().set("__ITER", iter_index);
+            });
 
             {
                 let mut s = shared.0.borrow_mut();
@@ -164,9 +247,11 @@ pub(crate) fn build_coroutine_vu(
                     "globalThis.__done=false; globalThis.__ret=''; globalThis.__err='';
                      globalThis.__failed=false; globalThis.__resolvers={};",
                 );
+                // Call the resolved exec fn with the setup() data. Fixed string —
+                // `__k6_exec` was bound once at bootstrap (no per-iteration parse).
                 let _ = ctx.eval::<(), _>(
                     r#"Promise.resolve((async function () {
-                           return (typeof __k6_default === 'function') ? __k6_default() : undefined;
+                           return (typeof __k6_exec === 'function') ? __k6_exec(globalThis.__k6_setup_data) : undefined;
                        })()).then(
                            function (v) { globalThis.__ret = String(v); globalThis.__done = true; },
                            function (e) { globalThis.__err = String(e); globalThis.__failed = true; globalThis.__done = true; });"#,
@@ -251,9 +336,22 @@ pub(crate) fn build_coroutine_vu(
                 *result.borrow_mut() = Some(outcome);
             });
 
+            iter_index += 1;
             sig = yp.suspend(Yield::IterationBoundary);
         }
     })
+}
+
+/// Bind `globalThis.__k6_exec` to the exec function once (after the script has
+/// defined its exports), so the per-iteration body needn't re-resolve or re-parse.
+/// Falls back to the default export (`__k6_default`) if the named function is
+/// absent, matching the sync VU's "default when unspecified" behavior.
+fn globals_set_exec(ctx: &rquickjs::Ctx<'_>, exec_name: &str) {
+    let _ = ctx.globals().set("__k6_exec_name", exec_name);
+    let _ = ctx.eval::<(), _>(
+        "globalThis.__k6_exec = (typeof globalThis[__k6_exec_name] === 'function') \
+             ? globalThis[__k6_exec_name] : globalThis.__k6_default;",
+    );
 }
 
 #[cfg(test)]
@@ -847,6 +945,41 @@ mod tests {
             out,
             Some(IterationOutcome::Completed { value: "hello-ws:200".into() }),
             "outer socket loop delivered the message AND the inner http.get (nested yield) completed"
+        );
+    }
+
+    /// 5a feature parity: a full `VuSpec` wires __ENV, the setup() data, a NAMED
+    /// exec function, __VU (the id passed to `build_coroutine_vu_spec`), and __ITER
+    /// (advancing per iteration). Runs 2 iterations as VU 7; the last returns
+    /// "BASE:token:__VU:__ITER" = "http://x:abc:7:1".
+    #[test]
+    fn vu_spec_wires_env_setup_named_exec_vu_and_iter() {
+        let spec = VuSpec {
+            script: r#"
+                export function myScenario(data) {
+                    return __ENV.BASE + ':' + data.token + ':' + __VU + ':' + __ITER;
+                }
+            "#
+            .to_string(),
+            env: vec![("BASE".to_string(), "http://x".to_string())],
+            setup_data: Some(r#"{"token":"abc"}"#.to_string()),
+            exec_fn: Some("myScenario".to_string()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = LocalSet::new().block_on(&rt, async {
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu_spec(spec, 7, shared.clone(), None, result.clone());
+            spawn_vu(coro, shared, Arc::new(NoHttp), Backpressure::new(4), |n| n < 2)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "http://x:abc:7:1".into() }),
+            "env + setup data + named exec + __VU + __ITER all wired"
         );
     }
 

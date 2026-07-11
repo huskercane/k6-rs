@@ -41,7 +41,7 @@ use k6_core::executor::vu_ramp::VuRampSchedule;
 use k6_core::metrics::BuiltinMetrics;
 use k6_core::traits::{HttpClient, RunSummary};
 
-use crate::coroutine_vu::{IterationOutcome, build_coroutine_vu};
+use crate::coroutine_vu::{IterationOutcome, VuSpec, build_coroutine_vu_spec};
 use crate::vu_sched::{HardStop, IterationControl, Shared, spawn_vu_hard};
 
 /// Max wait for VUs to report their initial idle at arrival-rate startup before
@@ -65,7 +65,7 @@ fn loop_thread_count(num_vus: usize) -> usize {
 /// thread until every VU has stopped at an `IterationBoundary` (graceful stop);
 /// call it from a blocking context (e.g. `spawn_blocking`) off the async executor.
 pub fn run_constant_vus<C>(
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     duration: Duration,
     client: Arc<C>,
@@ -79,7 +79,7 @@ where
 {
     run_constant_vus_on(
         loop_thread_count(num_vus),
-        script,
+        spec,
         num_vus,
         duration,
         client,
@@ -96,7 +96,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_constant_vus_on<C>(
     num_threads: usize,
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     duration: Duration,
     client: Arc<C>,
@@ -108,6 +108,7 @@ fn run_constant_vus_on<C>(
 where
     C: HttpClient + 'static,
 {
+    let spec = spec.into();
     let start = Instant::now();
     let deadline = start + duration;
     let completed = Arc::new(AtomicU64::new(0));
@@ -140,7 +141,7 @@ where
     // force_unwound and the join can't hang.
     let watchdog =
         spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
+    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
     watchdog.finish();
 
     RunSummary {
@@ -181,7 +182,7 @@ fn tally_outcome(
 fn run_vus_on_loops<C, F, K>(
     num_threads: usize,
     num_vus: usize,
-    script: String,
+    spec: VuSpec,
     client: Arc<C>,
     bp: Backpressure,
     metrics: BuiltinMetrics,
@@ -201,7 +202,7 @@ fn run_vus_on_loops<C, F, K>(
         if my_ids.is_empty() {
             continue;
         }
-        let script = script.clone();
+        let spec = spec.clone();
         let client = Arc::clone(&client);
         let bp = bp.clone();
         let metrics = metrics.clone();
@@ -223,8 +224,9 @@ fn run_vus_on_loops<C, F, K>(
                             // Per-VU outcome cell: the coroutine writes the last
                             // iteration's outcome, the control reads it (same thread).
                             let result = Rc::new(RefCell::new(None));
-                            let coro = build_coroutine_vu(
-                                script.clone(),
+                            let coro = build_coroutine_vu_spec(
+                                spec.clone(),
+                                id,
                                 shared.clone(),
                                 Some(metrics.clone()),
                                 result.clone(),
@@ -257,7 +259,7 @@ fn run_vus_on_loops<C, F, K>(
 /// those that ran). Reuses the VU-count spawn skeleton with a capped control.
 #[allow(clippy::too_many_arguments)]
 pub fn run_per_vu_iterations<C>(
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     iterations_per_vu: u32,
     max_duration: Duration,
@@ -270,6 +272,7 @@ pub fn run_per_vu_iterations<C>(
 where
     C: HttpClient + 'static,
 {
+    let spec = spec.into();
     let num_threads = loop_thread_count(num_vus);
     if num_threads == 0 {
         return RunSummary::default();
@@ -302,7 +305,7 @@ where
 
     let watchdog =
         spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
+    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
     watchdog.finish();
 
     let c = completed.load(Ordering::Relaxed);
@@ -325,7 +328,7 @@ where
 /// spawn skeleton with a budget-claiming control.
 #[allow(clippy::too_many_arguments)]
 pub fn run_shared_iterations<C>(
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     total_iterations: u32,
     max_duration: Duration,
@@ -338,6 +341,7 @@ pub fn run_shared_iterations<C>(
 where
     C: HttpClient + 'static,
 {
+    let spec = spec.into();
     let num_threads = loop_thread_count(num_vus);
     if num_threads == 0 {
         return RunSummary::default();
@@ -392,7 +396,7 @@ where
 
     let watchdog =
         spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, script, client, bp, metrics, hard.clone(), make_control);
+    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
     watchdog.finish();
 
     let c = completed.load(Ordering::Relaxed);
@@ -447,7 +451,7 @@ impl IterationControl for RampingControl {
 /// VU is force_unwound by the watchdog.
 #[allow(clippy::too_many_arguments)]
 pub fn run_ramping_vus<C>(
-    script: String,
+    spec: impl Into<VuSpec>,
     max_vus: usize,
     schedule: VuRampSchedule,
     client: Arc<C>,
@@ -459,6 +463,7 @@ pub fn run_ramping_vus<C>(
 where
     C: HttpClient + 'static,
 {
+    let spec = spec.into();
     let num_threads = loop_thread_count(max_vus);
     if num_threads == 0 {
         return RunSummary::default();
@@ -511,7 +516,7 @@ where
 
     let watchdog =
         spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, max_vus, script, client, bp, metrics, hard.clone(), make_control);
+    run_vus_on_loops(num_threads, max_vus, spec, client, bp, metrics, hard.clone(), make_control);
     watchdog.finish();
     let _ = controller.join();
 
@@ -618,7 +623,7 @@ impl IterationControl for ArrivalControl {
 /// completes. Drops (an arrival with no idle VU) ARE the load-test result.
 #[allow(clippy::too_many_arguments)]
 pub fn run_arrival_rate<C>(
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     curve: ArrivalCurve,
     client: Arc<C>,
@@ -632,7 +637,7 @@ where
 {
     run_arrival_rate_on(
         loop_thread_count(num_vus),
-        script,
+        spec,
         num_vus,
         curve,
         client,
@@ -646,7 +651,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_arrival_rate_on<C>(
     num_threads: usize,
-    script: String,
+    spec: impl Into<VuSpec>,
     num_vus: usize,
     curve: ArrivalCurve,
     client: Arc<C>,
@@ -661,6 +666,7 @@ where
     if num_vus == 0 || num_threads == 0 {
         return RunSummary::default();
     }
+    let spec = spec.into();
 
     let completed = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
@@ -692,7 +698,7 @@ where
         if my_vus.is_empty() {
             continue;
         }
-        let script = script.clone();
+        let spec = spec.clone();
         let client = Arc::clone(&client);
         let bp = bp.clone();
         let metrics = metrics.clone();
@@ -704,7 +710,7 @@ where
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
                 .spawn(move || {
-                    run_arrival_loop_thread(my_vus, script, client, bp, metrics, idle_tx, completed, errored, hard)
+                    run_arrival_loop_thread(my_vus, spec, client, bp, metrics, idle_tx, completed, errored, hard)
                 })
                 .expect("spawn loop thread"),
         );
@@ -788,7 +794,7 @@ fn spawn_hard_stop_watchdog(token: CancellationToken, graceful_stop: Duration) -
 #[allow(clippy::too_many_arguments)]
 fn run_arrival_loop_thread<C>(
     vus: Vec<(usize, UnboundedReceiver<()>)>,
-    script: String,
+    spec: VuSpec,
     client: Arc<C>,
     bp: Backpressure,
     metrics: BuiltinMetrics,
@@ -809,8 +815,9 @@ fn run_arrival_loop_thread<C>(
         for (id, run_next_rx) in vus {
             let shared = Shared::new();
             let result = Rc::new(RefCell::new(None));
-            let coro = build_coroutine_vu(
-                script.clone(),
+            let coro = build_coroutine_vu_spec(
+                spec.clone(),
+                id,
                 shared.clone(),
                 Some(metrics.clone()),
                 result.clone(),

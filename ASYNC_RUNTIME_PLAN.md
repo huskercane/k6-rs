@@ -1084,3 +1084,25 @@ Soak-observability watch item, tracked here — not a #12 blocker.
   quantifiable instead of grep-stderr. Fold into #6's observability wiring (add a
   degraded-VU AtomicU64 surfaced in the run summary alongside the console/logger
   cluster).
+
+### #6 — sync-path deletion (2026-07-11)
+
+- **Slice 1 (63c307c):** deleted throwaway spikes (async_spike/b2_spike/vu_loop) +
+  their features; deleted the dead async substrate (create_async_runtime/context/
+  spawn_driver + the superseded __http_request_async); dropped vu_sched's
+  transitional allow(dead_code) (removed Resume::Start, gated spawn_vu/HardStop::
+  never to #[cfg(test)]).
+- **Slice 2 (596ba57) — THE SYNC EXECUTION PATH IS GONE:** deleted the 7 sync
+  executors + vu_pool.rs; removed VirtualUser/IterationResult/Executor from traits;
+  QuickJsVu reduced to the one-shot lifecycle/eval runner (setup/teardown/
+  handleSummary) — run_iteration survives as a pub inherent eval primitive;
+  e2e.rs ported to pool::run_*; deleted the sync-path criterion bench; drive_vu
+  privatized. Workspace ZERO warnings; k6-core 185, k6-js 274(+3), e2e 3,
+  conformance 39, cli 43 green; CLI smoke works.
+
+REMAINING #6 (additive polish, oracle-neutral — NOT the deletion): (a) wire real
+console coroutine-side (currently a no-op stub in bootstrap_api — thread
+console_output through VuSpec); (b) degraded-VU COUNT surfaced in RunSummary + a
+post-run "N VUs degraded" line (fold the #9 eprintln into a HardStop.degraded
+AtomicU64); (c) grpc metrics fold-back if they gain a JS-tag/Context dep + a full
+grpc invoke tonic-fixture test.

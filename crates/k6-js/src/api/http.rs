@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rquickjs::prelude::Async;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Value};
 
 use k6_core::backpressure::Backpressure;
@@ -304,70 +303,6 @@ pub(crate) fn finish_http_response(
         }
     }
 }
-
-/// Register `__http_request_async` — the async counterpart of `__http_request`,
-/// for VUs running on an `AsyncRuntime`. Same request/response semantics, but it
-/// **awaits** the client on the VU's own loop (no `block_on`) and resolves a JS
-/// promise. Intended to back `http.asyncRequest` (and `http.batch` later).
-///
-/// Registered on an async context only: on a sync `Runtime` the returned
-/// future would never be driven (no async executor), so the promise would hang.
-///
-/// TODO(cutover): this resolves a **raw** `JsHttpResponse`. When the production
-/// `http.asyncRequest` moves onto this at the sync-blocking cutover, its JS
-/// wrapper MUST re-apply `__wrap_response` (adds `.json()`/`.html()`/`.cookies`)
-/// AND the per-VU cookie jar (inject `Cookie` on request, extract `Set-Cookie`
-/// on response) — both of which the old `Promise.resolve().then(__http.request)`
-/// stub got for free by routing through `__http.request`. Skipping them silently
-/// regresses `res.json()` and cookies on the async path. Parity bar: the
-/// existing `http_async_request_resolves_response` test asserts `res.json().ok`.
-pub fn register_async_request<C: HttpClient + 'static>(
-    ctx: &Ctx<'_>,
-    client: Arc<C>,
-    backpressure: Backpressure,
-    metrics: Option<BuiltinMetrics>,
-) -> Result<()> {
-    ctx.globals().set(
-        "__http_request_async",
-        Function::new(
-            ctx.clone(),
-            Async(
-                move |method: String,
-                      url: String,
-                      body: Value<'_>,
-                      headers_val: Value<'_>,
-                      timeout_ms: f64,
-                      tags_val: Value<'_>,
-                      response_callback_val: Value<'_>| {
-                    // Sync prep: read the JS Values into owned data up front...
-                    let req = build_http_request(&method, url, &body, &headers_val, timeout_ms);
-                    let user_tags = object_entries_to_pairs(&tags_val);
-                    let response_callback = parse_response_callback(&response_callback_val);
-                    // ...clone per-call captures so the future is 'static...
-                    let client = Arc::clone(&client);
-                    let bp = backpressure.clone();
-                    let metrics = metrics.clone();
-                    // ...then the future holds nothing borrowed from `'js`.
-                    async move {
-                        let result = {
-                            let _permit = bp.acquire().await;
-                            client.send(req).await
-                        };
-                        finish_http_response(
-                            result,
-                            &method,
-                            user_tags,
-                            &response_callback,
-                            metrics.as_ref(),
-                        )
-                    }
-                },
-            ),
-        )?,
-    )?;
-    Ok(())
-}
-
 
 /// Eval the shared `http` JS object (cookie jar, __wrap_response, request/
 /// get/post/batch/asyncRequest). Reused by BOTH the block_on `__http_request`
@@ -1523,72 +1458,6 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-
-    #[test]
-    fn async_http_request_resolves_on_async_loop() {
-        // The already-awaited http surface as a TRUE async host fn on the async
-        // VU foundation: __http_request_async awaits the client across an
-        // `.await`, driven by spawn_driver, and resolves a JS promise that
-        // `await http.asyncRequest(...)` unwraps. This is the !Send-across-await
-        // proof end-to-end on the pool-of-loops runtime.
-        //
-        // Sync http.get is intentionally NOT exercised here — it needs the B2
-        // stackful-coroutine suspension mechanism, out of this increment.
-        use crate::runtime;
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        tokio::task::LocalSet::new().block_on(&rt, async {
-            let qjs = runtime::create_async_runtime().await.unwrap();
-            let ctx = runtime::create_async_context(&qjs).await.unwrap();
-            let client = Arc::new(MockHttpClient::new(201, r#"{"ok":true}"#));
-            let bp = Backpressure::new(10);
-
-            ctx.with(|ctx| {
-                register_async_request(&ctx, client, bp, None).unwrap();
-                // Minimal asyncRequest wrapper over the async native fn — the
-                // shape the production wrapper takes once the http object moves
-                // onto the async runtime at cutover.
-                ctx.eval::<(), _>(
-                    r#"
-                    globalThis.http = {
-                        asyncRequest: function(method, url, body, params) {
-                            return __http_request_async(
-                                method, url, body || null,
-                                (params && params.headers) || {},
-                                (params && params.timeout) || 0,
-                                (params && params.tags) || null,
-                                undefined);
-                        }
-                    };
-                    "#,
-                )
-                .unwrap();
-            })
-            .await;
-
-            let driver = runtime::spawn_driver(&qjs);
-
-            let status: i32 = ctx
-                .async_with(async |ctx| {
-                    let p: rquickjs::Promise = ctx
-                        .eval(
-                            r#"http.asyncRequest('POST', 'http://example.com/api',
-                                   { a: 'a', b: 2 },
-                                   { headers: { 'X-Test': '1' } })
-                               .then(r => r.status)"#,
-                        )
-                        .unwrap();
-                    p.into_future().await.unwrap()
-                })
-                .await;
-            assert_eq!(status, 201);
-
-            driver.abort();
-        });
     }
 
     #[tokio::test]

@@ -1022,3 +1022,26 @@ re-verify → #9 loop-thread-panic → 7900 soak → #6 delete sync path.
 
 **NEXT = #12 (spike re-verify CI gate) → #9 (loop-thread-panic undercount) → 7900
 soak → #6 (delete sync path).**
+
+### SOAK-WATCH: cooperative-scheduling tax (loop-mate starvation) — design characteristic, not a fix
+
+Sharpened from #11's "known": a spinning VU wedging its loop-mates is NOT limited
+to `while(true)`. ANY heavy SYNCHRONOUS per-iteration compute — a large
+`JSON.parse`, a crypto/hash call, a big string/regex op — blocks EVERY co-located
+VU on that loop thread for its full duration, because `drive_vu` is stuck inside
+`coro.resume()` and can't service them. This is the flip side of the fidelity win
+#13 bought (cooperative single-thread-per-loop). At 7900 VUs over ~cores loops,
+each loop hosts ~500–1000 VUs, so one 50ms heavy iteration stalls ~1000 VUs'
+progress by 50ms → **latency-tail inflation in the reported numbers**.
+
+No cheap fix (sync JS can't yield without a suspend point — the reason #11 exists;
+more loop threads = more stacks = defeats the memory budget). So: make it
+OBSERVABLE, not eliminated.
+1. **Pre-soak:** check whether the OOM-reference script has heavy synchronous
+   per-iteration compute (large-body parse, crypto, hashing). Flat http-loop ⇒
+   never bites.
+2. **During soak:** watch for latency-tail spikes that CORRELATE across VUs on the
+   SAME loop thread (vs. tracking backend behavior) — the signature of loop-mate
+   starvation vs. a real server-side tail. A per-loop-thread iteration-latency
+   histogram is worth adding if instrumenting the soak anyway.
+Soak-observability watch item, tracked here — not a #12 blocker.

@@ -908,3 +908,45 @@ all on the coroutine model. **externally-controlled** (runtime REST-API VU contr
 deferred — not used by the OOM-reference soak; slot it during the main.rs cutover
 or stub it. NEXT: main.rs cutover (wire pool.rs, retire the sync spawn_blocking
 path) + fat-frame stack measurement + 7900 soak. Pre-soak gates: tasks #9, #11, #12.
+
+### #5 slice 4 — review findings (pre-soak sequence)
+
+- **F1 (teeth, task #13):** `RampingControl` polls idle VUs on a 20 ms sleep —
+  O(idle × time) wakeups, ~400k/s at 7900-VU ramp, ~3–5% CPU/loop-thread that
+  competes with load gen and skews latency. Convert to a `watch<u32>` broadcast of
+  `desired` (wake only on ramp change). Pre-soak, after the cutover.
+- **F2 (review-only, acknowledged):** the ramping tests lock schedule-following +
+  prompt-cancel, but the active-count SHAPE (only `desired` run at peak, highest
+  indices deactivate first) is review-verified, not test-verified (`completed>0`
+  proves work, not the curve). To lock: a script recording `__VU` into a
+  timestamped shared set → assert max-concurrent-distinct ≈ peak + high-index-stops
+  -first. Low priority.
+- **F3 (cutover):** externally-controlled → a LOUD error stub ("unsupported on the
+  async runtime"), never a silent no-op, so a config using it fails visibly.
+
+**Pre-soak sequence (agreed):** cutover (with the F3 loud stub) → F1 poll→watch
+(#13) → #11 CPU-interrupt handler → #12 spike re-verify → #9 loop-thread-panic
+undercount → fat-frame stack measurement → 7900 soak.
+
+### #5 slice 5 — main.rs cutover: COROUTINE RUNTIME IS LIVE
+
+- **5a** — coroutine VU feature parity via `VuSpec { script, script_dir, env,
+  setup_data, exec_fn }`: bootstrap sets __VU/__ITER/__ENV/__k6_setup_data and
+  resolves the exec fn once (__k6_exec); the raw script is prepared WITH script_dir
+  (local imports). Threaded through the pool as `impl Into<VuSpec>` ⇒ zero test
+  churn. Console stays a stub (observability → #6).
+- **5b** — main.rs runs every scenario through `k6_js::pool::run_*` on
+  spawn_blocking (the pool owns loop threads). Four-lane summary in the CLI
+  (errored + interrupted + dropped); externally-controlled fails LOUD (F3). Sync
+  create_vus removed; obsolete 512-ceiling test retired. setup()/teardown() still
+  on the one-off sync QuickJsVu (retire at #6).
+- Smoke-validated end-to-end: __ENV, setup() data, arrival-rate four-lane
+  conservation (33 completed + 17 errored = 50 arrivals, shown in CLI), loud stub.
+  Full workspace green INCLUDING the conformance suite (diffs vs upstream k6) —
+  upstream parity holds on the coroutine runtime.
+
+**Executor cutover (task #5) COMPLETE.** Remaining before the 7900 soak (all
+tracked): F1 poll→watch (#13) → #11 CPU-interrupt handler → #12 spike re-verify →
+#9 loop-thread-panic undercount → fat-frame stack measurement → soak. Then #6
+(delete the sync path: QuickJsVu/sync executors/vu_pool/setup-teardown-on-sync,
++ console on the coroutine path).

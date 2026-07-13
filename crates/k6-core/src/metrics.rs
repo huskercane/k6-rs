@@ -639,11 +639,20 @@ impl MetricsRegistry {
     pub fn counter_add(&self, name: &str, value: u64) {
         {
             let mut counters = self.counters.lock().unwrap();
-            counters
-                .entry(name.to_string())
-                .or_insert_with(CounterMetric::new)
-                .value
-                .fetch_add(value, Ordering::Relaxed);
+            // Get-first: after warmup the key already exists, so the common path
+            // is a borrowed &str lookup with NO owned-String allocation. Only the
+            // first sample for a given (name, tags) pays the `to_string()` insert.
+            // This is the per-request hot path — a load test hammering one
+            // endpoint hits the `get` arm on every request but the first.
+            if let Some(c) = counters.get(name) {
+                c.value.fetch_add(value, Ordering::Relaxed);
+            } else {
+                counters
+                    .entry(name.to_string())
+                    .or_insert_with(CounterMetric::new)
+                    .value
+                    .fetch_add(value, Ordering::Relaxed);
+            }
         }
         self.emit_to_sink(MetricKind::Counter, name, value as f64);
     }
@@ -670,14 +679,20 @@ impl MetricsRegistry {
     pub fn gauge_set(&self, name: &str, value: f64) {
         {
             let mut gauges = self.gauges.lock().unwrap();
-            let gauge = gauges
-                .entry(name.to_string())
-                .or_insert_with(GaugeMetric::new);
-
             let bits = value.to_bits();
-            gauge.value.store(bits, Ordering::Relaxed);
-            gauge.min.fetch_min(bits, Ordering::Relaxed);
-            gauge.max.fetch_max(bits, Ordering::Relaxed);
+            // Get-first (see counter_add): borrowed lookup on the warm path.
+            if let Some(gauge) = gauges.get(name) {
+                gauge.value.store(bits, Ordering::Relaxed);
+                gauge.min.fetch_min(bits, Ordering::Relaxed);
+                gauge.max.fetch_max(bits, Ordering::Relaxed);
+            } else {
+                let gauge = gauges
+                    .entry(name.to_string())
+                    .or_insert_with(GaugeMetric::new);
+                gauge.value.store(bits, Ordering::Relaxed);
+                gauge.min.fetch_min(bits, Ordering::Relaxed);
+                gauge.max.fetch_max(bits, Ordering::Relaxed);
+            }
         }
         self.emit_to_sink(MetricKind::Gauge, name, value);
     }
@@ -695,13 +710,23 @@ impl MetricsRegistry {
     pub fn rate_add(&self, name: &str, passed: bool) {
         {
             let mut rates = self.rates.lock().unwrap();
-            let rate = rates
-                .entry(name.to_string())
-                .or_insert_with(RateMetric::new);
-
-            rate.total.fetch_add(1, Ordering::Relaxed);
-            if passed {
-                rate.passes.fetch_add(1, Ordering::Relaxed);
+            // Get-first (see counter_add): borrowed lookup on the warm path, only
+            // the first sample for this key allocates an owned String on insert.
+            // Kept in confined if/else (not a match returning the ref) so the
+            // immutable `get` borrow can't escape into the insert branch.
+            if let Some(rate) = rates.get(name) {
+                rate.total.fetch_add(1, Ordering::Relaxed);
+                if passed {
+                    rate.passes.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                let rate = rates
+                    .entry(name.to_string())
+                    .or_insert_with(RateMetric::new);
+                rate.total.fetch_add(1, Ordering::Relaxed);
+                if passed {
+                    rate.passes.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // Wire-format value: 1.0 if the tracked event occurred, 0.0 otherwise.
@@ -737,10 +762,16 @@ impl MetricsRegistry {
     pub fn trend_add(&self, name: &str, value_ms: f64) {
         {
             let mut trends = self.trends.lock().unwrap();
-            trends
-                .entry(name.to_string())
-                .or_insert_with(TrendMetric::new)
-                .record(value_ms);
+            // Get-first via get_mut (record needs &mut): borrowed &str lookup on
+            // the warm path, owned-String insert only on the first sample.
+            if let Some(t) = trends.get_mut(name) {
+                t.record(value_ms);
+            } else {
+                trends
+                    .entry(name.to_string())
+                    .or_insert_with(TrendMetric::new)
+                    .record(value_ms);
+            }
         }
         self.emit_to_sink(MetricKind::Trend, name, value_ms);
     }

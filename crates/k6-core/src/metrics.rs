@@ -271,6 +271,16 @@ fn canonical_key(name: &str, suffix: &str) -> String {
     }
 }
 
+/// [`canonical_key`] written into a REUSED buffer instead of a fresh String —
+/// for the http hot path, which builds 9 keys off one suffix per request.
+/// Clears `buf` and writes `name` then `suffix`; byte-identical to
+/// `canonical_key(name, suffix)`.
+fn write_canonical_key(buf: &mut String, name: &str, suffix: &str) {
+    buf.clear();
+    buf.push_str(name);
+    buf.push_str(suffix);
+}
+
 /// A monotonically increasing counter (e.g., http_reqs, iterations, data_sent).
 #[derive(Debug)]
 pub struct CounterMetric {
@@ -1123,32 +1133,36 @@ impl BuiltinMetrics {
         // the tag string per metric (the per-request allocation hotspot).
         let suffix = canonical_tag_suffix(tags);
         let reg = &self.registry;
+        // ONE reused key buffer for all 9 metrics instead of a fresh
+        // canonical_key() String each — amortized zero allocation after it
+        // grows once (the longest name + suffix).
+        let mut key = String::with_capacity(24 + suffix.len());
 
-        reg.counter_add(&canonical_key("http_reqs", &suffix), 1);
+        write_canonical_key(&mut key, "http_reqs", &suffix);
+        reg.counter_add(&key, 1);
         // Upstream k6 semantic for http_req_failed: record the failure bool
         // directly. `passes` in the summary then = count of failed requests,
         // `fails` = count of non-failed, `rate` = failed/total (the failure
         // rate). Reversing this (recording !failed) inverts the rate and swaps
         // the passes/fails fields in --summary-export, breaking parity.
         if let Some(failed) = failed {
-            reg.rate_add(&canonical_key("http_req_failed", &suffix), failed);
+            write_canonical_key(&mut key, "http_req_failed", &suffix);
+            reg.rate_add(&key, failed);
         }
-        reg.trend_add(&canonical_key("http_req_duration", &suffix), timings.duration);
-        reg.trend_add(&canonical_key("http_req_blocked", &suffix), timings.blocked);
-        reg.trend_add(
-            &canonical_key("http_req_connecting", &suffix),
-            timings.connecting,
-        );
-        reg.trend_add(
-            &canonical_key("http_req_tls_handshaking", &suffix),
-            timings.tls_handshaking,
-        );
-        reg.trend_add(&canonical_key("http_req_sending", &suffix), timings.sending);
-        reg.trend_add(&canonical_key("http_req_waiting", &suffix), timings.waiting);
-        reg.trend_add(
-            &canonical_key("http_req_receiving", &suffix),
-            timings.receiving,
-        );
+        write_canonical_key(&mut key, "http_req_duration", &suffix);
+        reg.trend_add(&key, timings.duration);
+        write_canonical_key(&mut key, "http_req_blocked", &suffix);
+        reg.trend_add(&key, timings.blocked);
+        write_canonical_key(&mut key, "http_req_connecting", &suffix);
+        reg.trend_add(&key, timings.connecting);
+        write_canonical_key(&mut key, "http_req_tls_handshaking", &suffix);
+        reg.trend_add(&key, timings.tls_handshaking);
+        write_canonical_key(&mut key, "http_req_sending", &suffix);
+        reg.trend_add(&key, timings.sending);
+        write_canonical_key(&mut key, "http_req_waiting", &suffix);
+        reg.trend_add(&key, timings.waiting);
+        write_canonical_key(&mut key, "http_req_receiving", &suffix);
+        reg.trend_add(&key, timings.receiving);
     }
 
     // --- Network metrics ---

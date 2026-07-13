@@ -226,11 +226,39 @@ fn canonical_tag_suffix(tags: &[(String, String)]) -> String {
     if tags.is_empty() {
         return String::new();
     }
-    // Borrowed keys/values: no per-tag String clone. BTreeMap gives the same
-    // alphabetical order and last-wins dedup as the original owned map.
-    let map: BTreeMap<&str, &str> = tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let inner: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{v}")).collect();
-    format!("{{{}}}", inner.join(","))
+    // Single-pass build: one Vec for the sort + one output String, instead of a
+    // BTreeMap (node-per-tag) + a Vec<String> (format-per-tag) + join + format.
+    // This is the per-request hot path — a request records 9 tagged metrics off
+    // this one suffix, so trimming its allocation count is a first-order win.
+    //
+    // A STABLE sort by key preserves input order within equal keys, so emitting
+    // only the LAST element of each equal-key run reproduces the original
+    // BTreeMap's last-wins dedup byte-for-byte (locked by
+    // `canonical_key_matches_selector_output`).
+    let mut sorted: Vec<(&str, &str)> =
+        tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    // Pre-size: braces + each `k:v` + separating commas.
+    let cap = 2 + sorted.iter().map(|(k, v)| k.len() + v.len() + 2).sum::<usize>();
+    let mut out = String::with_capacity(cap);
+    out.push('{');
+    let mut first = true;
+    for (i, (k, v)) in sorted.iter().enumerate() {
+        // Skip this pair if a later pair shares the key (last-wins).
+        if i + 1 < sorted.len() && sorted[i + 1].0 == *k {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push(':');
+        out.push_str(v);
+        first = false;
+    }
+    out.push('}');
+    out
 }
 
 /// Append a precomputed canonical tag suffix to a metric name. `suffix` must
@@ -1164,6 +1192,7 @@ mod tests {
             &[("status", "200"), ("method", "GET")], // input not alphabetical
             &[("z", "1"), ("a", "2"), ("m", "3")],   // reordered
             &[("k", "v1"), ("k", "v2")],             // duplicate key: last wins
+            &[("b", "1"), ("a", "2"), ("b", "3")],   // dup key non-adjacent in input: last wins after sort
         ];
         for case in cases {
             let tags: Vec<(String, String)> = case

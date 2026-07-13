@@ -153,6 +153,9 @@ Run the script under `perf` and render the flame graph:
 perf record -F 997 -g --call-graph fp -o /tmp/k6rs.perf -- \
   target/release/k6-rs run profiling/bench.js
 
+perf record -F 997 -g --call-graph fp -o /tmp/k6rs-1000vu.perf -- \
+  target/release/k6-rs run --vus 1000 --duration 60s profiling/bench.js
+
 ~/.cargo/bin/flamegraph \
   --perfdata /tmp/k6rs.perf \
   --title 'k6-rs run: profiling/bench.js' \

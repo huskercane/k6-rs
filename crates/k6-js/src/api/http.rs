@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use rquickjs::{Array, Ctx, Function, IntoJs, Object, Value};
+use rquickjs::{Array, Atom, Ctx, Function, IntoJs, JsLifetime, Object, Value};
 
 use k6_core::backpressure::Backpressure;
 use k6_core::metrics::BuiltinMetrics;
@@ -41,17 +41,98 @@ pub(crate) struct JsHttpResponse {
     error_code: u32,
 }
 
+/// Per-context cache of the fixed property-name atoms used to build every HTTP
+/// response object. QuickJS interns each string key into an atom on `set`; done
+/// naively that is a hash-table probe (`__JS_FindAtom`/`JS_NewAtomLen`) per key
+/// per request — ~5% of CPU on the http hot path in profiling. Interning the 14
+/// fixed keys ONCE per context and reusing the atoms turns each key write into a
+/// cheap refcount bump (`Atom::clone` = `JS_DupAtom`) instead.
+///
+/// Stored in the context userdata, mirroring rquickjs's own
+/// `IteratorPrototypeCache` pattern. The atoms live as long as the context, so
+/// the cache is built lazily on the first response and reused for the rest of
+/// the test.
+struct HttpResponseAtoms<'js> {
+    status: Atom<'js>,
+    body: Atom<'js>,
+    headers: Atom<'js>,
+    url: Atom<'js>,
+    timings: Atom<'js>,
+    error: Atom<'js>,
+    error_code: Atom<'js>,
+    t_blocked: Atom<'js>,
+    t_connecting: Atom<'js>,
+    t_tls_handshaking: Atom<'js>,
+    t_sending: Atom<'js>,
+    t_waiting: Atom<'js>,
+    t_receiving: Atom<'js>,
+    t_duration: Atom<'js>,
+}
+
+// SAFETY: the only lifetime `HttpResponseAtoms` carries is the QuickJS `'js`
+// context lifetime (every field is an `Atom<'js>`), so re-parameterising it to a
+// different context lifetime is sound — exactly the guarantee `JsLifetime`
+// encodes. Mirrors `IteratorPrototypeCache`'s impl in rquickjs itself.
+unsafe impl<'js> JsLifetime<'js> for HttpResponseAtoms<'js> {
+    type Changed<'to> = HttpResponseAtoms<'to>;
+}
+
+impl<'js> HttpResponseAtoms<'js> {
+    fn new(ctx: &Ctx<'js>) -> rquickjs::Result<Self> {
+        Ok(Self {
+            status: Atom::from_str(ctx.clone(), "status")?,
+            body: Atom::from_str(ctx.clone(), "body")?,
+            headers: Atom::from_str(ctx.clone(), "headers")?,
+            url: Atom::from_str(ctx.clone(), "url")?,
+            timings: Atom::from_str(ctx.clone(), "timings")?,
+            error: Atom::from_str(ctx.clone(), "error")?,
+            error_code: Atom::from_str(ctx.clone(), "error_code")?,
+            t_blocked: Atom::from_str(ctx.clone(), "blocked")?,
+            t_connecting: Atom::from_str(ctx.clone(), "connecting")?,
+            t_tls_handshaking: Atom::from_str(ctx.clone(), "tls_handshaking")?,
+            t_sending: Atom::from_str(ctx.clone(), "sending")?,
+            t_waiting: Atom::from_str(ctx.clone(), "waiting")?,
+            t_receiving: Atom::from_str(ctx.clone(), "receiving")?,
+            t_duration: Atom::from_str(ctx.clone(), "duration")?,
+        })
+    }
+}
+
+/// Ensure the per-context response-atom cache exists, then run `f` with a borrow
+/// of it. The cache is built once per context; `store_userdata` can't run while
+/// a `userdata` guard is live, so we build-then-store before taking the guard.
+fn with_response_atoms<'js, R>(
+    ctx: &Ctx<'js>,
+    f: impl FnOnce(&HttpResponseAtoms<'js>) -> rquickjs::Result<R>,
+) -> rquickjs::Result<R> {
+    if ctx.userdata::<HttpResponseAtoms>().is_none() {
+        let atoms = HttpResponseAtoms::new(ctx)?;
+        // A QuickJS context is single-threaded, so no other path can have raced
+        // us to store it between the check and here; ignore the returned slot.
+        let _ = ctx.store_userdata(atoms);
+    }
+    let guard = ctx
+        .userdata::<HttpResponseAtoms>()
+        .expect("response atoms just stored");
+    f(&guard)
+}
+
 impl<'js> IntoJs<'js> for JsHttpResponse {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let obj = Object::new(ctx.clone())?;
 
-        obj.set("status", self.status)?;
-        obj.set("body", self.body)?;
-        obj.set("headers", build_headers_obj(ctx, &self.headers)?)?;
-        obj.set("url", self.url)?;
-        obj.set("timings", build_timings_obj(ctx, &self.timings)?)?;
-        obj.set("error", self.error)?;
-        obj.set("error_code", self.error_code)?;
+        with_response_atoms(ctx, |a| {
+            // `Atom::clone` is a refcount bump (`JS_DupAtom`); `set` consumes and
+            // frees that reference, leaving the cached atom's own ref intact.
+            obj.set(a.status.clone(), self.status)?;
+            obj.set(a.body.clone(), self.body)?;
+            obj.set(a.headers.clone(), build_headers_obj(ctx, &self.headers)?)?;
+            obj.set(a.url.clone(), self.url)?;
+            obj.set(a.timings.clone(), build_timings_obj(ctx, a, &self.timings)?)?;
+            obj.set(a.error.clone(), self.error)?;
+            obj.set(a.error_code.clone(), self.error_code)?;
+            Ok(())
+        })?;
 
         Ok(obj.into_value())
     }
@@ -821,41 +902,60 @@ pub(crate) fn object_entries_to_pairs(value: &Value<'_>) -> Vec<(String, String)
 }
 
 /// Build a native JS object for response headers, coalescing duplicates into arrays.
+///
+/// Header names arrive already lowercased — the `http` crate stores `HeaderName`
+/// in lowercase and `hyper_client` builds this Vec straight off it — so no
+/// per-key `to_lowercase()` allocation is needed. Duplicates are coalesced in
+/// Rust with a single pass (plus a short backward scan to skip keys already
+/// emitted), so each distinct name costs exactly one JS property write instead
+/// of the old get-before-set probe on every header. The scan is O(n²) in the
+/// header count, but that count is tiny (tens at most) and the comparisons are
+/// on short `&str`s — far cheaper than the JS `get` it replaces, and it keeps
+/// the common all-unique path allocation-free.
 fn build_headers_obj<'js>(
     ctx: &Ctx<'js>,
     headers: &[(String, String)],
 ) -> rquickjs::Result<Object<'js>> {
     let obj = Object::new(ctx.clone())?;
 
-    for (k, v) in headers {
-        let key = k.to_lowercase();
-        let existing: Value<'js> = obj.get(&*key)?;
-        if existing.is_undefined() {
-            obj.set(&*key, v.as_str())?;
-        } else if existing.is_array() {
-            let arr: rquickjs::Array<'js> = existing.into_array().unwrap();
-            arr.set(arr.len(), v.as_str())?;
+    for (i, (k, v)) in headers.iter().enumerate() {
+        // Already emitted (with all its values) when its first occurrence ran.
+        if headers[..i].iter().any(|(pk, _)| pk == k) {
+            continue;
+        }
+        // Values for this key: this one plus any later duplicates, in order.
+        let mut dups = headers[i + 1..].iter().filter(|(nk, _)| nk == k);
+        if let Some((_, first_dup)) = dups.next() {
+            let arr = Array::new(ctx.clone())?;
+            arr.set(0, v.as_str())?;
+            arr.set(1, first_dup.as_str())?;
+            for (idx, (_, dv)) in dups.enumerate() {
+                arr.set(idx + 2, dv.as_str())?;
+            }
+            obj.set(k.as_str(), arr)?;
         } else {
-            let arr = rquickjs::Array::new(ctx.clone())?;
-            arr.set(0, existing)?;
-            arr.set(1, v.as_str())?;
-            obj.set(&*key, arr)?;
+            obj.set(k.as_str(), v.as_str())?;
         }
     }
 
     Ok(obj)
 }
 
-/// Build a native JS object for HTTP timings.
-fn build_timings_obj<'js>(ctx: &Ctx<'js>, timings: &Timings) -> rquickjs::Result<Object<'js>> {
+/// Build a native JS object for HTTP timings, using the pre-interned property
+/// atoms from the per-context cache (see [`HttpResponseAtoms`]).
+fn build_timings_obj<'js>(
+    ctx: &Ctx<'js>,
+    atoms: &HttpResponseAtoms<'js>,
+    timings: &Timings,
+) -> rquickjs::Result<Object<'js>> {
     let obj = Object::new(ctx.clone())?;
-    obj.set("blocked", timings.blocked)?;
-    obj.set("connecting", timings.connecting)?;
-    obj.set("tls_handshaking", timings.tls_handshaking)?;
-    obj.set("sending", timings.sending)?;
-    obj.set("waiting", timings.waiting)?;
-    obj.set("receiving", timings.receiving)?;
-    obj.set("duration", timings.duration)?;
+    obj.set(atoms.t_blocked.clone(), timings.blocked)?;
+    obj.set(atoms.t_connecting.clone(), timings.connecting)?;
+    obj.set(atoms.t_tls_handshaking.clone(), timings.tls_handshaking)?;
+    obj.set(atoms.t_sending.clone(), timings.sending)?;
+    obj.set(atoms.t_waiting.clone(), timings.waiting)?;
+    obj.set(atoms.t_receiving.clone(), timings.receiving)?;
+    obj.set(atoms.t_duration.clone(), timings.duration)?;
     Ok(obj)
 }
 
@@ -1974,5 +2074,117 @@ mod tests {
             !falses.is_empty(),
             "transport-error path must attach expected_response:false"
         );
+    }
+
+    // --- Response object construction (perf hot path) regression locks ---
+    //
+    // `into_js` was rewritten to (a) intern the fixed property-name atoms once
+    // per context and reuse them, and (b) coalesce duplicate headers in Rust
+    // instead of a get-before-set JS probe. These lock the OBSERVABLE response
+    // shape so those optimizations can't silently drift the JS-visible object.
+
+    #[tokio::test]
+    async fn response_headers_unique_are_scalars_and_duplicates_become_ordered_arrays() {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            // Returns content-type once and set-cookie twice, in this order.
+            let client = Arc::new(MockHttpClientWithCookies::new(
+                200,
+                "",
+                vec!["session=abc123", "token=xyz"],
+            ));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let ok: bool = ctx
+                    .eval(
+                        r#"
+                        const h = http.get('http://mock.test').headers;
+                        // Unique header -> scalar string.
+                        (h['content-type'] === 'application/json') &&
+                        // Duplicated header -> array preserving arrival order.
+                        Array.isArray(h['set-cookie']) &&
+                        h['set-cookie'].length === 2 &&
+                        h['set-cookie'][0] === 'session=abc123' &&
+                        h['set-cookie'][1] === 'token=xyz'
+                    "#,
+                    )
+                    .unwrap();
+                assert!(ok, "header coalescing / scalar shape drifted");
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_timings_object_carries_all_seven_fields() {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            // MockHttpClient timings: duration 50, waiting 45, receiving 5, rest 0.
+            let client = Arc::new(MockHttpClient::new(200, ""));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let ok: bool = ctx
+                    .eval(
+                        r#"
+                        const t = http.get('http://example.com').timings;
+                        t.blocked === 0 && t.connecting === 0 &&
+                        t.tls_handshaking === 0 && t.sending === 0 &&
+                        t.waiting === 45 && t.receiving === 5 && t.duration === 50
+                    "#,
+                    )
+                    .unwrap();
+                assert!(ok, "timings object lost a field via the atom-cache path");
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn atom_cache_produces_identical_objects_across_requests() {
+        // The atom cache is built lazily on the FIRST response and reused for the
+        // rest of the context's life. This drives two requests so the second one
+        // exercises the populated-cache path, and asserts the object is fully
+        // intact both times.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let rt = runtime::create_runtime().unwrap();
+            let ctx = runtime::create_context(&rt).unwrap();
+            let client = Arc::new(MockHttpClient::new(200, r#"{"ok":true}"#));
+            let bp = Backpressure::new(10);
+
+            ctx.with(|ctx| {
+                register(&ctx, handle, client, bp).unwrap();
+                let ok: bool = ctx
+                    .eval(
+                        r#"
+                        function shape(r) {
+                            return r.status === 200 &&
+                                r.body === '{"ok":true}' &&
+                                r.url === 'http://mock.test' &&
+                                r.error === '' && r.error_code === 0 &&
+                                r.timings.duration === 50 &&
+                                r.headers['content-type'] === 'application/json';
+                        }
+                        const a = http.get('http://example.com'); // builds the cache
+                        const b = http.get('http://example.com'); // reuses it
+                        shape(a) && shape(b)
+                    "#,
+                    )
+                    .unwrap();
+                assert!(ok, "cached-atom response construction drifted between requests");
+            });
+        })
+        .await
+        .unwrap();
     }
 }

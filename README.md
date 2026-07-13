@@ -94,6 +94,78 @@ cargo build --release
 # Binary at target/release/k6-rs
 ```
 
+### Profiling (CPU flame graphs)
+
+> **The `http_bridge` Criterion bench no longer exists** — it benchmarked the
+> sync execution path and was deleted with it (#6, commit `8acaa1f`). Stale
+> `http_bridge-*` executables may still sit in `target/release/deps`; every
+> one of them predates the coroutine runtime, so profiling them measures dead
+> code. Delete them (`rm target/release/deps/http_bridge-*`) rather than let
+> a "pick the newest executable" workflow silently profile one.
+
+Profile the CLI itself. Build with frame pointers so `perf` can unwind
+userspace stacks — do NOT use `--call-graph dwarf`: perf's DWARF mode
+snapshots at most 64 KB of stack per sample, and the coroutine VU stacks
+carry ~252 KB fat frames, so DWARF unwinding stops at the first frame and the
+flame graph loses all userspace attribution (leaf libc/kernel frames only).
+Frame-pointer walking has no such limit, and corosensei preserves the
+frame-pointer chain across coroutine switches. `CFLAGS` covers the QuickJS C
+objects. Changing `RUSTFLAGS` invalidates the build cache, so this rebuilds
+everything (and the next plain `cargo build` rebuilds again).
+
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" CFLAGS="-fno-omit-frame-pointer" \
+  cargo build --release
+```
+
+For apples-to-apples profiles across runs, use the canonical workload in
+`profiling/bench.js` — the CLI twin of the deleted bench: plain `http.get` of
+a tiny JSON body from a zero-latency local server, so the profile isolates
+fixed per-iteration overhead rather than target-server or network cost. Keep
+the script stable; vary VU count with `--vus` instead of editing it.
+
+```js
+// profiling/bench.js
+import http from 'k6/http';
+
+export const options = {
+  vus: 1,
+  duration: '60s',
+};
+
+const BASE = __ENV.K6_TEST_URL || 'http://127.0.0.1:8877';
+
+export default function () {
+  http.get(`${BASE}/`);
+}
+```
+
+Start the zero-latency target server (port 8877 by default; pass a port as
+the first argument and point `K6_TEST_URL` at it to override):
+
+```bash
+cargo run --release -p k6-conformance --bin profiling_server &
+```
+
+Run the script under `perf` and render the flame graph:
+
+```bash
+perf record -F 997 -g --call-graph fp -o /tmp/k6rs.perf -- \
+  target/release/k6-rs run profiling/bench.js
+
+~/.cargo/bin/flamegraph \
+  --perfdata /tmp/k6rs.perf \
+  --title 'k6-rs run: profiling/bench.js' \
+  -o flamegraph.svg
+```
+
+Expect one `[unknown]` frame at the base of each thread's stack (the libc
+thread trampoline — system libc is built without frame pointers). Frames
+above it resolve normally. If instead the graph is almost all kernel frames
+with only leaf libc symbols in userspace, the binary was built without
+`force-frame-pointers` — rebuild with the flags above. Thread names in the
+graph are truncated to 15 chars by perf.
+
 ## Quick Start
 
 ```js

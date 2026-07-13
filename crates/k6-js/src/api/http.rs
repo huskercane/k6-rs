@@ -333,10 +333,17 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
             clear: function() { this._cookies = {}; },
         };
     
-        // Parse Set-Cookie headers from response
+        // Shared frozen empty cookie map — returned for the common no-Set-Cookie
+        // response so `__extractCookies` allocates no fresh `{}` per response.
+        const __noCookies = Object.freeze({});
+
+        // Parse Set-Cookie headers from response. Allocates the result map lazily:
+        // the common response carries no Set-Cookie, so it returns the shared empty
+        // map and does zero allocation. The jar side-effect (storing a Set-Cookie)
+        // still runs eagerly whenever one IS present.
         function __extractCookies(headers, url) {
-            const cookies = {};
-            if (!headers) return cookies;
+            if (!headers) return __noCookies;
+            let cookies = null;
             for (const key in headers) {
                 if (key.toLowerCase() !== 'set-cookie') continue;
                 const val = headers[key];
@@ -348,6 +355,7 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
                     const rest = cookie.substring(eqIdx + 1);
                     const semiIdx = rest.indexOf(';');
                     const value = semiIdx >= 0 ? rest.substring(0, semiIdx) : rest;
+                    if (cookies === null) cookies = {};
                     cookies[name] = { name: name, value: value.trim() };
                     // Store in jar
                     try {
@@ -356,11 +364,19 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
                     } catch(e) {}
                 }
             }
-            return cookies;
+            return cookies === null ? __noCookies : cookies;
         }
     
-        // Build Cookie header from jar for a URL
+        // Build Cookie header from jar for a URL. Fast path: an empty jar can
+        // contribute no Cookie header, so skip `cookiesForURL` — and with it the
+        // per-request URL host-extraction regex (`url.match(/^https?:.../)`) that
+        // otherwise runs on EVERY request even when no cookie has ever been set
+        // (the overwhelmingly common case). The regex only runs once a cookie has
+        // actually landed in the jar, where correctness matters more than speed.
         function __buildCookieHeader(url) {
+            let jarEmpty = true;
+            for (const _d in __cookieJar._cookies) { jarEmpty = false; break; }
+            if (jarEmpty) return null;
             const cookies = __cookieJar.cookiesForURL(url);
             const parts = [];
             for (const name in cookies) {
@@ -369,17 +385,24 @@ fn register_http_object(ctx: &Ctx<'_>) -> Result<()> {
             return parts.length > 0 ? parts.join('; ') : null;
         }
     
+        // Shared response methods — defined ONCE per VU and attached by reference
+        // to every response, instead of allocating two fresh closures per response.
+        // Invoked as methods (`res.json()` / `res.html()`), so `this` is the
+        // response object; that's the documented call form and matches upstream.
+        function __resp_json(selector) {
+            const parsed = JSON.parse(this.body);
+            if (selector !== undefined) {
+                return selector.split('.').reduce(function(obj, key) {
+                    return obj != null ? obj[key] : undefined;
+                }, parsed);
+            }
+            return parsed;
+        }
+        function __resp_html() { return this.body; }
+
         function __wrap_response(raw) {
-            raw.json = function(selector) {
-                const parsed = JSON.parse(raw.body);
-                if (selector !== undefined) {
-                    return selector.split('.').reduce(function(obj, key) {
-                        return obj != null ? obj[key] : undefined;
-                    }, parsed);
-                }
-                return parsed;
-            };
-            raw.html = function() { return raw.body; };
+            raw.json = __resp_json;
+            raw.html = __resp_html;
             raw.cookies = __extractCookies(raw.headers, raw.url || '');
             return raw;
         }

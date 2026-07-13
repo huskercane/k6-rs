@@ -245,6 +245,44 @@ pub(crate) fn build_coroutine_vu_spec(
             // per-iteration body is a fixed string (no re-parse). Falls back to the
             // default export if the named function is missing.
             globals_set_exec(&ctx, &exec_name);
+            // Compile the per-iteration driver ONCE into a global function. QuickJS
+            // has NO source→bytecode cache, so a "fixed string" fed to `eval` each
+            // iteration is re-tokenized, re-parsed, and re-compiled every call —
+            // the same defect class as the Jul-10 setup-data-eval fix, and (per the
+            // async-path flamegraph) ~28% of total CPU. Fold the per-iteration state
+            // reset AND the exec kickoff into one function compiled here; the loop
+            // then invokes it via `JS_Call` (no parser) each iteration.
+            //
+            // SYNC FAST-PATH: the common default fn is synchronous (a `http.get`
+            // yields the coroutine but returns to JS synchronously), yet the old
+            // driver wrapped every call in `Promise.resolve((async () => …)())`,
+            // spinning up an async-function frame + promise + microtask per
+            // iteration — pure overhead (JS_CallInternal + promise GC) the 1000-VU
+            // flamegraph showed. Now: call the exec fn directly; only if it returns
+            // a thenable (an `async` default fn / a returned Promise — the k6
+            // async-iteration path) do we drive it through `.then` and settle in a
+            // microtask. A sync return settles inline, no promise allocated. The
+            // driver loop still waits on `outstanding` async ops, so a sync fn that
+            // fires an un-awaited `asyncRequest` is still drained to completion.
+            // `__k6_onFulfill`/`__k6_onReject` are hoisted so the async branch adds
+            // no per-iteration closure either.
+            ctx.eval::<(), _>(
+                r#"globalThis.__k6_onFulfill = function (v) { globalThis.__ret = String(v); globalThis.__done = true; };
+                   globalThis.__k6_onReject = function (e) { globalThis.__err = String(e); globalThis.__failed = true; globalThis.__done = true; };
+                   globalThis.__k6_run_iteration = function () {
+                       globalThis.__done = false; globalThis.__ret = ''; globalThis.__err = '';
+                       globalThis.__failed = false; globalThis.__resolvers = {};
+                       if (typeof __k6_exec !== 'function') { globalThis.__ret = 'undefined'; globalThis.__done = true; return; }
+                       try {
+                           var r = __k6_exec(globalThis.__k6_setup_data);
+                           if (r != null && typeof r.then === 'function') { r.then(globalThis.__k6_onFulfill, globalThis.__k6_onReject); return; }
+                           globalThis.__ret = String(r); globalThis.__done = true;
+                       } catch (e) {
+                           globalThis.__err = String(e); globalThis.__failed = true; globalThis.__done = true;
+                       }
+                   };"#,
+            )
+            .expect("compile per-iteration driver");
         });
 
         // --- long-lived iteration loop (bootstrap persists; per-iteration driver
@@ -286,20 +324,18 @@ pub(crate) fn build_coroutine_vu_spec(
             // Call the default fn with a catch boundary; a sync `http.get` inside
             // yields the coroutine (borrow held) — the scheduler runs the request
             // and resumes. Async work (asyncRequest) settles via the driver loop.
+            // Invoke the once-compiled driver via `JS_Call` (no per-iteration parse):
+            // it resets the per-iteration state and kicks off the exec promise. See
+            // `__k6_run_iteration` at bootstrap.
             ctx.with(|ctx| {
-                let _ = ctx.eval::<(), _>(
-                    "globalThis.__done=false; globalThis.__ret=''; globalThis.__err='';
-                     globalThis.__failed=false; globalThis.__resolvers={};",
-                );
-                // Call the resolved exec fn with the setup() data. Fixed string —
-                // `__k6_exec` was bound once at bootstrap (no per-iteration parse).
-                let _ = ctx.eval::<(), _>(
-                    r#"Promise.resolve((async function () {
-                           return (typeof __k6_exec === 'function') ? __k6_exec(globalThis.__k6_setup_data) : undefined;
-                       })()).then(
-                           function (v) { globalThis.__ret = String(v); globalThis.__done = true; },
-                           function (e) { globalThis.__err = String(e); globalThis.__failed = true; globalThis.__done = true; });"#,
-                );
+                match ctx.globals().get::<_, rquickjs::Function>("__k6_run_iteration") {
+                    Ok(f) => {
+                        let _ = f.call::<_, ()>(());
+                    }
+                    // Compiled unconditionally at bootstrap, so this is unreachable in
+                    // practice; degrade to a skipped iteration rather than panic.
+                    Err(e) => eprintln!("[coroutine_vu] per-iteration driver missing: {e:?}"),
+                }
             });
 
             // Driver loop: resolve completed async http ops (I2, driver-loop-side
@@ -1050,6 +1086,112 @@ mod tests {
         );
     }
 
+    /// P3 regression-lock (sync-exec fast-path): a SYNCHRONOUS default fn that
+    /// fires an un-awaited `http.asyncRequest` must STILL have that request driven
+    /// to completion. The fast-path settles the iteration (`__done = true`) the
+    /// instant the sync fn returns — with no promise — so this proves the driver
+    /// loop still ends the iteration on `settled && outstanding == 0`, not on
+    /// `__done` alone. A regression that keyed iteration-end off `__done` would
+    /// drop the in-flight request and this sends 0.
+    #[test]
+    fn sync_fn_awaits_fire_and_forget_async_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountMock(Arc<AtomicUsize>);
+        impl HttpClient for CountMock {
+            fn send(
+                &self,
+                _req: HttpRequest,
+            ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: ResponseBody::Buffered(b"{}".to_vec()),
+                        timings: Timings::default(),
+                        url: "http://x/".into(),
+                        data_sent: 0,
+                        data_received: 0,
+                    })
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let out = LocalSet::new().block_on(&rt, async {
+            // NOT an async fn, and the promise is NOT awaited — fire-and-forget.
+            let script = "export default function () { http.asyncRequest('GET', 'http://x/'); }";
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+            spawn_vu(coro, shared.clone(), Arc::new(CountMock(count.clone())), Backpressure::new(8), |n| n < 1)
+                .await
+                .unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a fire-and-forget asyncRequest from a SYNC fn must be driven to completion by the driver loop"
+        );
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "undefined".into() }),
+            "the sync fn itself returns undefined (fast-path), iteration completes"
+        );
+    }
+
+    /// P2 regression-lock (per-response allocation trim): `res.cookies` is the
+    /// parsed Set-Cookie map when one is present, and a READABLE empty object
+    /// (the shared frozen `__noCookies`) when absent — a script can still
+    /// `Object.keys(res.cookies)` on it. Also locks that the shared, by-reference
+    /// `res.json()`/`res.html()` methods (no longer per-response closures) still
+    /// bind `this` to the response. A per-response-closure regression would pass
+    /// the json/html half; the shared-empty-cookies half catches the alloc-trim.
+    #[test]
+    fn response_cookies_and_shared_methods_survive_alloc_trim() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // With Set-Cookie: res.cookies.sid.value == 'abc'; json()/html() bind `this`.
+        let with = LocalSet::new().block_on(&rt, async {
+            let client = Arc::new(CookieMock {
+                set_cookie: "sid=abc; Path=/".into(),
+                seen_cookie: Arc::new(std::sync::Mutex::new(None)),
+            });
+            let script = r#"
+                export default function () {
+                    const r = http.get('http://example.test/');
+                    return Object.keys(r.cookies).length + ':' + r.cookies.sid.value
+                        + ':' + r.json().ok + ':' + (r.html() === r.body);
+                }
+            "#;
+            let shared = Shared::new();
+            let result = Rc::new(RefCell::new(None));
+            let coro = build_coroutine_vu(script.to_string(), shared.clone(), None, result.clone());
+            spawn_vu(coro, shared.clone(), client, Backpressure::new(8), |n| n < 1).await.unwrap();
+            let out = result.borrow().clone();
+            out
+        });
+        assert_eq!(
+            with,
+            Some(IterationOutcome::Completed { value: "1:abc:true:true".into() }),
+            "set-cookie response: res.cookies parsed + shared json()/html() this-bound"
+        );
+        // Without Set-Cookie: res.cookies is an empty BUT iterable object (shared frozen).
+        let without = run_script(
+            "export default function () { const r = http.get('http://x/'); \
+             return Object.keys(r.cookies).length + ':' + (typeof r.cookies); }",
+            1,
+        );
+        assert_eq!(
+            without,
+            Some(IterationOutcome::Completed { value: "0:object".into() }),
+            "no-cookie response: res.cookies is a readable empty object (shared frozen __noCookies)"
+        );
+    }
+
     /// #14 fat-frame coupling: deep JS recursion where EACH frame also does
     /// native-heavy work (`crypto.sha256` — a real host fn with its own Rust
     /// frame), so a fat native frame sits beneath every JS frame. QuickJS's 256KB
@@ -1226,6 +1368,26 @@ mod tests {
         "#;
         let out = run_script(script, 2);
         assert_eq!(out, Some(IterationOutcome::Completed { value: "ok2".into() }));
+    }
+
+    /// Regression-lock the once-compiled per-iteration driver (`__k6_run_iteration`,
+    /// compiled at bootstrap instead of re-parsed each iteration to kill the ~28%
+    /// re-parse CPU the async-path flamegraph showed). A script with NO default
+    /// export (so `__k6_exec` is undefined) must still COMPLETE with `undefined`
+    /// via the driver's `typeof __k6_exec === 'function' ? … : undefined` guard —
+    /// and it must do so on EVERY iteration, proving the compiled function is
+    /// re-callable and the guard + state-reset survived folding into it. Same
+    /// spirit as the Jul-10 setup-data-eval fix: fold the fixed body into one
+    /// bootstrap compile, invoke it per iteration without re-parsing.
+    #[test]
+    fn missing_exec_fn_yields_undefined_each_iteration() {
+        // No default export → `__k6_default`/`__k6_exec` never become functions.
+        let out = run_script("function helper() { return 1; }", 3);
+        assert_eq!(
+            out,
+            Some(IterationOutcome::Completed { value: "undefined".into() }),
+            "missing exec fn → each iteration completes with undefined via the compiled driver's guard"
+        );
     }
 
     /// `sleep` yields the coroutine (not `block_on`): two VUs each `sleep(0.1)`

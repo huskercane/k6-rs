@@ -94,9 +94,11 @@ sudo mv k6-rs /usr/local/bin/
 
 Install Rust using [rustup](https://rustup.rs/). The repository pins Rust 1.99.1
 in `rust-toolchain.toml`; rustup selects and installs this toolchain automatically.
+The committed `Cargo.lock` records the dependency versions used for validation;
+use `--locked` to keep builds on those versions.
 
 ```bash
-cargo build --release
+cargo build --release --locked
 # Binary at target/release/k6-rs
 ```
 

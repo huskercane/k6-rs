@@ -16,7 +16,7 @@ Snapshot date: 2026-07-09.
 | Upstream Go `Test*` functions | 1281 | `rg '^func Test' ../k6 -g '*_test.go'` |
 | Upstream Go benchmarks | 31 | `rg '^func Benchmark' ../k6 -g '*_test.go'` |
 | Rust test annotations | 536 | `rg '#\[(tokio::)?test\]' crates -g '*.rs'` |
-| Rust conformance scenarios | 13 | `find crates/k6-conformance/scripts -mindepth 1 -maxdepth 1 -type d` |
+| Rust conformance scenarios | 14 | `find crates/k6-conformance/scripts -mindepth 1 -maxdepth 1 -type d` |
 
 Rust test annotations by crate:
 
@@ -198,3 +198,40 @@ python3 crates/k6-conformance/tests/rest_api.py --bin target/debug/k6-rs
 
 These checks drive real loopback servers and validate responses, lifecycle ordering,
 concurrent commands, and stop exit codes independently of the metric-stream harness.
+
+### Concurrent scenarios and startTime (#16)
+
+`14_concurrent_scenarios` compares two overlapping per-VU scenarios against
+upstream k6 v2.0.0. It checks delayed starts against the common post-setup clock,
+iteration/request counts, checks, and counter rates. Byte-stream sample counts
+are excluded explicitly: upstream emits per-VU samples plus setup, while k6-rs
+emits per-request samples. This fixture does not establish byte-stream parity.
+
+`crates/k6-cli/tests/scenarios.rs` also covers slow setup, aggregate VU gauges,
+idle start-time gaps in the rate denominator, lifecycle ordering, and a threshold
+abort cancelling both overlapping executors and a pending delayed scenario.
+Scenario pools remain bounded independently. Gauge values describe reserved
+pool capacity; dynamic ramping/arrival allocation and execution-context metadata
+remain separate compatibility work.
+
+Validation: `cargo test --workspace` passes (567 passed, 3 ignored), and the new
+upstream conformance case passes. Workspace formatting and strict Clippy checks
+report pre-existing findings in unchanged code; changed Rust code is formatted,
+and package-local Clippy reports no new warnings in the scheduling changes.
+
+Release spot check (three paired runs, local profiling HTTP server, 20 VUs per
+scenario, 2s duration, one GET plus 5ms sleep per iteration; medians):
+
+| Workload | Version | Wall seconds | Requests/s | CPU seconds | Peak RSS KiB | HTTP failure rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Single scenario | Baseline | 2.02 | 3204 | 0.80 | 28512 | 0% |
+| Single scenario | Concurrent scheduler | 2.02 | 3184 | 0.86 | 28900 | 0% |
+| Two scenarios | Baseline (serial) | 4.03 | 3203 | 1.68 | 32548 | 0.14% |
+| Two scenarios | Concurrent scheduler | 2.03 | 6379 | 1.70 | 33800 | 0% |
+
+Overlap intentionally doubles simultaneous load and keeps both bounded pools
+resident. Process overhead beyond the execution window was approximately 20ms.
+These short runs are noisy, not a throughput guarantee or a soak result. An
+unpaced probe produced HTTP failures in both versions (median up to 0.4%); its
+throughput is not a clean scheduler comparison. The baseline's remaining paced
+multi-scenario failures are recorded rather than treated as successful requests.

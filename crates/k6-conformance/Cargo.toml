@@ -2,6 +2,7 @@
 name = "k6-conformance"
 version.workspace = true
 edition.workspace = true
+default-run = "k6-conformance"
 
 [[bin]]
 name = "k6-conformance"
@@ -18,7 +19,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
-toml = "0.9"
+toml = "1.1.8"
 tempfile = "3"
 k6-core = { path = "../k6-core" }
 

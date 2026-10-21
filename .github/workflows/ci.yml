@@ -36,7 +36,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
   test:
     name: Test
@@ -62,7 +62,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # Isolated job for the #[ignore] safety spikes that the main `test` job skips.
   # The async runtime's hard-cancellation tier leans on corosensei force_unwind
@@ -99,4 +99,4 @@ jobs:
       # `--ignored` runs the force_unwind-through-QuickJS-C spikes + the fat-frame
       # stack measurement. A process abort here (unwind regression) fails the job.
       - name: force_unwind + stack spikes
-        run: cargo test -p k6-js -- --ignored --nocapture --test-threads=1
+        run: cargo test --locked -p k6-js -- --ignored --nocapture --test-threads=1

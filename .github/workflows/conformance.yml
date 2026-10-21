@@ -26,7 +26,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.93"
+          toolchain: "1.99.1"
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -37,7 +37,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
 
       - name: Cache upstream k6 binary
         id: cache-k6

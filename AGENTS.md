@@ -24,4 +24,4 @@ Prefer focused unit tests next to the code under `#[cfg(test)]` and reserve `cra
 Recent history uses short, imperative commit subjects such as `Add k6-compatible CLI flags...` and `Fix formatting in dependabot.yml configuration`. Keep commits scoped and descriptive. PRs should explain the user-visible impact, note affected crates, link related issues, and include command output for verification. Screenshots are unnecessary unless output formatting or docs rendering changed.
 
 ## Configuration Notes
-CI currently builds and tests with Rust `1.93` on Ubuntu. Keep local validation aligned with that toolchain when investigating CI-only failures.
+CI currently builds and tests with Rust `1.99.1` on Ubuntu, matching `rust-toolchain.toml`. Keep local validation aligned with that toolchain when investigating CI-only failures.

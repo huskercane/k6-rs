@@ -92,6 +92,9 @@ sudo mv k6-rs /usr/local/bin/
 
 ### Build from Source
 
+Install Rust using [rustup](https://rustup.rs/). The repository pins Rust 1.99.1
+in `rust-toolchain.toml`; rustup selects and installs this toolchain automatically.
+
 ```bash
 cargo build --release
 # Binary at target/release/k6-rs

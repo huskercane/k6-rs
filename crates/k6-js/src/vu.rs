@@ -51,7 +51,7 @@ impl QuickJsVu {
             globals.set("__ENV", env_obj)?;
 
             // Register console.log/warn/error
-            Self::register_console(&ctx, None)?;
+            crate::api::console::register(&ctx, Default::default())?;
 
             // Register Phase 3 modules (no dependencies)
             crate::api::encoding::register(&ctx)?;
@@ -162,7 +162,7 @@ impl QuickJsVu {
         backpressure: Backpressure,
         metrics: Option<BuiltinMetrics>,
         script_dir: Option<PathBuf>,
-        console_output: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+        console_output: Option<k6_core::console::ConsoleSink>,
     ) -> Result<Self> {
         let rt = runtime::create_runtime()?;
         let ctx = runtime::create_context(&rt)?;
@@ -180,7 +180,7 @@ impl QuickJsVu {
             }
             globals.set("__ENV", env_obj)?;
 
-            Self::register_console(&ctx, console_output)?;
+            crate::api::console::register(&ctx, console_output.unwrap_or_default())?;
 
             // Register Phase 3 modules (no dependencies)
             crate::api::encoding::register(&ctx)?;
@@ -254,101 +254,6 @@ impl QuickJsVu {
     /// Attach metrics collection to this VU.
     pub fn set_metrics(&mut self, metrics: BuiltinMetrics) {
         self.metrics = Some(metrics);
-    }
-
-    fn register_console(
-        ctx: &rquickjs::Ctx<'_>,
-        console_output: Option<Arc<std::sync::Mutex<std::fs::File>>>,
-    ) -> Result<()> {
-        // Use JS wrapper that calls String() on each argument,
-        // so we always receive strings in the Rust callback.
-        ctx.eval::<(), _>(
-            r#"
-            globalThis.console = {
-                log: function() {
-                    let parts = [];
-                    for (let i = 0; i < arguments.length; i++) {
-                        parts.push(String(arguments[i]));
-                    }
-                    __console_log(parts.join(' '));
-                },
-                warn: function() {
-                    let parts = [];
-                    for (let i = 0; i < arguments.length; i++) {
-                        parts.push(String(arguments[i]));
-                    }
-                    __console_warn(parts.join(' '));
-                },
-                error: function() {
-                    let parts = [];
-                    for (let i = 0; i < arguments.length; i++) {
-                        parts.push(String(arguments[i]));
-                    }
-                    __console_error(parts.join(' '));
-                },
-            };
-        "#,
-        )?;
-
-        let globals = ctx.globals();
-
-        if let Some(ref file) = console_output {
-            let f = Arc::clone(file);
-            globals.set(
-                "__console_log",
-                Function::new(ctx.clone(), move |msg: String| {
-                    use std::io::Write;
-                    if let Ok(mut f) = f.lock() {
-                        let _ = writeln!(f, "{msg}");
-                    }
-                })?,
-            )?;
-
-            let f = Arc::clone(file);
-            globals.set(
-                "__console_warn",
-                Function::new(ctx.clone(), move |msg: String| {
-                    use std::io::Write;
-                    if let Ok(mut f) = f.lock() {
-                        let _ = writeln!(f, "WARN: {msg}");
-                    }
-                })?,
-            )?;
-
-            let f = Arc::clone(file);
-            globals.set(
-                "__console_error",
-                Function::new(ctx.clone(), move |msg: String| {
-                    use std::io::Write;
-                    if let Ok(mut f) = f.lock() {
-                        let _ = writeln!(f, "ERROR: {msg}");
-                    }
-                })?,
-            )?;
-        } else {
-            globals.set(
-                "__console_log",
-                Function::new(ctx.clone(), |msg: String| {
-                    println!("{msg}");
-                })?,
-            )?;
-
-            globals.set(
-                "__console_warn",
-                Function::new(ctx.clone(), |msg: String| {
-                    eprintln!("WARN: {msg}");
-                })?,
-            )?;
-
-            globals.set(
-                "__console_error",
-                Function::new(ctx.clone(), |msg: String| {
-                    eprintln!("ERROR: {msg}");
-                })?,
-            )?;
-        }
-
-        Ok(())
     }
 
     fn register_open(ctx: &rquickjs::Ctx<'_>, script_dir: PathBuf) -> Result<()> {

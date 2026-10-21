@@ -1,44 +1,47 @@
 # k6-rs
 
-A k6-compatible load testing tool written in Rust, designed to run long-duration soak tests without running out of memory.
+A Rust load testing tool with partial k6 compatibility, designed for long-duration soak tests with bounded VU and HTTP concurrency.
+
+Existing k6 scripts may need changes. See [Compatibility status](#compatibility-status) for current runtime limitations.
 
 ## Why k6-rs?
 
-[k6](https://github.com/grafana/k6) is an excellent load testing tool, but its Go runtime can OOM during sustained high-load soak tests. When a target server slows down under a constant-arrival-rate workload, VUs pile up, response bodies accumulate, and Go's GC can't reclaim memory fast enough. An 8-hour soak test with thousands of VUs will often crash partway through.
+[k6](https://github.com/grafana/k6) provides the scripting model that k6-rs aims to support. Long soak tests need explicit resource limits, especially when the target slows down and requests remain in flight longer.
 
-k6-rs solves this with a **fixed-memory architecture** built on three pillars:
+k6-rs controls resource use through three mechanisms:
 
-1. **Pre-allocated VU Pool** -- All JavaScript contexts (QuickJS via rquickjs) are created at startup and borrowed/returned per iteration. When the pool is exhausted, iterations are dropped (tracked as `dropped_iterations`), not queued in memory. Memory usage is predictable: `max_vus x ~4MB + 50MB base`.
+1. **Bounded VU Pool** -- Each VU owns an isolated QuickJS runtime and a coroutine. Many VUs share Tokio loop threads. Arrival-rate executors drop iterations when no VU is available, tracking them as `dropped_iterations`. Each QuickJS heap has a 64 MiB limit; this is a limit, not an allocation at startup.
 
-2. **Lazy Response Bodies** -- Response bodies are not retained unless the script reads them. Bodies are dropped after `check()`. A configurable buffer cap (10MB default) prevents any single response from blowing up memory. `discardResponseBodies` is fully supported.
+2. **Capped Response Buffers** -- The default HTTP client retains at most 10 MiB per response, or discards body data when `discardResponseBodies` is enabled. It drains the response to completion before returning the connection to the pool.
 
-3. **Bounded In-Flight Requests** -- A tokio semaphore caps concurrent TCP connections at `max_vus * 2`, preventing unbounded connection growth when the target is slow.
+3. **Bounded In-Flight Requests** -- A Tokio semaphore limits concurrent HTTP requests to twice each scenario's VU pool size.
 
-## What's Different from k6
+These limits do not guarantee a fixed process memory footprint or prevent every out-of-memory condition. Script data, metric cardinality, response buffers, and the configured number of VUs all affect memory use.
 
-| Area | k6 (Go) | k6-rs |
-|------|---------|-------|
-| **Memory model** | GC-dependent, can OOM on long soak tests | Fixed-memory, pre-allocated VU pool |
-| **JS engine** | goja (Go) | QuickJS via rquickjs (~4MB/context) |
-| **Async runtime** | goroutines | tokio |
-| **HTTP** | Go net/http | reqwest + rustls-tls |
-| **Script analysis** | None | Static lint warns about unbounded globals (`Set`, `Map`, growing arrays) with line numbers and fix suggestions |
-| **Memory monitoring** | None | Runtime heap sampling per VU, linear regression to detect memory growth before hitting limits |
-| **SharedQueue** | Not available | Lock-free `crossbeam::ArrayQueue` for auth token pool patterns (take/put, borrow/return) |
-| **SharedCounter** | Not available | `AtomicU64` for unique ID assignment across VUs |
-| **DuckDB output** | Not built-in | `--out duckdb=file.duckdb` for post-hoc SQL analysis |
+## Implementation Highlights
 
-### New Shared Data Objects
+- **JavaScript:** QuickJS via rquickjs, with an isolated runtime per VU.
+- **Execution:** coroutines multiplexed across Tokio loop threads.
+- **HTTP:** Hyper + rustls by default. Set `K6RS_HTTP_CLIENT=reqwest` to use the fallback client.
+- **Script analysis:** static lint warns about potentially unbounded globals (`Set`, `Map`, growing arrays).
+- **DuckDB output:** `--out duckdb=file.duckdb` for post-run SQL analysis.
 
-k6-rs adds two new shared data primitives alongside the standard `SharedArray`:
+## Compatibility Status
 
-- **`SharedQueue`** -- A bounded, lock-free queue for patterns like distributing pre-generated auth tokens across VUs. Each VU takes a token, uses it, and puts it back. No mutex contention.
-- **`SharedCounter`** -- An atomic counter for generating unique IDs across VUs without synchronization overhead.
+k6 compatibility is partial. Implementing an API name or accepting a configuration field does not establish full upstream behavioral parity. The [conformance harness](crates/k6-conformance) compares selected workloads against upstream k6; [TEST_PARITY.md](TEST_PARITY.md) tracks coverage and gaps.
+
+- **Executors:** six executors are supported (listed below). `externally-controlled` is rejected by `k6-rs run`; the current runtime has no REST control API.
+- **Console logging:** `console.log()`, `console.warn()`, and `console.error()` work in VU initialization, iteration functions (including named scenarios), and lifecycle hooks. Logs go to stdout; warnings and errors go to stderr. `--console-output` redirects all three levels from these contexts to one file. Formatting currently converts arguments with JavaScript `String()` and joins them with spaces; full upstream console formatting and additional console methods are not implemented.
+- **Console resource limits:** the CLI shares one writer thread and a queue of 1,024 messages. VUs never wait for file or terminal I/O. Messages are limited to 16 KiB of UTF-8 text; overflow drops new messages. A warning at shutdown reports dropped/truncated messages and write failures. Shutdown allows up to two seconds to drain pending console output, then reports a timeout if the destination is still blocked.
+- **Shared data:** `SharedArray`, `SharedQueue`, and `SharedCounter` have Rust implementations in `k6-core`, but are not exposed to scripts through JavaScript bindings.
+- **Memory monitoring:** heap-growth analysis code exists, but is not wired into the current CLI execution path.
+
+Additional unsupported CLI options are listed under [Not Yet Supported](#not-yet-supported).
 
 ## Features
 
 ### Executors
-All six k6 executors: `constant-vus`, `constant-arrival-rate`, `ramping-vus`, `ramping-arrival-rate`, `per-vu-iterations`, `shared-iterations`, plus `externally-controlled` with a REST API on port 6565.
+Six k6 executor types are supported: `constant-vus`, `constant-arrival-rate`, `ramping-vus`, `ramping-arrival-rate`, `per-vu-iterations`, and `shared-iterations`. The `externally-controlled` executor is not supported.
 
 ### Protocols
 - **HTTP** -- all methods, `batch()`, `asyncRequest()`, `expectedStatuses()`, CookieJar, cookies param, timeout, `.json()` with dotpath
@@ -46,7 +49,7 @@ All six k6 executors: `constant-vus`, `constant-arrival-rate`, `ramping-vus`, `r
 - **gRPC** (`k6/net/grpc`) -- `Client` with `connect`/`invoke`/`close`, status codes
 
 ### Modules
-`k6/http`, `k6/ws`, `k6/net/grpc`, `k6/metrics`, `k6/crypto`, `k6/encoding`, `k6/execution`, `k6/timers`, `k6/html`, `k6/data` (SharedArray), `k6/webcrypto`, `k6/experimental/csv`, `k6/experimental/fs`, `k6/experimental/streams`, `k6/secrets`
+Module implementations include `k6/http`, `k6/ws`, `k6/net/grpc`, `k6/metrics`, `k6/crypto`, `k6/encoding`, `k6/execution`, `k6/timers`, `k6/html`, `k6/webcrypto`, `k6/experimental/csv`, `k6/experimental/fs`, `k6/experimental/streams`, and `k6/secrets`. Coverage varies by module; this list is not a claim of complete API parity.
 
 ### Output Plugins
 `--out json=file.json`, `--out csv=file.csv`, `--out influxdb=http://host:8086/db`, `--out prometheus=http://host:9090/api/v1/write`, `--out duckdb=file.duckdb`. Multiple outputs can be used simultaneously.
@@ -194,21 +197,17 @@ export default function () {
 k6-rs run simple_test.js
 ```
 
-## Real-World Example: 8-Hour Soak Test
+## Example: Long-Duration Soak Test
 
-This is the type of workload that crashes k6 but runs to completion with k6-rs. Multiple scenarios hit different API endpoints at sustained rates, with thousands of pre-generated user tokens distributed via `SharedArray`.
+This example configures long-running arrival-rate scenarios against two API endpoints. Supply test credentials through `--env USERNAME=... --env TOKEN=...` or a `.env` file. It uses one test identity; distributing identities through `SharedArray` requires JavaScript bindings that are not yet implemented.
 
 ```js
 // soak_test.js
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { SharedArray } from 'k6/data';
 import { Trend, Rate } from 'k6/metrics';
 
-// Pre-generated auth tokens loaded at init (read-only, shared across all VUs)
-const users = new SharedArray('users', function () {
-  return JSON.parse(open('./users.json'));  // e.g., 1000 user tokens
-});
+const user = { username: __ENV.USERNAME, token: __ENV.TOKEN };
 
 // Custom metrics per endpoint
 const loginDuration = new Trend('login_duration');
@@ -257,8 +256,6 @@ export const options = {
 };
 
 export function loginScenario() {
-  const user = users[Math.floor(Math.random() * users.length)];
-
   const res = http.post('https://api.example.com/auth/login', JSON.stringify({
     username: user.username,
     token: user.token,
@@ -278,8 +275,6 @@ export function loginScenario() {
 }
 
 export function dashboardScenario() {
-  const user = users[Math.floor(Math.random() * users.length)];
-
   const res = http.get('https://api.example.com/dashboard/summary', {
     headers: {
       'Authorization': `Bearer ${user.token}`,
@@ -304,7 +299,7 @@ Run it with output to InfluxDB for Grafana dashboards:
 k6-rs run soak_test.js --out influxdb=http://localhost:8086/k6results
 ```
 
-With k6 (Go), this test OOMs after a few hours when the target API slows down and VUs accumulate. With k6-rs, memory stays flat at ~20GB (`5000 VUs x 4MB`) for the entire 8-hour run, and if VUs are exhausted, iterations are gracefully dropped instead of crashing.
+Each arrival-rate scenario has a bounded VU pool. When that pool is exhausted, new iterations are dropped and counted in `dropped_iterations`. Measure memory usage with your actual script and response sizes before choosing VU limits for a long run; this example is not a benchmark or a guarantee of memory usage.
 
 If the script accidentally has unbounded globals (like a growing `Set` or `Array`), k6-rs warns you at startup:
 
@@ -317,7 +312,7 @@ WARNING: Potential memory leak detected at line 4:
 
 ## CLI Reference
 
-k6-rs aims to be a drop-in replacement for `k6 run`. All supported flags use the same names and short aliases as k6.
+k6-rs aims to support the `k6 run` workflow, but is not yet a fully compatible drop-in replacement. See [Compatibility Status](#compatibility-status) and the unsupported options below before migrating a script.
 
 ```bash
 k6-rs run [OPTIONS] <SCRIPT>
@@ -363,7 +358,7 @@ k6-rs run [OPTIONS] <SCRIPT>
 | `--no-teardown` | | Skip `teardown()` |
 | `--no-thresholds` | | Skip threshold evaluation |
 | `--no-summary` | | Skip end-of-test summary |
-| `--console-output` | | Redirect console to file |
+| `--console-output` | | Redirect VU and lifecycle console messages to a file (subject to the console resource limits above) |
 | `--env` | `-e` | Set env variable as `VAR=value` (repeatable) |
 | `--tag` | | Add tag to all samples as `name=value` (repeatable) |
 
@@ -459,12 +454,13 @@ These k6 flags are not implemented. If you need any of these, open an issue.
 
 ```
 crates/
-  k6-core/    # Engine: VU pool, executors, metrics, thresholds, output plugins, shared data
-  k6-js/      # JS runtime: QuickJS bindings, k6 module implementations
-  k6-cli/     # Binary: CLI argument parsing, wiring, progress display
+  k6-core/         # Shared config, scheduling models, metrics, thresholds, outputs, data primitives
+  k6-js/           # QuickJS bindings, coroutine VUs, executor pools, k6 module implementations
+  k6-cli/          # Binary: CLI argument parsing, wiring, progress display
+  k6-conformance/  # Black-box comparisons against upstream k6
 ```
 
-**320 tests** across the workspace covering all executors, metrics, thresholds, lifecycle, HTTP, WebSocket, gRPC, crypto, encoding, HTML parsing, output plugins, and more.
+The workspace includes unit tests, JS/runtime integration tests, and upstream conformance scenarios. Run `cargo test --workspace` for the Rust test suite. See [TEST_PARITY.md](TEST_PARITY.md) for conformance commands and coverage notes.
 
 ## License
 

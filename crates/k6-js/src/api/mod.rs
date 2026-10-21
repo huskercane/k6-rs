@@ -1,4 +1,5 @@
 pub mod check;
+pub mod console;
 pub mod crypto;
 pub mod csv;
 pub mod encoding;

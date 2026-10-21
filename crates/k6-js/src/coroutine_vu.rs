@@ -79,6 +79,8 @@ pub struct VuSpec {
     pub setup_data: Option<String>,
     /// Named exported function to run each iteration; `None` = the default export.
     pub exec_fn: Option<String>,
+    /// Shared CLI console destination; default uses the library terminal sink.
+    pub console: Option<k6_core::console::ConsoleSink>,
 }
 
 impl VuSpec {
@@ -136,11 +138,7 @@ fn bootstrap_api(
         ctx.eval::<(), _>("globalThis.__k6_setup_data = JSON.parse(__k6_setup_data_json);")?;
     }
 
-    // console is OBSERVABILITY — richer output capture folds into #6 with the
-    // logger; a no-op stub is a safe defer.
-    ctx.eval::<(), _>(
-        "globalThis.console = { log: function () {}, warn: function () {}, error: function () {} };",
-    )?;
+    crate::api::console::register(ctx, spec.console.clone().unwrap_or_default())?;
     // fail + randomSeed are BEHAVIORAL — reuse the sync VU's real impls (one
     // source of truth). randomSeed installs a real seeded xorshift32 PRNG; a
     // no-op stub would silently diverge script results vs the sync VU + upstream.
@@ -1060,6 +1058,7 @@ mod tests {
             env: vec![("BASE".to_string(), "http://x".to_string())],
             setup_data: Some(r#"{"token":"abc"}"#.to_string()),
             exec_fn: Some("myScenario".to_string()),
+            console: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let out = LocalSet::new().block_on(&rt, async {

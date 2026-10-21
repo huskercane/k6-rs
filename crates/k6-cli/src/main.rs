@@ -421,15 +421,17 @@ async fn run_test(
     let rate_limiter = k6_core::backpressure::RateLimiter::new(test_config.rps);
     let _rate_limiter_handle = rate_limiter.start_replenish(cancel.clone());
 
-    // Set up console output file if configured
-    let console_output: Option<Arc<std::sync::Mutex<std::fs::File>>> =
-        if let Some(ref path) = test_config.console_output {
-            let file = std::fs::File::create(path)
-                .with_context(|| format!("creating console output file: {path}"))?;
-            Some(Arc::new(std::sync::Mutex::new(file)))
-        } else {
-            None
-        };
+    // One bounded writer shared by lifecycle contexts and coroutine VUs.
+    let console_file = if let Some(ref path) = test_config.console_output {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("creating console output file: {path}"))?;
+        Some(file)
+    } else {
+        None
+    };
+    let console_writer =
+        k6_core::console::ConsoleWriter::start(console_file).context("starting console writer")?;
+    let console_output = Some(console_writer.sink());
 
     // Set up Ctrl+C handler — first press stops gracefully, second force-kills
     let cancel_clone = cancel.clone();
@@ -569,6 +571,7 @@ async fn run_test(
             env: env_vars.clone(),
             setup_data: setup_data.clone(),
             exec_fn: scenario.exec.clone(),
+            console: console_output.clone(),
         };
         let graceful_stop = scenario.graceful_stop;
 
@@ -860,6 +863,11 @@ async fn run_test(
                 )
             );
         }
+    }
+
+    let console_stats = console_writer.finish();
+    if console_stats.has_loss() {
+        eprintln!("  warning: {console_stats}");
     }
 
     // Stop output plugins. CG-6: also await event-stream writer tasks so

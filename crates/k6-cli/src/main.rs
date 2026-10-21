@@ -18,6 +18,37 @@ use k6_js::hyper_client::{AnyHttpClient, HyperHttpClient};
 use k6_js::pool;
 use k6_js::vu::{self, QuickJsVu};
 
+// Serialize aggregate gauge updates so concurrent starts/stops cannot publish
+// stale totals. The guard also releases a scenario's contribution on errors.
+struct ScenarioVus {
+    active: Arc<std::sync::Mutex<u32>>,
+    metrics: BuiltinMetrics,
+    count: u32,
+}
+
+impl ScenarioVus {
+    fn new(active: Arc<std::sync::Mutex<u32>>, metrics: BuiltinMetrics, count: u32) -> Self {
+        {
+            let mut total = active.lock().unwrap();
+            *total += count;
+            metrics.set_vus(*total);
+        }
+        Self {
+            active,
+            metrics,
+            count,
+        }
+    }
+}
+
+impl Drop for ScenarioVus {
+    fn drop(&mut self) {
+        let mut total = self.active.lock().unwrap();
+        *total -= self.count;
+        self.metrics.set_vus(*total);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "k6-rs", about = "High-performance load testing tool")]
 struct Cli {
@@ -508,65 +539,6 @@ async fn run_test(
 
     let test_start = std::time::Instant::now();
 
-    // CG-4: periodic threshold evaluator. Spawns only when at least one
-    // threshold has `abort_on_fail` set — without that, mid-run state
-    // tracking has no observable effect (end-of-run eval still runs
-    // unconditionally). The task snapshots metrics every 1s, updates
-    // per-threshold state, and triggers `cancel.cancel()` if any
-    // `abort_on_fail` threshold has been failing continuously for at
-    // least its `delay_abort_eval` grace period.
-    //
-    // The snapshot's `duration_secs` MUST be the real elapsed time since
-    // test start, not zero — counter rates are computed as
-    // `value / duration_secs`, and a zero duration makes all counter
-    // rates collapse to 0. Without this, a rate-based abort threshold
-    // like `http_reqs: 'rate<1'` would always see rate=0 mid-run and
-    // either spuriously pass or spuriously fail depending on direction.
-    //
-    // NOTE: mid-run this deliberately stays wall-clock (eval_start ==
-    // test_start), unlike the end-of-test summary which divides by the
-    // execution window (exec_duration). The gap between them is the one-time
-    // VU/runtime-init overhead, negligible against any mid-run elapsed
-    // (>=1s here, since the first tick is skipped), so rate-based abort
-    // thresholds are unaffected.
-    if !cli.no_thresholds
-        && test_config
-            .thresholds
-            .values()
-            .flatten()
-            .any(|t| t.abort_on_fail)
-    {
-        let thresholds = test_config.thresholds.clone();
-        let registry = Arc::clone(&metrics.registry);
-        let cancel_eval = cancel.clone();
-        let eval_start = test_start;
-        tokio::spawn(async move {
-            use k6_core::thresholds::{TickDecision, update_states};
-            let mut states = std::collections::HashMap::new();
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            // Skip the immediate first tick — give the run ~1s to
-            // accumulate samples before the first eval.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = cancel_eval.cancelled() => break,
-                    _ = ticker.tick() => {
-                        let elapsed_secs = eval_start.elapsed().as_secs_f64();
-                        let snap = registry.snapshot(elapsed_secs);
-                        let now = std::time::Instant::now();
-                        if update_states(&thresholds, &snap, &mut states, now)
-                            == TickDecision::Abort
-                        {
-                            eprintln!("threshold abort: failing threshold(s) crossed delayAbortEval window — stopping run");
-                            cancel_eval.cancel();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     // Run setup() if the script defines it (unless --no-setup)
     let setup_data = if !started || cli.no_setup {
         control.as_ref().and_then(|c| c.setup_data())
@@ -604,41 +576,71 @@ async fn run_test(
     // still run on the one-off sync QuickJsVu below (they run once, not per-VU) —
     // retired with the rest of the sync path at #6.
 
-    // Accumulated executor execution window, used as the counter-rate
-    // denominator (and reported test-run duration) below. This is the sum of
-    // each executor's own active run time (RunSummary.duration), which starts
-    // only once iterations begin scheduling — it excludes VU/QuickJS-runtime
-    // init and setup/teardown. It matches upstream's TestRunDuration
-    // (MarkStarted-after-init .. MarkEnded-after-teardown) far better than
-    // test_start.elapsed(), whose init/teardown overhead made k6-rs counter
-    // rates read ~20-50x too low on short runs.
-    let mut exec_duration = std::time::Duration::ZERO;
-
-    // Run each scenario
-    for (name, scenario) in &test_config.scenarios {
-        if cancel.is_cancelled() {
-            break;
-        }
-        if let Some(control) = &control {
-            control.phase(7);
-        }
-        // Delay start if startTime is set
-        if !scenario.start_time.is_zero() {
-            eprintln!(
-                "  scenario {name}: waiting {:?} (startTime)",
-                scenario.start_time
-            );
-            tokio::select! {
-                _ = tokio::time::sleep(scenario.start_time) => {},
-                _ = cancel.cancelled() => break,
+    // All scenario delays and threshold rates share this post-setup clock.
+    let execution_start = std::time::Instant::now();
+    let threshold_stop = cancel.child_token();
+    // CG-4: periodic threshold evaluator. Spawns only when at least one
+    // threshold has `abort_on_fail` set — without that, mid-run state
+    // tracking has no observable effect (end-of-run eval still runs
+    // unconditionally). The task snapshots metrics every 1s, updates
+    // per-threshold state, and triggers `cancel.cancel()` if any
+    // `abort_on_fail` threshold has been failing continuously for at
+    // least its `delay_abort_eval` grace period.
+    //
+    // The snapshot's `duration_secs` MUST be the real elapsed time since
+    // test start, not zero — counter rates are computed as
+    // `value / duration_secs`, and a zero duration makes all counter
+    // rates collapse to 0. Without this, a rate-based abort threshold
+    // like `http_reqs: 'rate<1'` would always see rate=0 mid-run and
+    // either spuriously pass or spuriously fail depending on direction.
+    //
+    if !cli.no_thresholds
+        && test_config
+            .thresholds
+            .values()
+            .flatten()
+            .any(|t| t.abort_on_fail)
+    {
+        let thresholds = test_config.thresholds.clone();
+        let registry = Arc::clone(&metrics.registry);
+        let cancel_eval = cancel.clone();
+        let eval_start = execution_start;
+        let stop_eval = threshold_stop.clone();
+        tokio::spawn(async move {
+            use k6_core::thresholds::{TickDecision, update_states};
+            let mut states = std::collections::HashMap::new();
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            // Skip the immediate first tick — give the run ~1s to
+            // accumulate samples before the first eval.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop_eval.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let elapsed_secs = eval_start.elapsed().as_secs_f64();
+                        let snap = registry.snapshot(elapsed_secs);
+                        let now = std::time::Instant::now();
+                        if update_states(&thresholds, &snap, &mut states, now)
+                            == TickDecision::Abort
+                        {
+                            eprintln!("threshold abort: failing threshold(s) crossed delayAbortEval window — stopping run");
+                            cancel_eval.cancel();
+                            break;
+                        }
+                    }
+                }
             }
-        }
+        });
+    }
 
-        eprintln!("  running scenario: {name}");
-        let num_vus = scenario_max_vus(&scenario.executor);
-        metrics.set_vus(num_vus);
-        metrics.set_vus_max(num_vus);
-
+    let active_vus = Arc::new(std::sync::Mutex::new(0_u32));
+    metrics.set_vus(0);
+    metrics.set_vus_max(max_vus);
+    let mut scenarios = tokio::task::JoinSet::new();
+    if let Some(control) = &control {
+        control.phase(7);
+    }
+    for (name, scenario) in &test_config.scenarios {
         // One VuSpec per scenario: the RAW script (build_coroutine_vu_spec prepares
         // it with script_dir for local imports) + env + setup() data + the exec fn.
         let spec = VuSpec {
@@ -651,173 +653,216 @@ async fn run_test(
             console: console_output.clone(),
         };
         let graceful_stop = scenario.graceful_stop;
+        let name = name.clone();
+        let scenario = scenario.clone();
+        let client = client.clone();
+        let metrics = metrics.clone();
+        let cancel = cancel.clone();
+        let active_vus = active_vus.clone();
+        scenarios.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(None),
+                _ = tokio::time::sleep_until((execution_start + scenario.start_time).into()) => {},
+            }
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
+            eprintln!("  running scenario: {name}");
+            let num_vus = scenario_max_vus(&scenario.executor);
+            let _vus = ScenarioVus::new(active_vus, metrics.clone(), num_vus);
 
-        // The coroutine executors block (they own loop threads + join); run each on
-        // a blocking task so the async main loop isn't stalled.
-        let summary = match &scenario.executor {
-            ExecutorType::ConstantVus { vus, duration } => {
-                let nv = *vus as usize;
-                let bp = Backpressure::from_vus(nv);
-                let (client, metrics, cancel, duration) = (
-                    Arc::clone(&client),
-                    metrics.clone(),
-                    cancel.clone(),
-                    *duration,
-                );
-                tokio::task::spawn_blocking(move || {
-                    pool::run_constant_vus(
-                        spec,
-                        nv,
-                        duration,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
+            // The coroutine executors block (they own loop threads + join); run each on
+            // a blocking task so the async main loop isn't stalled.
+            let summary = match &scenario.executor {
+                ExecutorType::ConstantVus { vus, duration } => {
+                    let nv = *vus as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let (client, metrics, cancel, duration) = (
+                        Arc::clone(&client),
+                        metrics.clone(),
+                        cancel.clone(),
+                        *duration,
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_constant_vus(
+                            spec,
+                            nv,
+                            duration,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+                ExecutorType::ConstantArrivalRate {
+                    rate,
+                    time_unit,
+                    duration,
+                    pre_allocated_vus,
+                    max_vus,
+                } => {
+                    let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let curve = ArrivalCurve::constant(*rate, *time_unit, *duration);
+                    let (client, metrics, cancel) =
+                        (Arc::clone(&client), metrics.clone(), cancel.clone());
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_arrival_rate(
+                            spec,
+                            nv,
+                            curve,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+                ExecutorType::RampingVus {
+                    start_vus, stages, ..
+                } => {
+                    let nv = stages
+                        .iter()
+                        .map(|s| s.target)
+                        .max()
+                        .unwrap_or(*start_vus)
+                        .max(*start_vus) as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let schedule = VuRampSchedule::new(*start_vus, stages);
+                    let (client, metrics, cancel) =
+                        (Arc::clone(&client), metrics.clone(), cancel.clone());
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_ramping_vus(
+                            spec,
+                            nv,
+                            schedule,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+                ExecutorType::RampingArrivalRate {
+                    start_rate,
+                    stages,
+                    time_unit,
+                    pre_allocated_vus,
+                    max_vus,
+                } => {
+                    let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let curve = ArrivalCurve::new(*start_rate as f64, stages, *time_unit);
+                    let (client, metrics, cancel) =
+                        (Arc::clone(&client), metrics.clone(), cancel.clone());
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_arrival_rate(
+                            spec,
+                            nv,
+                            curve,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+                ExecutorType::PerVuIterations {
+                    vus,
+                    iterations,
+                    max_duration,
+                } => {
+                    let nv = *vus as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let (client, metrics, cancel, iters, md) = (
+                        Arc::clone(&client),
+                        metrics.clone(),
+                        cancel.clone(),
+                        *iterations,
+                        *max_duration,
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_per_vu_iterations(
+                            spec,
+                            nv,
+                            iters,
+                            md,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+                ExecutorType::SharedIterations {
+                    vus,
+                    iterations,
+                    max_duration,
+                } => {
+                    let nv = *vus as usize;
+                    let bp = Backpressure::from_vus(nv);
+                    let (client, metrics, cancel, iters, md) = (
+                        Arc::clone(&client),
+                        metrics.clone(),
+                        cancel.clone(),
+                        *iterations,
+                        *max_duration,
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        pool::run_shared_iterations(
+                            spec,
+                            nv,
+                            iters,
+                            md,
+                            client,
+                            bp,
+                            metrics,
+                            cancel,
+                            graceful_stop,
+                        )
+                    })
+                    .await?
+                }
+            };
+
+            Ok::<_, anyhow::Error>(Some((name, num_vus, summary, execution_start.elapsed())))
+        });
+    }
+
+    // Drain every executor, including after errors: blocking pool tasks must finish
+    // before teardown or output shutdown can observe a complete run.
+    let mut scenario_error = None;
+    let mut exec_duration = std::time::Duration::ZERO;
+    while let Some(result) = scenarios.join_next().await {
+        let (name, num_vus, summary, finished_at) = match result {
+            Ok(Ok(Some(summary))) => summary,
+            Ok(Ok(None)) => {
+                exec_duration = exec_duration.max(execution_start.elapsed());
+                continue;
             }
-            ExecutorType::ConstantArrivalRate {
-                rate,
-                time_unit,
-                duration,
-                pre_allocated_vus,
-                max_vus,
-            } => {
-                let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
-                let bp = Backpressure::from_vus(nv);
-                let curve = ArrivalCurve::constant(*rate, *time_unit, *duration);
-                let (client, metrics, cancel) =
-                    (Arc::clone(&client), metrics.clone(), cancel.clone());
-                tokio::task::spawn_blocking(move || {
-                    pool::run_arrival_rate(
-                        spec,
-                        nv,
-                        curve,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
-            }
-            ExecutorType::RampingVus {
-                start_vus, stages, ..
-            } => {
-                let nv = stages
-                    .iter()
-                    .map(|s| s.target)
-                    .max()
-                    .unwrap_or(*start_vus)
-                    .max(*start_vus) as usize;
-                let bp = Backpressure::from_vus(nv);
-                let schedule = VuRampSchedule::new(*start_vus, stages);
-                let (client, metrics, cancel) =
-                    (Arc::clone(&client), metrics.clone(), cancel.clone());
-                tokio::task::spawn_blocking(move || {
-                    pool::run_ramping_vus(
-                        spec,
-                        nv,
-                        schedule,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
-            }
-            ExecutorType::RampingArrivalRate {
-                start_rate,
-                stages,
-                time_unit,
-                pre_allocated_vus,
-                max_vus,
-            } => {
-                let nv = max_vus.unwrap_or(*pre_allocated_vus) as usize;
-                let bp = Backpressure::from_vus(nv);
-                let curve = ArrivalCurve::new(*start_rate as f64, stages, *time_unit);
-                let (client, metrics, cancel) =
-                    (Arc::clone(&client), metrics.clone(), cancel.clone());
-                tokio::task::spawn_blocking(move || {
-                    pool::run_arrival_rate(
-                        spec,
-                        nv,
-                        curve,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
-            }
-            ExecutorType::PerVuIterations {
-                vus,
-                iterations,
-                max_duration,
-            } => {
-                let nv = *vus as usize;
-                let bp = Backpressure::from_vus(nv);
-                let (client, metrics, cancel, iters, md) = (
-                    Arc::clone(&client),
-                    metrics.clone(),
-                    cancel.clone(),
-                    *iterations,
-                    *max_duration,
-                );
-                tokio::task::spawn_blocking(move || {
-                    pool::run_per_vu_iterations(
-                        spec,
-                        nv,
-                        iters,
-                        md,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
-            }
-            ExecutorType::SharedIterations {
-                vus,
-                iterations,
-                max_duration,
-            } => {
-                let nv = *vus as usize;
-                let bp = Backpressure::from_vus(nv);
-                let (client, metrics, cancel, iters, md) = (
-                    Arc::clone(&client),
-                    metrics.clone(),
-                    cancel.clone(),
-                    *iterations,
-                    *max_duration,
-                );
-                tokio::task::spawn_blocking(move || {
-                    pool::run_shared_iterations(
-                        spec,
-                        nv,
-                        iters,
-                        md,
-                        client,
-                        bp,
-                        metrics,
-                        cancel,
-                        graceful_stop,
-                    )
-                })
-                .await?
+            error => {
+                cancel.cancel();
+                scenario_error.get_or_insert_with(|| match error {
+                    Ok(Err(error)) => error,
+                    Err(error) => error.into(),
+                    _ => unreachable!(),
+                });
+                continue;
             }
         };
-
-        exec_duration += summary.duration;
+        exec_duration = exec_duration.max(finished_at);
 
         eprintln!(
             "  scenario {name}: {} iterations in {:?}",
@@ -856,18 +901,26 @@ async fn run_test(
         }
 
         // Push snapshot to output plugins after each scenario. The snapshot's
-        // rate denominator uses the accumulated execution window (consistent
-        // with the end-of-test summary); the plugin's `elapsed` timestamp
-        // stays wall-clock since it marks when the batch was emitted.
+        // rate denominator uses the shared clock because other scenarios may
+        // still be running; final duration uses executor completion timestamps
+        // so output plugin latency does not inflate the execution window.
         if !output_plugins.is_empty() {
             let elapsed = test_start.elapsed().as_secs_f64();
-            let snap = metrics.registry.snapshot(exec_duration.as_secs_f64());
+            let snap = metrics
+                .registry
+                .snapshot(execution_start.elapsed().as_secs_f64());
             for plugin in &mut output_plugins {
                 if let Err(e) = plugin.add_snapshot(&snap, elapsed) {
                     eprintln!("  warning: output plugin error: {e}");
                 }
             }
         }
+    }
+
+    // Stop threshold evaluation once workload execution is complete.
+    threshold_stop.cancel();
+    if let Some(error) = scenario_error {
+        return Err(error);
     }
 
     // Run teardown() if the script defines it (unless --no-teardown)
@@ -905,11 +958,8 @@ async fn run_test(
         control.end();
     }
 
-    // End-of-test summary. The rate denominator (and the reported test-run
-    // duration) is the execution window accumulated above, NOT
-    // test_start.elapsed(): wall-clock includes VU/QuickJS-runtime init and
-    // teardown, which upstream excludes from TestRunDuration. Dividing by
-    // wall-clock made k6-rs counter rates read ~20-50x too low on short tests.
+    // Use the shared execution window, including scheduled idle gaps but
+    // excluding setup and teardown. Overlapping scenario durations are not summed.
     let total_duration = exec_duration;
     let snapshot = metrics.registry.snapshot(total_duration.as_secs_f64());
 

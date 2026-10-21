@@ -1,0 +1,18 @@
+[run]
+expected_exit_code = 0
+
+[tolerances]
+default_counter = "exact"
+default_trend = "ignore"
+
+[tolerances.overrides]
+"iterations" = { count = "exact", rate = "relative:0.20" }
+
+"http_reqs" = { count = "exact", rate = "relative:0.20" }
+
+[known_drift]
+"vus" = "upstream --summary-export does not emit gauges; k6-rs does (engine schema asymmetry)"
+"vus_max" = "same as vus"
+
+"data_sent" = "upstream emits per-VU byte samples plus setup; k6-rs emits per-request samples (4 vs 3 here); byte-stream parity is outside scheduling coverage"
+"data_received" = "same byte-sample granularity difference as data_sent"

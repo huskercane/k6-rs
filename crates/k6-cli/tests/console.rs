@@ -25,6 +25,53 @@ impl Drop for TestDir {
 }
 
 #[test]
+fn removed_executor_fails_before_setup_or_output_initialization() {
+    // Verified against the CI-pinned k6 v2.0.0: invalid executor, exit 104,
+    // with no lifecycle hook execution. Exercise both configuration sources.
+    for from_config_file in [false, true] {
+        let dir = TestDir::new();
+        let script = dir.0.join("test.js");
+        let config = dir.0.join("config.json");
+        let log = dir.0.join("console.log");
+        let summary = dir.0.join("summary.json");
+        let options = r#"{"scenarios":{"ext":{"executor":"externally-controlled","vus":10,"maxVUs":100,"duration":"1s"}}}"#;
+        let mut source = String::from(
+            "export function setup() { throw new Error('SETUP-RAN'); }\n\
+             export default function() { throw new Error('VU-RAN'); }\n\
+             export function teardown() { throw new Error('TEARDOWN-RAN'); }\n",
+        );
+        if !from_config_file {
+            source.push_str(&format!("export const options = {options};\n"));
+        }
+        std::fs::write(&script, source).unwrap();
+        std::fs::write(&config, options).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_k6-rs"));
+        command
+            .arg("run")
+            .arg(&script)
+            .arg("--console-output")
+            .arg(&log)
+            .arg("--summary-export")
+            .arg(&summary);
+        if from_config_file {
+            command.arg("--config").arg(&config);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(104), "{stderr}");
+        assert!(
+            stderr.contains("unknown executor type 'externally-controlled'"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("SETUP-RAN"), "{stderr}");
+        assert!(!stderr.contains("VU-RAN"), "{stderr}");
+        assert!(!stderr.contains("TEARDOWN-RAN"), "{stderr}");
+        assert!(!log.exists());
+        assert!(!summary.exists());
+    }
+}
+
+#[test]
 fn console_file_contains_lifecycle_and_named_vu_messages_in_order() {
     let dir = TestDir::new();
     let script = dir.0.join("test.js");

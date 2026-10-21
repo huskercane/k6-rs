@@ -1,6 +1,7 @@
 pub mod backpressure;
 pub mod config;
 pub mod console;
+pub mod control;
 pub mod executor;
 pub mod metrics;
 pub mod output;

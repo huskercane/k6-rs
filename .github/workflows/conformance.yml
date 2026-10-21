@@ -70,6 +70,11 @@ jobs:
           K6RS_BIN: ${{ github.workspace }}/target/debug/k6-rs
         run: cargo run --locked -p k6-conformance -- run --filter 01_http_get
 
+      - name: REST API conformance (pinned upstream and k6-rs)
+        run: |
+          python3 crates/k6-conformance/tests/rest_api.py --bin ~/bin/k6
+          python3 crates/k6-conformance/tests/rest_api.py --bin target/debug/k6-rs
+
       - name: Spike acceptance — zero adapter branches in diff/
         run: |
           set -e

@@ -28,6 +28,7 @@ use crate::selector::MetricSelector;
 /// from a tag stream.
 #[derive(Default)]
 pub struct MetricsRegistry {
+    metric_contains: Mutex<HashMap<String, String>>,
     counters: Mutex<HashMap<String, CounterMetric>>,
     gauges: Mutex<HashMap<String, GaugeMetric>>,
     rates: Mutex<HashMap<String, RateMetric>>,
@@ -240,7 +241,10 @@ fn canonical_tag_suffix(tags: &[(String, String)]) -> String {
     sorted.sort_by(|a, b| a.0.cmp(b.0));
 
     // Pre-size: braces + each `k:v` + separating commas.
-    let cap = 2 + sorted.iter().map(|(k, v)| k.len() + v.len() + 2).sum::<usize>();
+    let cap = 2 + sorted
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 2)
+        .sum::<usize>();
     let mut out = String::with_capacity(cap);
     out.push('{');
     let mut first = true;
@@ -541,6 +545,39 @@ pub fn snapshot_percentile_ms(
 }
 
 impl MetricsRegistry {
+    /// Metadata registered once per JS metric constructor, not per sample.
+    pub fn register_contains(&self, name: &str, contains: &str) {
+        self.metric_contains
+            .lock()
+            .unwrap()
+            .entry(name.to_owned())
+            .or_insert_with(|| contains.to_owned());
+    }
+
+    pub fn contains(&self, name: &str) -> String {
+        let base = name.split('{').next().unwrap_or(name);
+        if let Some(value) = self.metric_contains.lock().unwrap().get(base) {
+            return value.clone();
+        }
+        if matches!(base, "data_sent" | "data_received") {
+            return "data".into();
+        }
+        if base.starts_with("http_req_") && base != "http_req_failed"
+            || matches!(
+                base,
+                "iteration_duration"
+                    | "group_duration"
+                    | "ws_connecting"
+                    | "ws_session_duration"
+                    | "ws_ping"
+                    | "grpc_req_duration"
+            )
+        {
+            return "time".into();
+        }
+        "default".into()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1237,7 +1274,7 @@ mod tests {
             &[("status", "200"), ("method", "GET")], // input not alphabetical
             &[("z", "1"), ("a", "2"), ("m", "3")],   // reordered
             &[("k", "v1"), ("k", "v2")],             // duplicate key: last wins
-            &[("b", "1"), ("a", "2"), ("b", "3")],   // dup key non-adjacent in input: last wins after sort
+            &[("b", "1"), ("a", "2"), ("b", "3")], // dup key non-adjacent in input: last wins after sort
         ];
         for case in cases {
             let tags: Vec<(String, String)> = case
@@ -1278,7 +1315,10 @@ mod tests {
         // Counter recorded once, retrievable by bare name AND by the exact
         // canonical tag combination (proves the key is `{method:GET,status:200}`).
         assert_eq!(m.registry.counter_get("http_reqs"), 1);
-        assert_eq!(m.registry.counter_get("http_reqs{method:GET,status:200}"), 1);
+        assert_eq!(
+            m.registry.counter_get("http_reqs{method:GET,status:200}"),
+            1
+        );
 
         // failed=false → passes(=failed count)=0, total=1.
         let (_rate, passes, total) = m.registry.rate_get("http_req_failed");

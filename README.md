@@ -30,7 +30,8 @@ These limits do not guarantee a fixed process memory footprint or prevent every 
 
 k6 compatibility is partial. Implementing an API name or accepting a configuration field does not establish full upstream behavioral parity. The [conformance harness](crates/k6-conformance) compares selected workloads against upstream k6; [TEST_PARITY.md](TEST_PARITY.md) tracks coverage and gaps.
 
-- **Executors:** six executors are supported (listed below). `externally-controlled` is rejected by `k6-rs run`; the current runtime has no REST control API.
+- **Executors:** six executors are supported (listed below). The compatibility reference pinned in CI is k6 **v2.0.0**, which removed `externally-controlled`. Like that release, `k6-rs run` rejects this executor during configuration validation, before `setup()`, with exit code 104.
+- **Execution control:** the opt-in REST server implements the `/v1/status`, metrics, groups, setup, and teardown endpoints retained by k6 v2.0.0, including initial `--paused` execution and REST stop. Live VU updates and pauses after execution starts are rejected, matching v2.0.0. See [REST control API](#rest-control-api-k6-v200) for usage and limitations.
 - **Console logging:** `console.log()`, `console.warn()`, and `console.error()` work in VU initialization, iteration functions (including named scenarios), and lifecycle hooks. Logs go to stdout; warnings and errors go to stderr. `--console-output` redirects all three levels from these contexts to one file. Formatting currently converts arguments with JavaScript `String()` and joins them with spaces; full upstream console formatting and additional console methods are not implemented.
 - **Console resource limits:** the CLI shares one writer thread and a queue of 1,024 messages. VUs never wait for file or terminal I/O. Messages are limited to 16 KiB of UTF-8 text; overflow drops new messages. A warning at shutdown reports dropped/truncated messages and write failures. Shutdown allows up to two seconds to drain pending console output, then reports a timeout if the destination is still blocked.
 - **Shared data:** `SharedArray`, `SharedQueue`, and `SharedCounter` have Rust implementations in `k6-core`, but are not exposed to scripts through JavaScript bindings.
@@ -38,10 +39,99 @@ k6 compatibility is partial. Implementing an API name or accepting a configurati
 
 Additional unsupported CLI options are listed under [Not Yet Supported](#not-yet-supported).
 
+### REST control API (k6 v2.0.0)
+
+The server implements these endpoints retained in the [pinned upstream release](https://github.com/grafana/k6/blob/v2.0.0/api/v1/routes.go):
+
+| Endpoint | Upstream capability |
+|----------|---------------------|
+| `GET /v1/status` | Execution state, active/initialized VUs, pause state, threshold failure status |
+| `PATCH /v1/status` | Stop execution; resume execution initially started with `--paused` |
+| `GET /v1/metrics`, `GET /v1/metrics/{id}` | Current metric aggregates |
+| `GET /v1/groups`, `GET /v1/groups/{id}` | Groups and check results |
+| `GET /v1/setup` | Read setup data |
+| `PUT /v1/setup` | Replace or clear setup data |
+| `POST /v1/setup` | Invoke `setup()` and return its data |
+| `POST /v1/teardown` | Invoke `teardown()` |
+
+Like upstream v2.0.0, the server is disabled by default. Enable it on loopback with `--address 127.0.0.1:6565` (or `K6_ADDRESS`); an empty address disables it. `--paused` / `-p` (or `K6_PAUSED=true`) waits before automatic setup and execution. Status responses use the upstream JSON API envelope. Missing metric/group IDs return 404; unsupported methods return 405.
+
+For example, save the ramp script below as `ramp.js`, then run:
+
+```bash
+cargo run --release -p k6-rs -- run --address 127.0.0.1:6565 --paused ramp.js
+```
+
+In another terminal:
+
+```bash
+# Inspect the initially paused test, including its reserved VU capacity.
+curl -s http://127.0.0.1:6565/v1/status
+# Start setup and execution.
+curl -s -X PATCH http://127.0.0.1:6565/v1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"data":{"type":"status","id":"default","attributes":{"paused":false}}}'
+# Inspect observed metrics and groups while the test is running.
+curl -s http://127.0.0.1:6565/v1/metrics
+curl -s http://127.0.0.1:6565/v1/groups
+# Abort the test, interrupting in-flight iterations; teardown still runs.
+curl -s -X PATCH http://127.0.0.1:6565/v1/status \
+  -H 'Content-Type: application/json' \
+  -d '{"data":{"type":"status","id":"default","attributes":{"stopped":true}}}'
+```
+
+REST stop returns HTTP 200 and the CLI exits with code 103. Stopping before the initial resume skips setup and teardown. Once execution has started, stopping during setup still runs teardown. Normal completion and the first Ctrl+C retain their existing graceful shutdown behavior.
+
+Live VU scaling and pausing/resuming an already-running standard executor return HTTP 500, as in upstream v2.0.0. A combined resume/scaling request resumes first and then returns the scaling error. `PUT /v1/setup` accepts raw JSON; an empty body clears setup data, while `null` stores explicit JSON null. Lifecycle mutations are serialized; `setupTimeout` and `teardownTimeout` default to 60 seconds. The server closes at the end of the run.
+
+Compatibility limitations: VUs are initialized lazily by this runtime, so `vus-max` reports reserved pool capacity; multi-scenario execution and arrival-rate allocation retain the existing scheduler behavior. Metric values retain the engine's existing HDR percentile approximation and custom-metric/tag limitations. JavaScript exception messages and some malformed-JSON diagnostic text differ from Go. Go runtime diagnostics (`/debug/pprof`, `/debug/vars`, and the process `/metrics` endpoint) are not provided. Lifecycle cancellation interrupts JavaScript, HTTP, and sleep; blocking native WebSocket/gRPC lifecycle calls retain their existing timeout behavior.
+
+
+REST validation uses `python3 crates/k6-conformance/tests/rest_api.py --bin <binary>` against both the pinned upstream binary and k6-rs. It covers wire formats, initial resume, lifecycle hooks/timeouts, threshold taint, concurrent commands, ramp-to-zero/reactivation status, and interruption of sleeping and CPU-bound iterations.
+
+For a repeatable Linux performance comparison, start `target/release/profiling_server`, then run `python3 profiling/rest_bench.py --baseline /path/to/saved-baseline --output /tmp/rest-perf`. This interleaves the baseline, REST-disabled, and REST-enabled binaries; the last variant polls status at 10 Hz. It records request rate, p95 latency, CPU time, and peak RSS, and rejects runs with failed HTTP requests.
+
+Measured on the development host with Rust 1.99.1, five 3-second release runs per variant at 1 VU (medians; all HTTP requests successful):
+
+| Variant | Requests/s | HTTP p95 (ms) | CPU seconds/run | Peak RSS (MiB) |
+|---------|------------|---------------|-----------------|----------------|
+| Before runtime changes | 14,615 | 0.058 | 2.36 | 18.62 |
+| REST disabled | 14,888 | 0.054 | 2.36 | 19.72 |
+| REST enabled, status polled at 10 Hz | 14,767 | 0.054 | 2.39 | 19.95 |
+
+Three-run 10/100-VU comparisons showed similar throughput and CPU use, but both baseline and candidate had a small failed-request rate. A separate 100-VU probe reproduced 52 `send_request failed` responses in each binary, throughout execution. Those runs are not an all-success performance guarantee; the HTTP-path issue remains unresolved. REST adds approximately 1–1.3 MiB of fixed resident memory in the clean comparison.
+
 ## Features
 
 ### Executors
 Six k6 executor types are supported: `constant-vus`, `constant-arrival-rate`, `ramping-vus`, `ramping-arrival-rate`, `per-vu-iterations`, and `shared-iterations`. The `externally-controlled` executor is not supported.
+
+For a scheduled load profile starting at 10 VUs, rising to 100, and returning to 10, save this as `ramp.js`:
+
+```javascript
+import { sleep } from 'k6';
+
+export const options = {
+  scenarios: {
+    load: {
+      executor: 'ramping-vus',
+      startVUs: 10,
+      stages: [
+        { duration: '5s', target: 10 },
+        { duration: '10s', target: 100 },
+        { duration: '10s', target: 10 },
+      ],
+    },
+  },
+};
+
+export default function () {
+  // Replace with the requests or other work you want to test.
+  sleep(0.1);
+}
+```
+
+Run it with `cargo run --release -p k6-rs -- run ramp.js`. The stages control VUs automatically during a single run; this example does not provide external runtime control. There is no v2.0.0-compatible REST scaling example because that capability was removed upstream.
 
 ### Protocols
 - **HTTP** -- all methods, `batch()`, `asyncRequest()`, `expectedStatuses()`, CookieJar, cookies param, timeout, `.json()` with dotpath
@@ -439,7 +529,6 @@ These k6 flags are not implemented. If you need any of these, open an issue.
 
 | Flag | Reason |
 |------|--------|
-| `--paused` / `-p` | Requires API server pause/resume |
 | `--linger` / `-l` | Requires API server keep-alive |
 | `--system-tags` | System tag filtering not implemented |
 | `--summary-trend-stats` | Custom trend stat selection not implemented |

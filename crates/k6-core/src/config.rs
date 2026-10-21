@@ -7,6 +7,8 @@ use serde_json::Value;
 /// Top-level test configuration, parsed from k6 script `export const options`.
 #[derive(Debug, Clone)]
 pub struct TestConfig {
+    pub setup_timeout: Duration,
+    pub teardown_timeout: Duration,
     pub vus: u32,
     pub duration: Duration,
     /// Top-level `options.iterations` — when set without an explicit `scenarios`
@@ -68,6 +70,8 @@ pub struct DnsConfig {
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
+            setup_timeout: Duration::from_secs(60),
+            teardown_timeout: Duration::from_secs(60),
             vus: 1,
             duration: Duration::from_secs(10),
             iterations: None,
@@ -162,12 +166,20 @@ pub enum ExecutorType {
         iterations: u32,
         max_duration: Duration,
     },
-    ExternallyControlled {
-        vus: u32,
-        max_vus: u32,
-        duration: Duration,
-    },
 }
+
+/// Unknown executor names fail during script initialization in upstream k6.
+/// Kept typed so frontends can report its exit code without matching strings.
+#[derive(Debug)]
+pub struct UnknownExecutor(pub String);
+
+impl std::fmt::Display for UnknownExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown executor type '{}'", self.0)
+    }
+}
+
+impl std::error::Error for UnknownExecutor {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage {
@@ -266,6 +278,18 @@ pub fn parse_options(options: &Value) -> Result<TestConfig> {
         .context("options must be a JSON object")?;
 
     let mut config = TestConfig::default();
+    for (name, target) in [
+        ("setupTimeout", &mut config.setup_timeout),
+        ("teardownTimeout", &mut config.teardown_timeout),
+    ] {
+        if let Some(value) = obj.get(name) {
+            *target = parse_duration(
+                value
+                    .as_str()
+                    .with_context(|| format!("{name} must be a duration string"))?,
+            )?;
+        }
+    }
 
     if let Some(v) = obj.get("vus") {
         config.vus = v.as_u64().context("vus must be a number")? as u32;
@@ -520,12 +544,7 @@ fn parse_scenario(val: &Value) -> Result<ScenarioConfig> {
             iterations: get_u32(obj, "iterations").unwrap_or(1),
             max_duration: get_duration_or(obj, "maxDuration", Duration::from_secs(600)),
         },
-        "externally-controlled" => ExecutorType::ExternallyControlled {
-            vus: get_u32(obj, "vus").unwrap_or(1),
-            max_vus: get_u32(obj, "maxVUs").unwrap_or(10),
-            duration: get_duration_or(obj, "duration", Duration::from_secs(0)),
-        },
-        other => bail!("unknown executor type: {other}"),
+        other => return Err(UnknownExecutor(other.to_owned()).into()),
     };
 
     let exec = obj.get("exec").and_then(|v| v.as_str()).map(String::from);
@@ -1109,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_externally_controlled() {
+    fn rejects_removed_externally_controlled_executor() {
         let opts = json!({
             "scenarios": {
                 "ext": {
@@ -1121,19 +1140,11 @@ mod tests {
             }
         });
 
-        let config = parse_options(&opts).unwrap();
-        let scenario = config.scenarios.get("ext").unwrap();
-        match &scenario.executor {
-            ExecutorType::ExternallyControlled {
-                vus,
-                max_vus,
-                duration,
-            } => {
-                assert_eq!(*vus, 5);
-                assert_eq!(*max_vus, 20);
-                assert_eq!(*duration, Duration::from_secs(600));
-            }
-            other => panic!("expected ExternallyControlled, got {other:?}"),
-        }
+        let error = parse_options(&opts).unwrap_err();
+        assert_eq!(error.to_string(), "in scenario 'ext'");
+        assert_eq!(
+            error.downcast_ref::<UnknownExecutor>().unwrap().to_string(),
+            "unknown executor type 'externally-controlled'"
+        );
     }
 }

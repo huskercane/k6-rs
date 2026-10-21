@@ -268,6 +268,7 @@ pub(crate) async fn run_op<C: HttpClient + 'static>(
 /// it's only for VUs that can't reach a boundary because their I/O is hung.
 #[derive(Clone)]
 pub(crate) struct HardStop {
+    pub(crate) control: Option<Arc<k6_core::control::Control>>,
     pub(crate) token: CancellationToken,
     pub(crate) interrupted: Arc<AtomicU64>,
     /// VUs that FAILED (a build-time panic — e.g. coroutine-stack OOM — or a
@@ -282,10 +283,20 @@ impl HardStop {
     /// A fresh hard-stop: a live token + zeroed interrupted/degraded counters.
     pub(crate) fn new() -> Self {
         Self {
+            control: None,
             token: CancellationToken::new(),
             interrupted: Arc::new(AtomicU64::new(0)),
             degraded: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn from_control(control: Option<Arc<k6_core::control::Control>>) -> Self {
+        let mut hard = Self::new();
+        if let Some(c) = &control {
+            hard.token = c.abort.child_token();
+        }
+        hard.control = control;
+        hard
     }
 
     /// A `HardStop` that never fires — for the coroutine_vu tests, which exercise
@@ -293,6 +304,19 @@ impl HardStop {
     #[cfg(test)]
     pub(crate) fn never() -> Self {
         Self::new()
+    }
+}
+
+struct ActiveVu(Arc<k6_core::control::Control>);
+impl ActiveVu {
+    fn new(c: Arc<k6_core::control::Control>) -> Self {
+        c.active_vus.fetch_add(1, Ordering::Relaxed);
+        Self(c)
+    }
+}
+impl Drop for ActiveVu {
+    fn drop(&mut self) {
+        self.0.active_vus.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -334,6 +358,8 @@ where
     use futures_util::FutureExt;
     let degraded = Arc::clone(&hard.degraded);
     tokio::task::spawn_local(async move {
+        // One increment/decrement per VU, never per iteration.
+        let _active = hard.control.as_ref().map(|c| ActiveVu::new(c.clone()));
         // Fault isolation (#9): catch a panic in the VU's own execution (a host-fn
         // or client bug) at the task boundary. CRUCIAL — if the panic instead
         // unwound the task, the parked `coro` would be dropped DURING the active
@@ -343,7 +369,12 @@ where
         // AFTER, so its force_unwind runs cleanly (the validated path). One VU's
         // bug degrades to one lost VU + a loud log, not a whole-run abort.
         let driven = std::panic::AssertUnwindSafe(drive_vu(
-            PanicSafeCoro(Some(coro)), shared, client, bp, control, hard,
+            PanicSafeCoro(Some(coro)),
+            shared,
+            client,
+            bp,
+            control,
+            hard,
         ))
         .catch_unwind()
         .await;
@@ -379,7 +410,11 @@ async fn drive_vu<C, K>(
     type PendingFut = Pin<Box<dyn std::future::Future<Output = (OpId, OpDone)>>>;
     let mut pending: FuturesUnordered<PendingFut> = FuturesUnordered::new();
     // First resume runs iteration 0 unless control declines it up front.
-    let mut resume = if control.next(0).await { Resume::RunNext } else { Resume::Stop };
+    let mut resume = if control.next(0).await {
+        Resume::RunNext
+    } else {
+        Resume::Stop
+    };
     let mut done_iters = 0u32;
     let home = std::thread::current().id();
 
@@ -415,7 +450,9 @@ async fn drive_vu<C, K>(
             for (op, hop) in ops {
                 let client = Arc::clone(&client);
                 let bp = bp.clone();
-                pending.push(Box::pin(async move { (op, run_op(hop, &client, &bp).await) }));
+                pending.push(Box::pin(
+                    async move { (op, run_op(hop, &client, &bp).await) },
+                ));
             }
         }
 
@@ -446,8 +483,9 @@ async fn drive_vu<C, K>(
                 // order). While parked, keep draining pending async completions
                 // into `completed` (I2) — same as AwaitOne.
                 let n = ops.len();
-                let mut batch: FuturesUnordered<Pin<Box<dyn std::future::Future<Output = (usize, OpDone)>>>> =
-                    FuturesUnordered::new();
+                let mut batch: FuturesUnordered<
+                    Pin<Box<dyn std::future::Future<Output = (usize, OpDone)>>>,
+                > = FuturesUnordered::new();
                 for (i, op) in ops.into_iter().enumerate() {
                     let client = Arc::clone(&client);
                     let bp = bp.clone();
@@ -467,7 +505,12 @@ async fn drive_vu<C, K>(
                         _ = hard.token.cancelled() => on_hard_cancel!(),
                     }
                 }
-                resume = Resume::All(results.into_iter().map(|r| r.expect("all batch ops done")).collect());
+                resume = Resume::All(
+                    results
+                        .into_iter()
+                        .map(|r| r.expect("all batch ops done"))
+                        .collect(),
+                );
             }
             Yield::AwaitPending => {
                 debug_assert!(
@@ -529,9 +572,8 @@ mod tests {
     async fn run_op_streaming_carries_its_own_resource_and_type_erases_result() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         tx.send("hello".to_string()).unwrap();
-        let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> = Box::pin(async move {
-            Box::new(rx.recv().await.unwrap()) as Box<dyn Any>
-        });
+        let fut: Pin<Box<dyn Future<Output = Box<dyn Any>>>> =
+            Box::pin(async move { Box::new(rx.recv().await.unwrap()) as Box<dyn Any> });
         let client = Arc::new(Dummy);
         let bp = Backpressure::new(4);
         match run_op(HostOp::Streaming(fut), &client, &bp).await {

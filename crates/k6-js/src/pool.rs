@@ -56,7 +56,9 @@ fn loop_thread_count(num_vus: usize) -> usize {
     if num_vus == 0 {
         return 0;
     }
-    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     cores.min(num_vus).max(1)
 }
 
@@ -113,7 +115,7 @@ where
     let deadline = start + duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
-    let hard = HardStop::new();
+    let hard = HardStop::from_control(spec.control.clone());
 
     // constant-vus control: run continuously until the deadline (or cancel). No
     // drops (no arrival curve); a stuck VU is force_unwound by the watchdog.
@@ -141,9 +143,17 @@ where
     // Watchdog arms the hard tier `graceful_stop` after graceful stop begins
     // (deadline reached or cancel), so a VU stuck mid-op past the deadline is
     // force_unwound and the join can't hang.
-    let watchdog =
-        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
+    let watchdog = spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(
+        num_threads,
+        num_vus,
+        spec,
+        client,
+        bp,
+        metrics,
+        hard.clone(),
+        make_control,
+    );
     watchdog.finish();
 
     RunSummary {
@@ -240,16 +250,17 @@ fn run_vus_on_loops<C, F, K>(
                             // failed VU build would panic the whole loop thread and
                             // silently drop EVERY VU sharded onto it. Catch it, log
                             // LOUD, skip just that VU — degraded, not a silent hole.
-                            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                build_coroutine_vu_spec(
-                                    spec.clone(),
-                                    id,
-                                    shared.clone(),
-                                    Some(metrics.clone()),
-                                    result.clone(),
-                                    hard.token.clone(),
-                                )
-                            }));
+                            let built =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    build_coroutine_vu_spec(
+                                        spec.clone(),
+                                        id,
+                                        shared.clone(),
+                                        Some(metrics.clone()),
+                                        result.clone(),
+                                        hard.token.clone(),
+                                    )
+                                }));
                             let coro = match built {
                                 Ok(c) => c,
                                 Err(_) => {
@@ -320,7 +331,7 @@ where
     let deadline = start + max_duration;
     let completed = Arc::new(AtomicU64::new(0));
     let errored = Arc::new(AtomicU64::new(0));
-    let hard = HardStop::new();
+    let hard = HardStop::from_control(spec.control.clone());
 
     let make_control = {
         let completed = Arc::clone(&completed);
@@ -344,9 +355,17 @@ where
         }
     };
 
-    let watchdog =
-        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
+    let watchdog = spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(
+        num_threads,
+        num_vus,
+        spec,
+        client,
+        bp,
+        metrics,
+        hard.clone(),
+        make_control,
+    );
     watchdog.finish();
 
     let c = completed.load(Ordering::Relaxed);
@@ -394,7 +413,7 @@ where
     let errored = Arc::new(AtomicU64::new(0));
     // The shared iteration budget — CAS-claimed by every VU across all threads.
     let remaining = Arc::new(AtomicU32::new(total_iterations));
-    let hard = HardStop::new();
+    let hard = HardStop::from_control(spec.control.clone());
 
     let make_control = {
         let completed = Arc::clone(&completed);
@@ -435,9 +454,17 @@ where
         }
     };
 
-    let watchdog =
-        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, num_vus, spec, client, bp, metrics, hard.clone(), make_control);
+    let watchdog = spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(
+        num_threads,
+        num_vus,
+        spec,
+        client,
+        bp,
+        metrics,
+        hard.clone(),
+        make_control,
+    );
     watchdog.finish();
 
     let c = completed.load(Ordering::Relaxed);
@@ -461,6 +488,8 @@ where
 /// pre-allocated (fixed memory) but only `desired` run at any moment — deactivating
 /// the highest indices first, matching the sync executor's scale-down.
 struct RampingControl {
+    observer: Option<Arc<k6_core::control::Control>>,
+    active: bool,
     my_index: usize,
     /// Broadcast of the desired active-VU count from the controller. An inactive VU
     /// parks on `changed()` — waking ONLY on a ramp change, not on a timer — so idle
@@ -474,10 +503,35 @@ struct RampingControl {
     interrupted: Arc<AtomicU64>,
 }
 
+impl RampingControl {
+    fn active(&mut self, active: bool) {
+        if active != self.active {
+            if let Some(observer) = &self.observer {
+                if active {
+                    observer.active_vus.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    observer.active_vus.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            self.active = active;
+        }
+    }
+}
+impl Drop for RampingControl {
+    fn drop(&mut self) {
+        self.active(false);
+    }
+}
+
 impl IterationControl for RampingControl {
     async fn next(&mut self, completed_iters: u32) -> bool {
         if completed_iters >= 1 {
-            tally_outcome(&self.result, &self.completed, &self.errored, &self.interrupted);
+            tally_outcome(
+                &self.result,
+                &self.completed,
+                &self.errored,
+                &self.interrupted,
+            );
         }
         loop {
             if self.stop.is_cancelled() {
@@ -485,7 +539,9 @@ impl IterationControl for RampingControl {
             }
             // `borrow_and_update` marks this version seen, so the `changed()` below
             // waits for the NEXT ramp change (no missed change, no spurious wake).
-            if (self.my_index as u32) < *self.desired_rx.borrow_and_update() {
+            let active = (self.my_index as u32) < *self.desired_rx.borrow_and_update();
+            self.active(active);
+            if active {
                 return true;
             }
             // Inactive: sleep until the desired count changes OR the run stops. A
@@ -532,7 +588,9 @@ where
     let (desired_tx, desired_rx) = tokio::sync::watch::channel(0u32);
     // Graceful stop for the VUs, fired by the controller at schedule end / cancel.
     let stop = CancellationToken::new();
-    let hard = HardStop::new();
+    let mut hard = HardStop::from_control(spec.control.clone());
+    // RampingControl observes activation, including parking between stages.
+    hard.control = None;
 
     // Controller: drive `desired` along the schedule until the schedule ends (or
     // cancel), then fire `stop` so every VU graceful-stops at its next boundary.
@@ -560,11 +618,14 @@ where
     };
 
     let make_control = {
+        let observer = spec.control.clone();
         let completed = Arc::clone(&completed);
         let errored = Arc::clone(&errored);
         let interrupted = Arc::clone(&hard.interrupted);
         let stop = stop.clone();
         move |index: usize, result: Rc<RefCell<Option<IterationOutcome>>>| RampingControl {
+            observer: observer.clone(),
+            active: false,
             my_index: index,
             desired_rx: desired_rx.clone(),
             stop: stop.clone(),
@@ -575,9 +636,17 @@ where
         }
     };
 
-    let watchdog =
-        spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
-    run_vus_on_loops(num_threads, max_vus, spec, client, bp, metrics, hard.clone(), make_control);
+    let watchdog = spawn_hard_stop_watchdog_at(hard.token.clone(), cancel, deadline, graceful_stop);
+    run_vus_on_loops(
+        num_threads,
+        max_vus,
+        spec,
+        client,
+        bp,
+        metrics,
+        hard.clone(),
+        make_control,
+    );
     watchdog.finish();
     let _ = controller.join();
 
@@ -661,7 +730,12 @@ impl IterationControl for ArrivalControl {
             // it consumed an arrival slot and ran, so conservation requires it be
             // counted here (else completed+dropped silently under-sums the
             // integral by the error count). A hard-stop interrupt is `interrupted`.
-            tally_outcome(&self.result, &self.completed, &self.errored, &self.interrupted);
+            tally_outcome(
+                &self.result,
+                &self.completed,
+                &self.errored,
+                &self.interrupted,
+            );
         }
         // Signal idle, then await dispatch. A send error (coordinator gone) or a
         // closed channel (senders dropped at end-of-run) ⇒ graceful Stop.
@@ -729,7 +803,7 @@ where
     // Hard-cancellation tier: fired by the watchdog `graceful_stop` after the run
     // ends, to force_unwind any VU still parked mid-op (hung I/O) so the join
     // can't hang. Each such VU counts as one interrupted iteration.
-    let hard = HardStop::new();
+    let hard = HardStop::from_control(spec.control.clone());
 
     // Per-VU dispatch channels: coordinator holds the senders (by id), each VU its
     // receiver. Idle channel: every VU clones `idle_tx` → coordinator's `idle_rx`.
@@ -762,7 +836,9 @@ where
             thread::Builder::new()
                 .name(format!("k6-loop-{t}"))
                 .spawn(move || {
-                    run_arrival_loop_thread(my_vus, spec, client, bp, metrics, idle_tx, completed, errored, hard)
+                    run_arrival_loop_thread(
+                        my_vus, spec, client, bp, metrics, idle_tx, completed, errored, hard,
+                    )
                 })
                 .expect("spawn loop thread"),
         );
@@ -1047,13 +1123,19 @@ mod tests {
     /// JSON body, no artificial delay.
     struct Mock200;
     impl HttpClient for Mock200 {
-        fn send(&self, _req: HttpRequest) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
             async {
                 Ok(HttpResponse {
                     status: 200,
                     headers: vec![("content-type".into(), "application/json".into())],
                     body: ResponseBody::Buffered(br#"{"ok":true}"#.to_vec()),
-                    timings: Timings { duration: 1.0, ..Default::default() },
+                    timings: Timings {
+                        duration: 1.0,
+                        ..Default::default()
+                    },
                     url: "http://x/".into(),
                     data_sent: 20,
                     data_received: 30,
@@ -1066,7 +1148,10 @@ mod tests {
     /// happens inside `drive_vu`'s task, on the loop thread).
     struct PanicClient;
     impl HttpClient for PanicClient {
-        fn send(&self, _req: HttpRequest) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
             async { panic!("injected VU fault in http send") }
         }
     }
@@ -1114,7 +1199,10 @@ mod tests {
     /// it parks mid-op forever; only the hard-cancellation tier can reclaim it.
     struct HangClient;
     impl HttpClient for HangClient {
-        fn send(&self, _req: HttpRequest) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> impl Future<Output = anyhow::Result<HttpResponse>> + Send {
             async {
                 std::future::pending::<()>().await;
                 unreachable!()
@@ -1174,8 +1262,9 @@ mod tests {
         // (c) The three lanes agree: the executor's own tally, the coroutine-side
         // `iterations` counter, and `http_reqs` (one GET per iteration) are equal.
         let iterations_metric = metrics.registry.counter_get("iterations");
-        let http_reqs =
-            metrics.registry.counter_get("http_reqs{expected_response:true,method:GET,status:200}");
+        let http_reqs = metrics
+            .registry
+            .counter_get("http_reqs{expected_response:true,method:GET,status:200}");
         assert_eq!(
             iterations_metric, summary.iterations_completed,
             "iterations metric (coroutine lane) must equal the executor tally"
@@ -1223,10 +1312,14 @@ mod tests {
         );
 
         let iterations_metric = metrics.registry.counter_get("iterations");
-        let http_reqs =
-            metrics.registry.counter_get("http_reqs{expected_response:true,method:GET,status:200}");
+        let http_reqs = metrics
+            .registry
+            .counter_get("http_reqs{expected_response:true,method:GET,status:200}");
 
-        assert!(summary.iterations_completed > 0, "some iterations completed");
+        assert!(
+            summary.iterations_completed > 0,
+            "some iterations completed"
+        );
         // Every iteration (incl. thrown ones) issued exactly one GET, so http_reqs
         // == total attempts > completed. This is the discriminating assertion.
         assert!(
@@ -1291,7 +1384,10 @@ mod tests {
             "cancel should stop the run well before the 30 s duration, got {:?}",
             summary.duration
         );
-        assert!(summary.iterations_completed > 0, "some iterations ran before cancel");
+        assert!(
+            summary.iterations_completed > 0,
+            "some iterations ran before cancel"
+        );
     }
 
     /// Degenerate input: zero VUs ⇒ no loop threads, an immediate empty summary.
@@ -1334,7 +1430,10 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
         );
-        assert_eq!(summary.iterations_dropped, 0, "ample fast pool must not drop");
+        assert_eq!(
+            summary.iterations_dropped, 0,
+            "ample fast pool must not drop"
+        );
         // completed ≈ integral (a small tail either way for the final tick).
         let lo = (integral as u64).saturating_sub(6);
         let hi = integral as u64 + 3;
@@ -1359,7 +1458,7 @@ mod tests {
         let summary = run_arrival_rate_on(
             2,
             "export default function () { sleep(0.05); }".to_string(), // 50 ms/iter
-            2, // saturated: 2 VUs vs 100/s
+            2,                                                         // saturated: 2 VUs vs 100/s
             curve,
             Arc::new(Mock200),
             Backpressure::new(16),
@@ -1368,7 +1467,10 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        assert!(summary.iterations_completed > 0, "some iterations completed");
+        assert!(
+            summary.iterations_completed > 0,
+            "some iterations completed"
+        );
         assert!(
             summary.iterations_dropped > 0,
             "2 slow VUs vs 100/s must drop, got 0 (completed {})",
@@ -1421,14 +1523,19 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        assert!(summary.iterations_completed > 0, "some completed: {summary:?}");
+        assert!(
+            summary.iterations_completed > 0,
+            "some completed: {summary:?}"
+        );
         assert!(summary.iterations_dropped > 0, "some dropped: {summary:?}");
         assert!(summary.iterations_errored > 0, "some errored: {summary:?}");
-        assert_eq!(summary.iterations_interrupted, 0, "graceful stop interrupts nothing");
+        assert_eq!(
+            summary.iterations_interrupted, 0,
+            "graceful stop interrupts nothing"
+        );
 
-        let total = summary.iterations_completed
-            + summary.iterations_dropped
-            + summary.iterations_errored;
+        let total =
+            summary.iterations_completed + summary.iterations_dropped + summary.iterations_errored;
         let lo = (integral as u64).saturating_sub(3);
         let hi = integral as u64 + 3;
         assert!(
@@ -1496,7 +1603,10 @@ mod tests {
         // (a) We reached this line ⇒ the loop-thread join returned ⇒ force_unwind
         // reclaimed the two coroutines parked mid-http.get.
         // (b) Nothing finished; both VUs were force-unwound → interrupted.
-        assert_eq!(summary.iterations_completed, 0, "hung client completes nothing");
+        assert_eq!(
+            summary.iterations_completed, 0,
+            "hung client completes nothing"
+        );
         assert_eq!(summary.iterations_errored, 0, "hung ≠ errored");
         assert_eq!(
             summary.iterations_interrupted, 2,
@@ -1544,7 +1654,10 @@ mod tests {
         // is accounted as interrupted, not completed/errored.
         assert_eq!(summary.iterations_completed, 0);
         assert_eq!(summary.iterations_errored, 0);
-        assert_eq!(summary.iterations_interrupted, 1, "the hung VU was force-unwound");
+        assert_eq!(
+            summary.iterations_interrupted, 1,
+            "the hung VU was force-unwound"
+        );
     }
 
     /// #11 CPU-interrupt through the production executor: a VU spinning in
@@ -1558,17 +1671,23 @@ mod tests {
             1,
             "export default function () { while (true) {} }".to_string(),
             1,
-            Duration::from_millis(80),  // duration
+            Duration::from_millis(80), // duration
             Arc::new(Mock200),
             Backpressure::new(4),
             BuiltinMetrics::new(),
             CancellationToken::new(),
-            Duration::from_millis(80),  // graceful stop → watchdog fires hard ~160ms
+            Duration::from_millis(80), // graceful stop → watchdog fires hard ~160ms
         );
         // Reaching here = the CPU-interrupt broke the runaway loop (else deadlock).
         assert_eq!(summary.iterations_completed, 0);
-        assert_eq!(summary.iterations_errored, 0, "a shutdown interrupt is NOT an error");
-        assert_eq!(summary.iterations_interrupted, 1, "the spinning VU was interrupted");
+        assert_eq!(
+            summary.iterations_errored, 0,
+            "a shutdown interrupt is NOT an error"
+        );
+        assert_eq!(
+            summary.iterations_interrupted, 1,
+            "the spinning VU was interrupted"
+        );
     }
 
     /// #11 four-way conservation with CPU-interrupt (design note 3): 2 VUs (one per
@@ -1592,12 +1711,18 @@ mod tests {
             Duration::from_millis(100),
         );
         assert_eq!(summary.iterations_completed, 0);
-        assert_eq!(summary.iterations_errored, 0, "spin-interrupt is not an error");
+        assert_eq!(
+            summary.iterations_errored, 0,
+            "spin-interrupt is not an error"
+        );
         assert_eq!(
             summary.iterations_interrupted, 2,
             "both spinning VUs interrupted, not errored: {summary:?}"
         );
-        assert!(summary.iterations_dropped > 0, "arrivals past the 2 spinners dropped");
+        assert!(
+            summary.iterations_dropped > 0,
+            "arrivals past the 2 spinners dropped"
+        );
         let total = summary.iterations_completed
             + summary.iterations_dropped
             + summary.iterations_errored
@@ -1625,7 +1750,10 @@ mod tests {
         // WS server: accept one conn, never send, hold until the client drops.
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
@@ -1671,7 +1799,9 @@ mod tests {
         );
         // The server thread returns only once the client tore the socket down —
         // i.e. the force_unwound VU's ws tasks/socket were dropped, not leaked.
-        server.join().expect("ws server thread joins ⇒ client fully torn down");
+        server
+            .join()
+            .expect("ws server thread joins ⇒ client fully torn down");
     }
 
     /// Ramp integral parity (mirrors the sync `ramp_matches_integral_count`): a
@@ -1683,7 +1813,10 @@ mod tests {
         use k6_core::config::Stage;
         let curve = ArrivalCurve::new(
             0.0,
-            &[Stage { duration: Duration::from_millis(300), target: 100 }],
+            &[Stage {
+                duration: Duration::from_millis(300),
+                target: 100,
+            }],
             Duration::from_secs(1),
         );
         let integral = curve.expected_arrivals(Duration::from_millis(300)); // ≈ 15
@@ -1698,7 +1831,10 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
         );
-        assert_eq!(summary.iterations_dropped, 0, "ample pool ⇒ no drops on the ramp");
+        assert_eq!(
+            summary.iterations_dropped, 0,
+            "ample pool ⇒ no drops on the ramp"
+        );
         let lo = (integral as u64).saturating_sub(6);
         let hi = integral as u64 + 3;
         assert!(
@@ -1726,8 +1862,14 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
         );
-        assert_eq!(summary.iterations_completed, 12, "3 VUs × 4 = 12: {summary:?}");
-        assert_eq!(summary.iterations_dropped, 0, "the quota was met, nothing dropped");
+        assert_eq!(
+            summary.iterations_completed, 12,
+            "3 VUs × 4 = 12: {summary:?}"
+        );
+        assert_eq!(
+            summary.iterations_dropped, 0,
+            "the quota was met, nothing dropped"
+        );
         assert_eq!(summary.iterations_errored, 0);
         assert_eq!(summary.iterations_interrupted, 0);
     }
@@ -1741,8 +1883,8 @@ mod tests {
         let summary = run_per_vu_iterations(
             "export default function () { sleep(0.02); }".to_string(), // 20 ms/iter
             2,
-            100,                          // unreachable in the window
-            Duration::from_millis(150),   // ~7 iters/VU possible
+            100,                        // unreachable in the window
+            Duration::from_millis(150), // ~7 iters/VU possible
             Arc::new(Mock200),
             Backpressure::new(8),
             BuiltinMetrics::new(),
@@ -1750,12 +1892,18 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(summary.iterations_completed > 0, "some ran: {summary:?}");
-        assert!(summary.iterations_dropped > 0, "the quota couldn't be met: {summary:?}");
+        assert!(
+            summary.iterations_dropped > 0,
+            "the quota couldn't be met: {summary:?}"
+        );
         let total = summary.iterations_completed
             + summary.iterations_dropped
             + summary.iterations_errored
             + summary.iterations_interrupted;
-        assert_eq!(total, planned, "completed+dropped+errored+interrupted == planned");
+        assert_eq!(
+            total, planned,
+            "completed+dropped+errored+interrupted == planned"
+        );
     }
 
     /// shared-iterations: 4 VUs draw from a shared budget of 20 ⇒ exactly 20 run,
@@ -1774,7 +1922,10 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
         );
-        assert_eq!(summary.iterations_completed, 20, "budget of 20 fully drawn: {summary:?}");
+        assert_eq!(
+            summary.iterations_completed, 20,
+            "budget of 20 fully drawn: {summary:?}"
+        );
         assert_eq!(summary.iterations_dropped, 0);
         let total = summary.iterations_completed
             + summary.iterations_dropped
@@ -1824,8 +1975,14 @@ mod tests {
         let schedule = VuRampSchedule::new(
             0,
             &[
-                Stage { duration: Duration::from_millis(100), target: 4 }, // ramp up
-                Stage { duration: Duration::from_millis(100), target: 0 }, // ramp down
+                Stage {
+                    duration: Duration::from_millis(100),
+                    target: 4,
+                }, // ramp up
+                Stage {
+                    duration: Duration::from_millis(100),
+                    target: 0,
+                }, // ramp down
             ],
         );
         let summary = run_ramping_vus(
@@ -1838,9 +1995,15 @@ mod tests {
             CancellationToken::new(),
             Duration::from_secs(5),
         );
-        assert!(summary.iterations_completed > 0, "ramp did real work: {summary:?}");
+        assert!(
+            summary.iterations_completed > 0,
+            "ramp did real work: {summary:?}"
+        );
         assert_eq!(summary.iterations_dropped, 0, "ramping-vus never drops");
-        assert_eq!(summary.iterations_interrupted, 0, "graceful stop interrupts nothing");
+        assert_eq!(
+            summary.iterations_interrupted, 0,
+            "graceful stop interrupts nothing"
+        );
         assert!(
             summary.duration >= Duration::from_millis(180)
                 && summary.duration < Duration::from_millis(800),
@@ -1856,7 +2019,10 @@ mod tests {
         use k6_core::config::Stage;
         let schedule = VuRampSchedule::new(
             0,
-            &[Stage { duration: Duration::from_secs(30), target: 4 }],
+            &[Stage {
+                duration: Duration::from_secs(30),
+                target: 4,
+            }],
         );
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();

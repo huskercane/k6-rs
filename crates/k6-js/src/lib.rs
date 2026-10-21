@@ -12,3 +12,5 @@ pub mod http_client;
 pub mod hyper_client;
 pub mod runtime;
 pub mod vu;
+
+pub mod lifecycle;

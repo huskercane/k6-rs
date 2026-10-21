@@ -69,6 +69,8 @@ pub(crate) enum IterationOutcome {
 /// (`exec`, default `__k6_default`). Cloned per VU across loop threads (all `Send`).
 #[derive(Clone, Default)]
 pub struct VuSpec {
+    /// Optional REST observer and immediate-abort source.
+    pub control: Option<std::sync::Arc<k6_core::control::Control>>,
     /// RAW script source (NOT pre-transformed) — the builder runs `prepare_script`
     /// with `script_dir` so local imports resolve.
     pub script: String,
@@ -1059,6 +1061,7 @@ mod tests {
             setup_data: Some(r#"{"token":"abc"}"#.to_string()),
             exec_fn: Some("myScenario".to_string()),
             console: None,
+            control: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let out = LocalSet::new().block_on(&rt, async {

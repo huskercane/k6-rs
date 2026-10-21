@@ -16,6 +16,13 @@ use k6_core::metrics::MetricsRegistry;
 ///
 /// Since we rewrite imports, these are available as globals.
 pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
+    let metadata = registry.clone();
+    ctx.globals().set(
+        "__metrics_register",
+        Function::new(ctx.clone(), move |name: String, is_time: bool| {
+            metadata.register_contains(&name, if is_time { "time" } else { "default" });
+        })?,
+    )?;
     // Register low-level Rust functions for each metric type
     {
         let reg = Arc::clone(&registry);
@@ -62,13 +69,15 @@ pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
         r#"
         function Trend(name, isTime) {
             this.name = name;
-            this.isTime = isTime !== false;
+            this.isTime = !!isTime;
+            __metrics_register(name, this.isTime);
         }
         Trend.prototype.add = function(value, tags) {
             __metrics_trend_add(this.name, Number(value));
         };
 
         function Counter(name) {
+            __metrics_register(name, false);
             this.name = name;
         }
         Counter.prototype.add = function(value, tags) {
@@ -76,6 +85,7 @@ pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
         };
 
         function Rate(name) {
+            __metrics_register(name, false);
             this.name = name;
         }
         Rate.prototype.add = function(value, tags) {
@@ -83,6 +93,7 @@ pub fn register(ctx: &Ctx<'_>, registry: Arc<MetricsRegistry>) -> Result<()> {
         };
 
         function Gauge(name) {
+            __metrics_register(name, false);
             this.name = name;
         }
         Gauge.prototype.add = function(value, tags) {

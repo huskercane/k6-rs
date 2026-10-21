@@ -21,6 +21,9 @@ use k6_js::vu::{self, QuickJsVu};
 #[derive(Parser)]
 #[command(name = "k6-rs", about = "High-performance load testing tool")]
 struct Cli {
+    /// Enable the REST API at this address (e.g. 127.0.0.1:6565). Empty disables it.
+    #[arg(long, short = 'a', global = true)]
+    address: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -35,6 +38,10 @@ enum Commands {
         /// Path to a JSON config file (same format as script options)
         #[arg(long)]
         config: Option<String>,
+
+        /// Wait for REST resume before setup and execution.
+        #[arg(long, short = 'p')]
+        paused: bool,
 
         // --- Execution ---
         /// Number of virtual users (overrides script options)
@@ -159,6 +166,8 @@ enum Commands {
 
 /// Parsed CLI overrides that map to TestConfig fields.
 struct CliOverrides {
+    address: Option<String>,
+    paused: bool,
     vus: Option<u32>,
     duration: Option<String>,
     iterations: Option<u32>,
@@ -188,26 +197,20 @@ struct CliOverrides {
 }
 
 fn main() -> Result<()> {
-    build_runtime()?.block_on(async_main())
+    let result = build_runtime()?.block_on(async_main());
+    if let Err(error) = &result
+        && error.downcast_ref::<config::UnknownExecutor>().is_some()
+    {
+        eprintln!("Error: {error:#}");
+        // k6 v2.0.0: InvalidConfig during script initialization.
+        std::process::exit(104);
+    }
+    result
 }
 
-/// Build the multi-threaded tokio runtime the whole test runs on.
-///
-/// STOPGAP (tracked in `ASYNC_RUNTIME_PLAN.md`): the stock `#[tokio::main]`
-/// leaves `max_blocking_threads` at tokio's default of **512**. Every VU runs on
-/// a `spawn_blocking` task, and each in-flight iteration holds its blocking
-/// thread for the *whole* iteration (the `handle.block_on` I/O wait included).
-/// So above 512 concurrent VUs the excess never start (constant/ramping-vus,
-/// which spawn one long-lived blocking loop per VU) or iteration throughput is
-/// silently capped (arrival-rate). At the reference soak's 7900 VUs that means
-/// the run is broken today. We raise the cap well past any realistic maxVUs so
-/// the VU pool — not this ceiling — bounds concurrency.
-///
-/// The cap is a lazy ceiling (threads spawn on demand, not up front), but each
-/// blocking thread that *is* spawned costs a full stack (~2 MB × N). That memory
-/// is inherent to the current synchronous model and is precisely why the real
-/// fix is the async-runtime migration to pool-of-loops (many VUs per loop
-/// thread, no stack-per-VU), not this number.
+/// Build the CLI runtime. Blocking workers host executor coordinators and
+/// isolated lifecycle calls; VUs themselves share the coroutine pool's pinned
+/// loop threads. Preserve the existing lazy blocking-worker ceiling.
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -222,6 +225,7 @@ async fn async_main() -> Result<()> {
     match cli.command {
         Commands::Run {
             script,
+            paused,
             config,
             vus,
             duration,
@@ -257,6 +261,11 @@ async fn async_main() -> Result<()> {
                 outputs.push(format!("influxdb={url}"));
             }
             let overrides = CliOverrides {
+                address: cli
+                    .address
+                    .or_else(|| std::env::var("K6_ADDRESS").ok())
+                    .filter(|s| !s.is_empty()),
+                paused: paused || std::env::var("K6_PAUSED").as_deref() == Ok("true"),
                 vus,
                 duration,
                 iterations,
@@ -446,6 +455,57 @@ async fn run_test(
         std::process::exit(130);
     });
 
+    let control = if cli.address.is_some() || cli.paused {
+        let (name, scenario) = test_config
+            .scenarios
+            .iter()
+            .min_by_key(|(name, _)| *name)
+            .context("no scenarios configured")?;
+        let lifecycle = Arc::new(k6_js::lifecycle::JsLifecycle {
+            setup_timeout: test_config.setup_timeout,
+            teardown_timeout: test_config.teardown_timeout,
+            spec: VuSpec {
+                script: raw_script.clone(),
+                script_dir: script_dir.clone(),
+                env: env_vars.clone(),
+                console: console_output.clone(),
+                ..Default::default()
+            },
+            client: client.clone(),
+            metrics: metrics.clone(),
+        });
+        Some(k6_core::control::Control::new(
+            cli.paused,
+            max_vus,
+            executor_name(&scenario.executor).into(),
+            name.clone(),
+            metrics.registry.clone(),
+            if cli.no_thresholds {
+                Default::default()
+            } else {
+                test_config.thresholds.clone()
+            },
+            cancel.clone(),
+            lifecycle,
+        ))
+    } else {
+        None
+    };
+    let server = if let (Some(address), Some(control)) = (&cli.address, &control) {
+        let server = k6_core::control::Server::bind(address, control.clone())
+            .await
+            .context("starting REST API")?;
+        eprintln!("  REST API: http://{}", server.address);
+        Some(server)
+    } else {
+        None
+    };
+    let started = if let Some(control) = &control {
+        control.wait_for_start().await
+    } else {
+        true
+    };
+
     let test_start = std::time::Instant::now();
 
     // CG-4: periodic threshold evaluator. Spawns only when at least one
@@ -508,8 +568,15 @@ async fn run_test(
     }
 
     // Run setup() if the script defines it (unless --no-setup)
-    let setup_data = if cli.no_setup {
-        None
+    let setup_data = if !started || cli.no_setup {
+        control.as_ref().and_then(|c| c.setup_data())
+    } else if let Some(control) = &control {
+        control.phase(6);
+        match control.hook(true).await {
+            Ok(data) => data,
+            Err(_) if control.stopped() => None,
+            Err(error) => return Err(error),
+        }
     } else {
         let bp = Backpressure::new(1);
         let mut setup_vu = QuickJsVu::new_full_with_console(
@@ -549,13 +616,22 @@ async fn run_test(
 
     // Run each scenario
     for (name, scenario) in &test_config.scenarios {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if let Some(control) = &control {
+            control.phase(7);
+        }
         // Delay start if startTime is set
         if !scenario.start_time.is_zero() {
             eprintln!(
                 "  scenario {name}: waiting {:?} (startTime)",
                 scenario.start_time
             );
-            tokio::time::sleep(scenario.start_time).await;
+            tokio::select! {
+                _ = tokio::time::sleep(scenario.start_time) => {},
+                _ = cancel.cancelled() => break,
+            }
         }
 
         eprintln!("  running scenario: {name}");
@@ -566,6 +642,7 @@ async fn run_test(
         // One VuSpec per scenario: the RAW script (build_coroutine_vu_spec prepares
         // it with script_dir for local imports) + env + setup() data + the exec fn.
         let spec = VuSpec {
+            control: control.clone(),
             script: raw_script.clone(),
             script_dir: script_dir.clone(),
             env: env_vars.clone(),
@@ -581,10 +658,23 @@ async fn run_test(
             ExecutorType::ConstantVus { vus, duration } => {
                 let nv = *vus as usize;
                 let bp = Backpressure::from_vus(nv);
-                let (client, metrics, cancel, duration) =
-                    (Arc::clone(&client), metrics.clone(), cancel.clone(), *duration);
+                let (client, metrics, cancel, duration) = (
+                    Arc::clone(&client),
+                    metrics.clone(),
+                    cancel.clone(),
+                    *duration,
+                );
                 tokio::task::spawn_blocking(move || {
-                    pool::run_constant_vus(spec, nv, duration, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_constant_vus(
+                        spec,
+                        nv,
+                        duration,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
             }
@@ -601,7 +691,16 @@ async fn run_test(
                 let (client, metrics, cancel) =
                     (Arc::clone(&client), metrics.clone(), cancel.clone());
                 tokio::task::spawn_blocking(move || {
-                    pool::run_arrival_rate(spec, nv, curve, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_arrival_rate(
+                        spec,
+                        nv,
+                        curve,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
             }
@@ -619,7 +718,16 @@ async fn run_test(
                 let (client, metrics, cancel) =
                     (Arc::clone(&client), metrics.clone(), cancel.clone());
                 tokio::task::spawn_blocking(move || {
-                    pool::run_ramping_vus(spec, nv, schedule, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_ramping_vus(
+                        spec,
+                        nv,
+                        schedule,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
             }
@@ -636,7 +744,16 @@ async fn run_test(
                 let (client, metrics, cancel) =
                     (Arc::clone(&client), metrics.clone(), cancel.clone());
                 tokio::task::spawn_blocking(move || {
-                    pool::run_arrival_rate(spec, nv, curve, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_arrival_rate(
+                        spec,
+                        nv,
+                        curve,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
             }
@@ -655,7 +772,17 @@ async fn run_test(
                     *max_duration,
                 );
                 tokio::task::spawn_blocking(move || {
-                    pool::run_per_vu_iterations(spec, nv, iters, md, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_per_vu_iterations(
+                        spec,
+                        nv,
+                        iters,
+                        md,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
             }
@@ -674,18 +801,19 @@ async fn run_test(
                     *max_duration,
                 );
                 tokio::task::spawn_blocking(move || {
-                    pool::run_shared_iterations(spec, nv, iters, md, client, bp, metrics, cancel, graceful_stop)
+                    pool::run_shared_iterations(
+                        spec,
+                        nv,
+                        iters,
+                        md,
+                        client,
+                        bp,
+                        metrics,
+                        cancel,
+                        graceful_stop,
+                    )
                 })
                 .await?
-            }
-            ExecutorType::ExternallyControlled { .. } => {
-                // F3: fail LOUD, never a silent no-op — the async runtime has no
-                // REST control API to drive runtime VU changes.
-                anyhow::bail!(
-                    "the externally-controlled executor is not supported on the async runtime \
-                     (scenario '{name}') — it needs the k6 REST control API. Use a \
-                     constant-vus / ramping-vus / arrival-rate executor instead."
-                );
             }
         };
 
@@ -743,7 +871,13 @@ async fn run_test(
     }
 
     // Run teardown() if the script defines it (unless --no-teardown)
-    if !cli.no_teardown {
+    if started
+        && !cli.no_teardown
+        && let Some(control) = &control
+    {
+        control.phase(8);
+        control.hook(false).await?;
+    } else if started && !cli.no_teardown {
         let bp = Backpressure::new(1);
         let mut teardown_vu = QuickJsVu::new_full_with_console(
             0,
@@ -764,6 +898,11 @@ async fn run_test(
             }
             teardown_vu.run_teardown()?;
         }
+    }
+
+    if let Some(control) = &control {
+        control.close_lifecycle().await;
+        control.end();
     }
 
     // End-of-test summary. The rate denominator (and the reported test-run
@@ -892,6 +1031,13 @@ async fn run_test(
         if let Err(e) = h.await {
             eprintln!("  warning: output writer task join error: {e}");
         }
+    }
+
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
+    if control.as_ref().is_some_and(|c| c.stopped()) {
+        std::process::exit(103);
     }
 
     // Exit with code 99 if thresholds failed (same as k6)
@@ -1108,6 +1254,8 @@ mod tests {
 
     fn empty_overrides() -> CliOverrides {
         CliOverrides {
+            address: None,
+            paused: false,
             vus: None,
             duration: None,
             iterations: None,
@@ -1460,7 +1608,6 @@ fn scenario_max_vus(executor: &ExecutorType) -> u32 {
         } => max_vus.unwrap_or(*pre_allocated_vus),
         ExecutorType::PerVuIterations { vus, .. } => *vus,
         ExecutorType::SharedIterations { vus, .. } => *vus,
-        ExecutorType::ExternallyControlled { max_vus, .. } => *max_vus,
     }
 }
 
@@ -1506,18 +1653,16 @@ fn format_executor_desc(executor: &ExecutorType) -> String {
         } => {
             format!("{iterations} iterations shared across {vus} VUs")
         }
-        ExecutorType::ExternallyControlled {
-            vus,
-            max_vus,
-            duration,
-        } => {
-            if duration.is_zero() {
-                format!("externally controlled, {vus} initial VUs (max {max_vus}), API on :6565")
-            } else {
-                format!(
-                    "externally controlled, {vus} initial VUs (max {max_vus}), {duration:?}, API on :6565"
-                )
-            }
-        }
+    }
+}
+
+fn executor_name(executor: &ExecutorType) -> &'static str {
+    match executor {
+        ExecutorType::ConstantVus { .. } => "constant-vus",
+        ExecutorType::RampingVus { .. } => "ramping-vus",
+        ExecutorType::ConstantArrivalRate { .. } => "constant-arrival-rate",
+        ExecutorType::RampingArrivalRate { .. } => "ramping-arrival-rate",
+        ExecutorType::PerVuIterations { .. } => "per-vu-iterations",
+        ExecutorType::SharedIterations { .. } => "shared-iterations",
     }
 }

@@ -77,7 +77,7 @@ result is silently wrong" outranks module breadth.
 | Execution JS module | 14 | `k6-js/src/api/execution.rs`; zero-based `__ITER`, VU/scenario iteration-info override globals | Partial (broadening) | T3 |
 | crypto / webcrypto / encoding | 17 | `k6-js/src/api/{crypto,webcrypto,encoding}.rs` | Partial | T3 |
 | Event loop + task queue | 13 (`internal/js/eventloop` 11, `taskqueue` 2) | runtime/event-loop tests in `k6-js` | Partial | T3 |
-| API routes | 11 (`api/v1`, `internal/api`) | externally controlled executor API tests | Partial | T4 |
+| API routes | 11 (`api/v1`, `internal/api`) | Core control tests and `tests/rest_api.py` cover the retained v2.0.0 status, metrics, groups, setup/teardown APIs, initial resume, immediate stop, concurrent commands, and lifecycle timeouts. Removed executor rejected before setup (104); scaling rejected (500). See README for runtime/diagnostic limitations. | Partial (behavioral) | T4 |
 | Loader, archive, fsext | 16 (`internal/loader` 10, `lib/fsext` 6) | import/`open()` tests in `k6-js` | Partial | T4 |
 | HTML JS module | 9 | `k6-js/src/api/html.rs` | Partial | T4 |
 | UI, event, usage, secretsource | ~14 | `k6-cli` analysis + `k6-js` secrets tests | Partial | T4 |
@@ -187,3 +187,14 @@ Ordered by the priority column above.
    boundary rejections → ported Rust unit test.
 6. Keep this file honest: re-run the count commands after large upstream syncs
    and after adding tests, and update the snapshot date.
+
+REST conformance against the pinned v2.0.0 binary (Python standard library only):
+
+```bash
+cargo build --locked -p k6-rs
+python3 crates/k6-conformance/tests/rest_api.py --bin /path/to/k6-v2.0.0
+python3 crates/k6-conformance/tests/rest_api.py --bin target/debug/k6-rs
+```
+
+These checks drive real loopback servers and validate responses, lifecycle ordering,
+concurrent commands, and stop exit codes independently of the metric-stream harness.

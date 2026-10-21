@@ -17,6 +17,7 @@ use crate::runtime;
 /// The script is compiled once and the default function is called
 /// repeatedly for each iteration.
 pub struct QuickJsVu {
+    hook_cancel: Option<tokio_util::sync::CancellationToken>,
     ctx: JsContext,
     rt: rquickjs::Runtime,
     vu_id: u32,
@@ -80,6 +81,7 @@ impl QuickJsVu {
         runtime::drain_pending_jobs(&rt);
 
         Ok(Self {
+            hook_cancel: None,
             ctx,
             rt,
             vu_id,
@@ -164,7 +166,37 @@ impl QuickJsVu {
         script_dir: Option<PathBuf>,
         console_output: Option<k6_core::console::ConsoleSink>,
     ) -> Result<Self> {
+        Self::new_full_with_control(
+            vu_id,
+            script,
+            env,
+            handle,
+            client,
+            backpressure,
+            metrics,
+            script_dir,
+            console_output,
+            None,
+        )
+    }
+
+    pub fn new_full_with_control<C: HttpClient + 'static>(
+        vu_id: u32,
+        script: &str,
+        env: &[(String, String)],
+        handle: tokio::runtime::Handle,
+        client: Arc<C>,
+        backpressure: Backpressure,
+        metrics: Option<BuiltinMetrics>,
+        script_dir: Option<PathBuf>,
+        console_output: Option<k6_core::console::ConsoleSink>,
+        control: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Self> {
+        let hook_cancel = control.clone();
         let rt = runtime::create_runtime()?;
+        if let Some(control) = control.clone() {
+            rt.set_interrupt_handler(Some(Box::new(move || control.is_cancelled())));
+        }
         let ctx = runtime::create_context(&rt)?;
 
         ctx.with(|ctx| {
@@ -212,7 +244,15 @@ impl QuickJsVu {
             )?;
             crate::api::check::register_with_metrics(&ctx, metrics.clone())?;
             crate::api::check::register_group_with_metrics(&ctx, metrics.clone())?;
-            crate::api::sleep::register(&ctx, handle.clone())?;
+            if let Some(control) = control {
+                let sleep_handle = handle.clone();
+                ctx.globals().set("sleep", Function::new(ctx.clone(), move |seconds: f64| {
+                    sleep_handle.block_on(async {tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0))) => {},
+                        _ = control.cancelled() => {},
+                    }});
+                })?)?;
+            } else {crate::api::sleep::register(&ctx, handle.clone())?;}
             crate::api::timers::register(&ctx)?;
 
             // Register WebSocket support (k6/ws)
@@ -242,6 +282,7 @@ impl QuickJsVu {
         });
 
         Ok(Self {
+            hook_cancel,
             ctx,
             rt,
             vu_id,
@@ -419,6 +460,28 @@ impl QuickJsVu {
         })
     }
 
+    fn resolve_hook_result<'js>(
+        &self,
+        value: rquickjs::Value<'js>,
+    ) -> Result<rquickjs::Value<'js>> {
+        let Some(promise) = value.as_promise() else {
+            return Ok(value);
+        };
+        loop {
+            match promise.finish::<rquickjs::Value<'js>>() {
+                Ok(value) => return Ok(value),
+                Err(rquickjs::Error::WouldBlock) if self.hook_cancel.is_some() => {
+                    anyhow::ensure!(
+                        !self.hook_cancel.as_ref().unwrap().is_cancelled(),
+                        "lifecycle execution interrupted"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(anyhow::anyhow!("lifecycle promise error: {error}")),
+            }
+        }
+    }
+
     /// Execute setup() and return the JSON-serialized result.
     /// The result is stored as `__k6_setup_data` for use in iterations.
     pub fn run_setup(&mut self) -> Result<Option<String>> {
@@ -434,8 +497,9 @@ impl QuickJsVu {
                 .catch(&ctx)
                 .map_err(|e| anyhow::anyhow!("setup() error: {e:?}"))?;
 
-            // Serialize the return value to JSON for sharing across VUs
-            if result.is_undefined() || result.is_null() {
+            let result = self.resolve_hook_result(result)?;
+            // Explicit JSON null is distinct from an undefined setup result.
+            if result.is_undefined() {
                 Ok(None)
             } else {
                 let json_fn: Function = ctx.eval("JSON.stringify").unwrap();
@@ -484,10 +548,11 @@ impl QuickJsVu {
                 .eval("typeof __k6_setup_data !== 'undefined' ? __k6_setup_data : undefined")
                 .unwrap_or(rquickjs::Value::new_undefined(ctx.clone()));
 
-            teardown_fn
+            let result = teardown_fn
                 .call::<_, rquickjs::Value>((data,))
                 .catch(&ctx)
                 .map_err(|e| anyhow::anyhow!("teardown() error: {e:?}"))?;
+            self.resolve_hook_result(result)?;
 
             Ok(())
         })?;
@@ -740,6 +805,20 @@ fn extract_import_names(import_line: &str) -> Option<Vec<&str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_hooks_await_promises_and_preserve_explicit_null() {
+        let mut vu = QuickJsVu::new(0, "function setup() { return Promise.resolve(null); } function teardown(data) { if (data !== null) throw Error('lost null'); return Promise.reject(Error('rejected teardown')); }", &[]).unwrap();
+        assert_eq!(vu.run_setup().unwrap().as_deref(), Some("null"));
+        assert!(vu.run_teardown().is_err());
+        let mut vu = QuickJsVu::new(
+            0,
+            "function setup() { return Promise.resolve({token:42}); }",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(vu.run_setup().unwrap().as_deref(), Some(r#"{"token":42}"#));
+    }
+
     #[test]
     fn create_vu_and_run_iteration() {
         let script = r#"
